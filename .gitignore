@@ -1,0 +1,11 @@
+/build*/
+/.cache/
+/.vs/
+/out/
+*.user
+*.suo
+__pycache__/
+*.pyc
+benchmarks/results/
+build-bench/
+target/

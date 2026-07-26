@@ -1,0 +1,8 @@
+[package]
+name = "cio-tokio-benchmark"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tokio = { version = "=1.53.1", features = ["full", "test-util", "tracing"] }

@@ -1,0 +1,128 @@
+name: 跨平台持续集成
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }} / ${{ matrix.config }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux GCC
+            os: ubuntu-latest
+            cxx: g++
+            config: Debug
+          - name: Linux GCC
+            os: ubuntu-latest
+            cxx: g++
+            config: Release
+          - name: Linux Clang
+            os: ubuntu-latest
+            cxx: clang++
+            config: Debug
+          - name: Linux Clang
+            os: ubuntu-latest
+            cxx: clang++
+            config: Release
+          - name: Windows MSVC
+            os: windows-latest
+            cxx: cl
+            config: Debug
+          - name: Windows MSVC
+            os: windows-latest
+            cxx: cl
+            config: Release
+          - name: macOS Apple Clang
+            os: macos-latest
+            cxx: clang++
+            config: Debug
+          - name: macOS Apple Clang
+            os: macos-latest
+            cxx: clang++
+            config: Release
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 配置（Linux/macOS）
+        if: runner.os != 'Windows'
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DCIO_BUILD_TESTS=ON
+
+      - name: 配置（Windows）
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -A x64 -DCIO_BUILD_TESTS=ON
+
+      - name: 构建
+        run: cmake --build build --config ${{ matrix.config }} --parallel
+
+      - name: 测试
+        run: >
+          ctest --test-dir build --build-config ${{ matrix.config }}
+          --output-on-failure
+
+  sanitizers:
+    name: Linux Clang / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ASan + UBSan
+            options: -DCIO_ENABLE_ASAN=ON -DCIO_ENABLE_UBSAN=ON
+          - name: TSan
+            options: -DCIO_ENABLE_TSAN=ON
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 配置
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=clang++
+          -DCIO_BUILD_TESTS=ON
+          ${{ matrix.options }}
+
+      - name: 构建
+        run: cmake --build build --parallel
+
+      - name: 测试
+        run: ctest --test-dir build --output-on-failure
+
+  tokio-differential:
+    name: Tokio 1.53.1 语义差分
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 固定 Tokio 依赖
+        run: cargo generate-lockfile --manifest-path tests/differential/tokio-reference/Cargo.toml
+
+      - name: 配置
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=clang++
+          -DCIO_BUILD_TESTS=ON
+          -DCIO_ENABLE_TOKIO_DIFFERENTIAL_TESTS=ON
+
+      - name: 构建
+        run: cmake --build build --parallel
+
+      - name: 差分测试
+        run: >
+          ctest --test-dir build
+          -R cio.differential.tokio-1.53.1
+          --output-on-failure

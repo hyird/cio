@@ -8,3 +8,4 @@ compile_commands.json
 *.so
 perf.data*
 bench/echo-comparison/build/
+bench/http-comparison/build/

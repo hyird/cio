@@ -186,20 +186,33 @@ int Reactor::poll(std::int64_t timeout_ns) {
 
     CIO_METRIC(poll_wakeups, made_runnable);
 
-    // One of these is the poller's own next task, so it needs one fewer peer
-    // awake than it made runnable.
+    // One of these is the poller's own next task, so wake one fewer peer than
+    // tasks made runnable.
     //
     // Every caller of poll() that is a worker returns straight to its run loop
     // and takes an item — park() falls through to Worker::run's next_local(),
     // find_work() calls next_local() itself. Counting that one as somebody
     // else's work means a poll that wakes a single task issues a futex to a
     // parked worker which arrives, finds the queue already emptied by the
-    // poller, and parks again. At one connection that round trip is on the
-    // critical path of every request: 93us per round trip against asio's 79.
+    // poller, and parks again. Go's findRunnable does the same thing: it pops
+    // one goroutine off the netpoll list to run on the current P and injects
+    // only the remainder.
     //
-    // Go does the same thing for the same reason — findRunnable pops one
-    // goroutine off the netpoll list to run on the current P and injects only
-    // the remainder.
+    // The trade is real and worth stating, because it is not free at every
+    // concurrency. Measured against wrk, which is not built on this runtime:
+    //
+    //     1 connection    +14.1%
+    //     8 connections    -2.7%
+    //     64              ~0
+    //     256              +0.8%
+    //     1024            ~0
+    //
+    // The loss at 8 is the flip side of the win at 1. A woken peer is not
+    // wasted when other connections are in flight: it becomes the *next* poller
+    // while this one is busy running its task, which is worth more than the
+    // futex costs. One connection is the only case where there can never be a
+    // next event for it to catch — and also the case where the futex is pure
+    // latency on the critical path of every request.
     //
     // The monitor thread also polls, and it is not a worker and will not run
     // anything, so it still has to wake somebody for every task.

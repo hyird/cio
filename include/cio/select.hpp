@@ -26,6 +26,7 @@
 //     leaves the resume to the setup code.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -338,14 +339,24 @@ private:
             for (std::size_t i = lock_count; i-- > 0;) locked[i]->mutex.unlock();
         };
 
-        // Phase 1: is anything ready right now? Random start offset so a
-        // permanently-ready early case cannot starve the later ones.
+        // Phase 1: is anything ready right now?
+        //
+        // A full shuffle, not a random rotation. A rotation only randomises
+        // where the scan starts, so a case that is never ready still hands its
+        // rotations to whichever case follows it: with [ready, ready, nil] the
+        // first case wins two rotations out of three, a 2:1 bias against the
+        // uniform choice this is documented to make. Go's selectgo shuffles
+        // pollorder for the same reason.
         detail::ChanWaiter* to_wake = nullptr;
-        const std::uint32_t offset = detail::select_rand(kCount);
+        std::array<std::size_t, kCount> poll_order{};
+        for (std::size_t i = 0; i < kCount; ++i) poll_order[i] = i;
+        for (std::size_t i = kCount; i > 1; --i) {
+            const std::size_t j = detail::select_rand(static_cast<std::uint32_t>(i));
+            std::swap(poll_order[i - 1], poll_order[j]);
+        }
+
         std::size_t ready = kCount;
-        for_each_case([&](auto& c, std::size_t raw_index) {
-            if (ready != kCount) return;
-            const std::size_t i = (raw_index + offset) % kCount;
+        for (const std::size_t i : poll_order) {
             visit_case(i, [&](auto& target) {
                 detail::ChanWaiter* woken = nullptr;
                 if (detail::case_try(target, woken) != detail::OpStatus::kBlocked) {
@@ -353,8 +364,8 @@ private:
                     to_wake = woken;
                 }
             });
-            (void)c;
-        });
+            if (ready != kCount) break;
+        }
 
         if (ready != kCount) {
             shared_.winner.store(static_cast<std::uint32_t>(ready), std::memory_order_release);

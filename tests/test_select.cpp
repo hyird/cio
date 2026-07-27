@@ -202,6 +202,37 @@ void test_concurrent_selects() {
     CIO_CHECK_EQ(cio::run(body()), kRounds * 2);
 }
 
+// A rotation randomises only where the scan starts, so a case that is never
+// ready hands its rotations to whichever case follows it. With two ready cases
+// and one disabled, that used to produce a 2:1 split.
+void test_ready_cases_are_uniform_with_a_disabled_case() {
+    auto body = []() -> cio::Task<std::array<int, 2>> {
+        auto a = cio::make_chan<int>();
+        auto b = cio::make_chan<int>();
+        cio::Chan<int> disabled;
+        a.close();
+        b.close();
+
+        std::array<int, 2> picked{};
+        for (int i = 0; i < 6000; ++i) {
+            auto sel = cio::select(cio::recv(a), cio::recv(b), cio::recv(disabled));
+            const std::size_t which = co_await sel;
+            CIO_CHECK(which < 2);
+            if (which < 2) ++picked[which];
+        }
+        co_return picked;
+    };
+
+    const auto picked = cio::run(body());
+    CIO_CHECK(picked[0] > 2500);
+    CIO_CHECK(picked[0] < 3500);
+    CIO_CHECK(picked[1] > 2500);
+    CIO_CHECK(picked[1] < 3500);
+    if (picked[0] <= 2500 || picked[0] >= 3500) {
+        std::fprintf(stderr, "  (split was %d / %d)\n", picked[0], picked[1]);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -214,6 +245,7 @@ int main() {
     RUN_TEST(test_nil_channel_case_is_never_ready);
     RUN_TEST(test_ready_cases_are_chosen_randomly);
     RUN_TEST(test_cancellation_through_select);
+    RUN_TEST(test_ready_cases_are_uniform_with_a_disabled_case);
     RUN_TEST(test_concurrent_selects);
     return cio_test::summary();
 }

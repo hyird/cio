@@ -9,8 +9,8 @@ namespace {
 constexpr auto kIdleKeepAlive = std::chrono::seconds(10);
 }
 
-BlockingPool::BlockingPool(Scheduler& sched, std::size_t max_threads)
-    : sched_(sched), max_threads_(max_threads == 0 ? 512 : max_threads) {}
+BlockingPool::BlockingPool(std::size_t max_threads)
+    : max_threads_(max_threads == 0 ? 512 : max_threads) {}
 
 BlockingPool::~BlockingPool() { shutdown(); }
 

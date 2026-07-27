@@ -20,6 +20,21 @@
 #include "cio/cio.hpp"
 #include "test_util.hpp"
 
+// ASan's quarantine holds freed blocks, which inflates RSS by far more than the
+// growth this test is looking for. LeakSanitizer still runs, and every other
+// assertion here stays active.
+#if defined(__SANITIZE_ADDRESS__)
+constexpr bool kAddressSanitized = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+constexpr bool kAddressSanitized = true;
+#else
+constexpr bool kAddressSanitized = false;
+#endif
+#else
+constexpr bool kAddressSanitized = false;
+#endif
+
 using namespace std::chrono_literals;
 namespace net = cio::net;
 
@@ -70,12 +85,20 @@ cio::Task<> echo_connection(net::TcpStream stream) {
 }
 
 cio::Task<> echo_server(net::TcpListener listener, cio::CancelToken stop) {
+    cio::TaskGroup connections;
     for (;;) {
-        auto conn = co_await listener.accept();
-        if (!conn) break;
         if (stop.cancelled()) break;
-        cio::go(echo_connection(std::move(*conn)));
+        // See test_net.cpp: a deadline is what makes a parked accept observe
+        // cancellation without another task closing the socket under it.
+        listener.set_deadline(cio::Clock::now() + 10ms);
+        auto conn = co_await listener.accept();
+        if (!conn) {
+            if (conn.error().is(cio::Errc::timed_out)) continue;
+            break;
+        }
+        connections.spawn(echo_connection(std::move(*conn)));
     }
+    co_await connections.join();
 }
 
 // One client's life: connect, do a few round trips of random size, sometimes
@@ -162,7 +185,7 @@ cio::Task<bool> soak(std::chrono::seconds duration) {
     const auto addr = listener->local_addr().value();
 
     cio::CancelSource stop;
-    cio::go(echo_server(std::move(*listener), stop.token()));
+    auto server = cio::spawn(echo_server(std::move(*listener), stop.token()));
 
     constexpr int kClients = 48;
     constexpr int kNoiseTasks = 8;
@@ -190,6 +213,7 @@ cio::Task<bool> soak(std::chrono::seconds duration) {
 
     stop.cancel();
     co_await workers.join();
+    co_await server;
 
     // Give the accept loop and any in-flight connections a moment to unwind.
     co_await cio::sleep(200ms);
@@ -214,7 +238,9 @@ cio::Task<bool> soak(std::chrono::seconds duration) {
 
     // Memory is noisier — allocator arenas and thread caches move around — so
     // this only has to catch unbounded growth, not track it precisely.
-    CIO_CHECK(rss_after <= rss_baseline + 65536);
+    if constexpr (!kAddressSanitized) {
+        CIO_CHECK(rss_after <= rss_baseline + 65536);
+    }
 
     co_return g_mismatched.load() == 0;
 }

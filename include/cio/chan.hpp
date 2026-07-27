@@ -25,6 +25,8 @@
 #include <cassert>
 #include <coroutine>
 #include <cstddef>
+#include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -176,13 +178,21 @@ template <typename T>
 class Channel final : public ChannelBase {
 public:
     static Channel* create(std::size_t capacity) {
-        auto* channel = new Channel();
+        // unique_ptr so a throwing buffer allocation does not leak the control
+        // block along the way.
+        auto channel = std::unique_ptr<Channel>(new Channel());
         channel->ChannelBase::capacity = capacity;
         if (capacity > 0) {
+            // capacity * sizeof(T) wrapping would allocate a ring far smaller
+            // than the capacity recorded above, and every buffered send after
+            // that writes out of bounds.
+            if (capacity > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+                throw std::bad_array_new_length{};
+            }
             channel->buffer_ = static_cast<T*>(
                 ::operator new(capacity * sizeof(T), std::align_val_t{alignof(T)}));
         }
-        return channel;
+        return channel.release();
     }
 
     void add_ref() noexcept { refs.fetch_add(1, std::memory_order_relaxed); }

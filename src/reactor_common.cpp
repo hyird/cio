@@ -172,6 +172,12 @@ void Reactor::set_deadline(IoDesc* desc, Dir dir, std::int64_t deadline_ns) {
 // ---------------------------------------------------------------- awaiter ---
 
 bool IoAwaiter::await_ready() noexcept {
+    // A default-constructed, moved-from or closed socket hands us no
+    // descriptor. Completing with EBADF is the only thing that is not a crash.
+    if (desc_ == nullptr) {
+        wait_.err = Error{EBADF};
+        return true;
+    }
     if (desc_->timed_out(dir_)) {
         wait_.err = Error{Errc::timed_out};
         return true;
@@ -197,6 +203,11 @@ bool IoAwaiter::await_suspend(std::coroutine_handle<> h) noexcept {
     IoDesc* const desc = desc_;
     const Dir dir = dir_;
     IoWait* const self = &wait_;
+
+    if (desc == nullptr) {
+        self->err = Error{EBADF};
+        return false;
+    }
 
     self->handle = h;
     self->sched = current_scheduler();
@@ -250,7 +261,7 @@ Result<void> IoAwaiter::await_resume() noexcept {
     // again because the hint is still false, and parks with data sitting in the
     // socket and no further edge coming. Setting it on the path that observed
     // readiness makes the last writer the one that is right.
-    desc_->note_readable(dir_);
+    if (desc_ != nullptr) desc_->note_readable(dir_);
     if (wait_.err) return wait_.err;
     return ok();
 }

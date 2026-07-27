@@ -12,7 +12,22 @@ endif()
 option(CIO_BUILD_TESTS "Build cio tests" ON)
 option(CIO_BUILD_EXAMPLES "Build cio examples" ON)
 option(CIO_BUILD_BENCHMARKS "Build cio benchmarks" ON)
-option(CIO_SANITIZE "Build with thread/address sanitizer (tsan|asan|none)" "none")
+# Not option(): that declares a BOOL, so the "none" default lands in the cache as
+# OFF, no UI can offer the real choices, and a misspelled value silently
+# produces an uninstrumented build that looks sanitized.
+if(NOT DEFINED CIO_SANITIZE OR CIO_SANITIZE STREQUAL "OFF")
+  set(_cio_sanitize "none")
+else()
+  set(_cio_sanitize "${CIO_SANITIZE}")
+endif()
+set(CIO_SANITIZE "${_cio_sanitize}" CACHE STRING
+    "Build with a sanitizer (none|asan|tsan)" FORCE)
+set_property(CACHE CIO_SANITIZE PROPERTY STRINGS none asan tsan)
+unset(_cio_sanitize)
+if(NOT CIO_SANITIZE MATCHES "^(none|asan|tsan)$")
+  message(FATAL_ERROR
+    "Invalid CIO_SANITIZE='${CIO_SANITIZE}'; expected none, asan, or tsan")
+endif()
 
 find_package(Threads REQUIRED)
 
@@ -39,7 +54,9 @@ target_include_directories(cio PUBLIC
 target_compile_features(cio PUBLIC cxx_std_20)
 target_link_libraries(cio PUBLIC Threads::Threads)
 target_compile_options(cio PRIVATE
-  -Wall -Wextra -Wpedantic -Wshadow -Wno-interference-size)
+  -Wall -Wextra -Wpedantic -Wshadow
+  # GCC-only; clang reports it as an unknown warning once per TU.
+  $<$<CXX_COMPILER_ID:GNU>:-Wno-interference-size>)
 
 # Load-bearing, and PUBLIC because it has to reach every translation unit that
 # awaits a task, not just the library's own.
@@ -67,7 +84,9 @@ endif()
 function(cio_add_program dir name)
   add_executable(${name} ${dir}/${name}.cpp)
   target_link_libraries(${name} PRIVATE cio)
-  target_compile_options(${name} PRIVATE -Wall -Wextra -Wno-interference-size)
+  target_compile_options(${name} PRIVATE
+    -Wall -Wextra
+    $<$<CXX_COMPILER_ID:GNU>:-Wno-interference-size>)
 endfunction()
 
 if(CIO_BUILD_TESTS)

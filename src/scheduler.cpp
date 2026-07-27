@@ -106,9 +106,21 @@ void* Worker::find_work() noexcept {
 
     // Non-blocking reactor drain. Skipped when another worker is already parked
     // inside the reactor — it will deliver these events.
-    if (sched.reactor_->registered() > 0 && !sched.polling_.load(std::memory_order_relaxed)) {
+    // Claim the reactor, do not merely test for it. polling_ says "exactly one
+    // thread is inside the reactor", and a load-then-store cannot enforce that:
+    // the parked poller sets the flag under idle_mutex_ and this path reads it
+    // without, so a worker can slip in after the flag is set but before the
+    // poller has entered epoll_wait. Two threads on one epoll fd then race for
+    // the wakeup eventfd, and a non-blocking drain that swallows the token
+    // meant for the blocking poller leaves it in epoll_wait forever — at
+    // shutdown, that is a hung join().
+    bool unclaimed = false;
+    if (sched.reactor_->registered() > 0 &&
+        sched.polling_.compare_exchange_strong(unclaimed, true, std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
         sched.last_poll_ns_.store(now_ns(), std::memory_order_relaxed);
         sched.reactor_->poll(0);
+        sched.polling_.store(false, std::memory_order_release);
         if (void* item = next_local()) return item;
         if (void* item = sched.global_.pop()) return item;
     }
@@ -167,7 +179,7 @@ Scheduler::Scheduler(std::size_t worker_count, std::size_t max_blocking_threads)
     }
     reactor_ = std::make_unique<Reactor>(*this);
     timers_ = std::make_unique<TimerService>(*this, worker_count);
-    blocking_ = std::make_unique<BlockingPool>(*this, max_blocking_threads);
+    blocking_ = std::make_unique<BlockingPool>(max_blocking_threads);
 
     workers_.reserve(worker_count);
     for (std::size_t i = 0; i < worker_count; ++i) {
@@ -387,8 +399,9 @@ bool Scheduler::park(Worker& /*worker*/) {
     // Volunteer to be the one thread blocked in the reactor. polling_ is set
     // while holding the lock so notify() cannot decide "nobody to wake" in the
     // window between the decision and the syscall.
-    if (!polling_.load(std::memory_order_relaxed)) {
-        polling_.store(true, std::memory_order_relaxed);
+    bool unclaimed = false;
+    if (polling_.compare_exchange_strong(unclaimed, true, std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
         lock.unlock();
 
         const std::int64_t timeout_ns = timers_->next_timeout_ns();
@@ -402,7 +415,7 @@ bool Scheduler::park(Worker& /*worker*/) {
 
         {
             std::lock_guard<std::mutex> relock(idle_mutex_);
-            polling_.store(false, std::memory_order_relaxed);
+            polling_.store(false, std::memory_order_release);
         }
         timers_->run_expired();
         leave();
@@ -433,10 +446,15 @@ void Scheduler::monitor_main() {
 
         const std::int64_t now = now_ns();
 
-        if (!polling_.load(std::memory_order_acquire) && reactor_->registered() > 0 &&
+        if (reactor_->registered() > 0 &&
             now - last_poll_ns_.load(std::memory_order_relaxed) > kMonitorPollStaleNs) {
-            last_poll_ns_.store(now, std::memory_order_relaxed);
-            reactor_->poll(0);
+            bool unclaimed = false;
+            if (polling_.compare_exchange_strong(unclaimed, true, std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
+                last_poll_ns_.store(now, std::memory_order_relaxed);
+                reactor_->poll(0);
+                polling_.store(false, std::memory_order_release);
+            }
         }
 
         if (timers_->next_deadline_ns() <= now) timers_->run_expired();

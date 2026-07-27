@@ -1,4 +1,7 @@
 #include <atomic>
+#include <cstdint>
+#include <limits>
+#include <new>
 #include <chrono>
 #include <numeric>
 #include <string>
@@ -160,6 +163,23 @@ void test_string_payload_ordering() {
     CIO_CHECK_EQ(cio::run(body()), std::string("abcdefghijklmnopqrstuvwxyz"));
 }
 
+// capacity * sizeof(T) wrapping would allocate a ring far smaller than the
+// capacity the channel then believes it has.
+void test_capacity_overflow_is_rejected() {
+    constexpr std::size_t impossible =
+        std::numeric_limits<std::size_t>::max() / sizeof(std::uint64_t) + 1;
+    bool rejected = false;
+    try {
+        auto channel = cio::make_chan<std::uint64_t>(impossible);
+        (void)channel;
+    } catch (const std::bad_array_new_length&) {
+        rejected = true;
+    } catch (const std::bad_alloc&) {
+        rejected = true;
+    }
+    CIO_CHECK(rejected);
+}
+
 }  // namespace
 
 int main() {
@@ -170,5 +190,6 @@ int main() {
     RUN_TEST(test_mpmc_throughput);
     RUN_TEST(test_move_only_payload);
     RUN_TEST(test_string_payload_ordering);
+    RUN_TEST(test_capacity_overflow_is_rejected);
     return cio_test::summary();
 }

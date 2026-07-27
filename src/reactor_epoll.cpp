@@ -189,9 +189,22 @@ void Reactor::wake() noexcept {
     // Collapse redundant wakes: many schedule() calls can race to nudge one
     // parked poller, and each write is a syscall.
     if (wake_pending_.exchange(true, std::memory_order_acq_rel)) return;
+
     const std::uint64_t one = 1;
-    ssize_t written = ::write(wake_write_fd_, &one, sizeof(one));
-    (void)written;
+    for (;;) {
+        const ssize_t written = ::write(wake_write_fd_, &one, sizeof(one));
+        if (written == static_cast<ssize_t>(sizeof(one))) return;
+        if (written < 0 && errno == EINTR) continue;
+        // EAGAIN means the counter is already saturated, so a token is pending
+        // and the poll will return regardless.
+        if (written < 0 && errno == EAGAIN) return;
+
+        // Anything else published no token. Dropping the flag matters more than
+        // the failed write: leaving it set would silently swallow every future
+        // wake, including the one that ends a blocking poll at shutdown.
+        wake_pending_.store(false, std::memory_order_release);
+        return;
+    }
 }
 
 }  // namespace cio::detail

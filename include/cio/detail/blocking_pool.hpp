@@ -21,8 +21,6 @@
 
 namespace cio::detail {
 
-class Scheduler;
-
 // Intrusive job node. Lives in the awaiter, which lives in the coroutine frame.
 struct BlockingJob {
     // Runs the user's callable, stores its result, then reschedules the waiter.
@@ -32,7 +30,7 @@ struct BlockingJob {
 
 class BlockingPool {
 public:
-    BlockingPool(Scheduler& sched, std::size_t max_threads);
+    explicit BlockingPool(std::size_t max_threads);
     ~BlockingPool();
 
     BlockingPool(const BlockingPool&) = delete;
@@ -51,7 +49,6 @@ private:
     void worker_main();
     void spawn_thread();
 
-    Scheduler& sched_;
     std::size_t max_threads_;
 
     std::mutex mutex_;

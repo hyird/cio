@@ -1,4 +1,5 @@
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <string>
@@ -25,13 +26,25 @@ cio::Task<> echo_connection(net::TcpStream stream) {
     }
 }
 
-cio::Task<> echo_server(net::TcpListener listener, cio::CancelToken token) {
+// Cancellable accept loop, and the reason it is shaped this way: cancellation
+// does not interrupt a parked accept(), so a server that only checks a token
+// after accept returns never returns at all once traffic stops. A short listener
+// deadline makes accept come back on its own, which lets the loop observe the
+// token without a second task closing the socket underneath it. Everything it
+// spawns is joined, so nothing is still parked when the runtime is destroyed.
+cio::Task<> echo_server(net::TcpListener listener, cio::CancelToken stop) {
+    cio::TaskGroup connections;
     for (;;) {
+        if (stop.cancelled()) break;
+        listener.set_deadline(cio::Clock::now() + 10ms);
         auto conn = co_await listener.accept();
-        if (!conn) break;  // Errc::closed when the listener is torn down
-        cio::go(echo_connection(std::move(*conn)));
-        if (token.cancelled()) break;
+        if (!conn) {
+            if (conn.error().is(cio::Errc::timed_out)) continue;
+            break;  // Errc::closed when the listener is torn down
+        }
+        connections.spawn(echo_connection(std::move(*conn)));
     }
+    co_await connections.join();
 }
 
 void test_echo_round_trip() {
@@ -41,7 +54,7 @@ void test_echo_round_trip() {
         const auto addr = listener->local_addr().value();
 
         cio::CancelSource stop;
-        cio::go(echo_server(std::move(*listener), stop.token()));
+        auto server = cio::spawn(echo_server(std::move(*listener), stop.token()));
 
         auto client = co_await net::TcpStream::connect(addr);
         CIO_CHECK(client.has_value());
@@ -58,7 +71,9 @@ void test_echo_round_trip() {
             if (!n || *n == 0) break;
             received.append(reinterpret_cast<const char*>(buffer), *n);
         }
+        client->close();
         stop.cancel();
+        co_await server;
         co_return received;
     };
     CIO_CHECK_EQ(cio::run(body()), std::string("hello cio"));
@@ -135,7 +150,7 @@ void test_many_concurrent_connections() {
         const auto addr = listener->local_addr().value();
 
         cio::CancelSource stop;
-        cio::go(echo_server(std::move(*listener), stop.token()));
+        auto server = cio::spawn(echo_server(std::move(*listener), stop.token()));
 
         cio::TaskGroup clients;
         auto successes = cio::make_chan<int>(kClients);
@@ -173,6 +188,7 @@ void test_many_concurrent_connections() {
         int total = 0;
         for (int i = 0; i < kClients; ++i) total += *co_await successes.recv();
         stop.cancel();
+        co_await server;
         co_return total;
     };
     CIO_CHECK_EQ(cio::run(body()), kClients * kRoundTrips);
@@ -271,6 +287,38 @@ void test_blocking_pool_offload() {
     CIO_CHECK_EQ(cio::run(body()), 31 * 32);
 }
 
+// Default-constructed, moved-from and closed sockets have no descriptor. Every
+// fallible entry point must say EBADF rather than dereference it.
+void test_invalid_socket_operations_return_ebadf() {
+    auto body = []() -> cio::Task<bool> {
+        std::byte buffer[16];
+        net::SocketAddr from;
+
+        net::TcpStream stream;
+        auto read = co_await stream.read(buffer);
+        auto write = co_await stream.write(bytes_of("x"));
+        auto readable = co_await stream.readable();
+        CIO_CHECK(!read && read.error().is(EBADF));
+        CIO_CHECK(!write && write.error().is(EBADF));
+        CIO_CHECK(!readable && readable.error().is(EBADF));
+        // Void mutators must be a safe no-op, not a crash.
+        stream.set_read_timeout(1s);
+        stream.clear_read_deadline();
+
+        net::TcpListener listener;
+        auto accepted = co_await listener.accept();
+        CIO_CHECK(!accepted && accepted.error().is(EBADF));
+
+        net::UdpSocket udp;
+        auto received = co_await udp.recv_from(buffer, from);
+        auto sent = co_await udp.send_to(bytes_of("x"), net::SocketAddr::loopback_v4(9));
+        CIO_CHECK(!received && received.error().is(EBADF));
+        CIO_CHECK(!sent && sent.error().is(EBADF));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 }  // namespace
 
 int main() {
@@ -282,5 +330,6 @@ int main() {
     RUN_TEST(test_udp_round_trip);
     RUN_TEST(test_resolve_localhost);
     RUN_TEST(test_blocking_pool_offload);
+    RUN_TEST(test_invalid_socket_operations_return_ebadf);
     return cio_test::summary();
 }

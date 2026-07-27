@@ -228,6 +228,7 @@ Result<SocketAddr> Socket::peer_addr() const {
 // an attempt — but they keep the readiness hint coherent so that mixing them
 // with the awaiting forms does not confuse it.
 Result<std::size_t> TcpStream::try_read(std::span<std::byte> buffer) {
+    if (fd_ < 0 || desc_ == nullptr) return Error{EBADF};
     const ssize_t n = ::recv(fd_, buffer.data(), buffer.size(), 0);
     if (n >= 0) {
         if (static_cast<std::size_t>(n) < buffer.size()) {
@@ -240,6 +241,7 @@ Result<std::size_t> TcpStream::try_read(std::span<std::byte> buffer) {
 }
 
 Result<std::size_t> TcpStream::try_write(std::span<const std::byte> buffer) {
+    if (fd_ < 0 || desc_ == nullptr) return Error{EBADF};
     // MSG_NOSIGNAL: a write to a closed peer must be an EPIPE return, not a
     // process-wide SIGPIPE.
     const ssize_t n = ::send(fd_, buffer.data(), buffer.size(), MSG_NOSIGNAL);
@@ -254,6 +256,7 @@ Result<std::size_t> TcpStream::try_write(std::span<const std::byte> buffer) {
 }
 
 Task<Result<std::size_t>> TcpStream::read(std::span<std::byte> buffer) {
+    if (fd_ < 0 || desc_ == nullptr) co_return Error{EBADF};
     for (;;) {
         // Skip the syscall when the last one proved the queue empty and no edge
         // has arrived since. This is what removes the EAGAIN read that
@@ -280,6 +283,7 @@ Task<Result<std::size_t>> TcpStream::read(std::span<std::byte> buffer) {
 }
 
 Task<Result<std::size_t>> TcpStream::write(std::span<const std::byte> buffer) {
+    if (fd_ < 0 || desc_ == nullptr) co_return Error{EBADF};
     for (;;) {
         if (desc_->may_be_ready(detail::Dir::kWrite)) {
             const ssize_t n = ::send(fd_, buffer.data(), buffer.size(), MSG_NOSIGNAL);
@@ -357,6 +361,7 @@ Task<Result<TcpStream>> TcpStream::connect(std::string host, std::uint16_t port)
 }
 
 void TcpStream::set_read_deadline(TimePoint deadline) {
+    if (desc_ == nullptr) return;
     reactor_for(desc_).set_deadline(
         desc_, detail::Dir::kRead,
         std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
@@ -364,6 +369,7 @@ void TcpStream::set_read_deadline(TimePoint deadline) {
 }
 
 void TcpStream::set_write_deadline(TimePoint deadline) {
+    if (desc_ == nullptr) return;
     reactor_for(desc_).set_deadline(
         desc_, detail::Dir::kWrite,
         std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
@@ -371,18 +377,22 @@ void TcpStream::set_write_deadline(TimePoint deadline) {
 }
 
 void TcpStream::set_read_timeout(Duration timeout) {
+    if (desc_ == nullptr) return;
     reactor_for(desc_).set_deadline(desc_, detail::Dir::kRead, deadline_from_now(timeout));
 }
 
 void TcpStream::set_write_timeout(Duration timeout) {
+    if (desc_ == nullptr) return;
     reactor_for(desc_).set_deadline(desc_, detail::Dir::kWrite, deadline_from_now(timeout));
 }
 
 void TcpStream::clear_read_deadline() {
+    if (desc_ == nullptr) return;
     reactor_for(desc_).set_deadline(desc_, detail::Dir::kRead, 0);
 }
 
 void TcpStream::clear_write_deadline() {
+    if (desc_ == nullptr) return;
     reactor_for(desc_).set_deadline(desc_, detail::Dir::kWrite, 0);
 }
 
@@ -435,6 +445,7 @@ Result<TcpListener> TcpListener::bind(std::string_view host, std::uint16_t port,
 }
 
 Task<Result<TcpStream>> TcpListener::accept() {
+    if (fd_ < 0 || desc_ == nullptr) co_return Error{EBADF};
     for (;;) {
         if (desc_->may_be_ready(detail::Dir::kRead)) {
             const int fd = ::accept4(fd_, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
@@ -459,6 +470,7 @@ Task<Result<TcpStream>> TcpListener::accept() {
 }
 
 void TcpListener::set_deadline(TimePoint deadline) {
+    if (desc_ == nullptr) return;
     reactor_for(desc_).set_deadline(
         desc_, detail::Dir::kRead,
         std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
@@ -466,6 +478,7 @@ void TcpListener::set_deadline(TimePoint deadline) {
 }
 
 void TcpListener::clear_deadline() {
+    if (desc_ == nullptr) return;
     reactor_for(desc_).set_deadline(desc_, detail::Dir::kRead, 0);
 }
 
@@ -491,6 +504,7 @@ Result<UdpSocket> UdpSocket::bind(SocketAddr addr) {
 }
 
 Task<Result<std::size_t>> UdpSocket::recv_from(std::span<std::byte> buffer, SocketAddr& from) {
+    if (fd_ < 0 || desc_ == nullptr) co_return Error{EBADF};
     for (;;) {
         sockaddr_storage storage{};
         socklen_t length = sizeof(storage);
@@ -514,6 +528,7 @@ Task<Result<std::size_t>> UdpSocket::recv_from(std::span<std::byte> buffer, Sock
 
 Task<Result<std::size_t>> UdpSocket::send_to(std::span<const std::byte> buffer,
                                              const SocketAddr& to) {
+    if (fd_ < 0 || desc_ == nullptr) co_return Error{EBADF};
     for (;;) {
         const ssize_t n = ::sendto(fd_, buffer.data(), buffer.size(), MSG_NOSIGNAL, to.raw(),
                                    to.length());
@@ -529,6 +544,7 @@ Task<Result<std::size_t>> UdpSocket::send_to(std::span<const std::byte> buffer,
 }
 
 void UdpSocket::set_read_deadline(TimePoint deadline) {
+    if (desc_ == nullptr) return;
     reactor_for(desc_).set_deadline(
         desc_, detail::Dir::kRead,
         std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
@@ -536,6 +552,7 @@ void UdpSocket::set_read_deadline(TimePoint deadline) {
 }
 
 void UdpSocket::set_write_deadline(TimePoint deadline) {
+    if (desc_ == nullptr) return;
     reactor_for(desc_).set_deadline(
         desc_, detail::Dir::kWrite,
         std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())

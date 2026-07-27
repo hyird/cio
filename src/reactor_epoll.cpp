@@ -185,7 +185,26 @@ void Reactor::poll(std::int64_t timeout_ns) {
     }
 
     CIO_METRIC(poll_wakeups, made_runnable);
-    sched_.notify_batch(made_runnable);
+
+    // One of these is the poller's own next task, so it needs one fewer peer
+    // awake than it made runnable.
+    //
+    // Every caller of poll() that is a worker returns straight to its run loop
+    // and takes an item — park() falls through to Worker::run's next_local(),
+    // find_work() calls next_local() itself. Counting that one as somebody
+    // else's work means a poll that wakes a single task issues a futex to a
+    // parked worker which arrives, finds the queue already emptied by the
+    // poller, and parks again. At one connection that round trip is on the
+    // critical path of every request: 93us per round trip against asio's 79.
+    //
+    // Go does the same thing for the same reason — findRunnable pops one
+    // goroutine off the netpoll list to run on the current P and injects only
+    // the remainder.
+    //
+    // The monitor thread also polls, and it is not a worker and will not run
+    // anything, so it still has to wake somebody for every task.
+    const std::uint32_t taken_by_poller = current_worker() != nullptr ? 1u : 0u;
+    sched_.notify_batch(made_runnable > taken_by_poller ? made_runnable - taken_by_poller : 0);
 }
 
 void Reactor::wake() noexcept {

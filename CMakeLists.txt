@@ -12,6 +12,7 @@ endif()
 option(CIO_BUILD_TESTS "Build cio tests" ON)
 option(CIO_BUILD_EXAMPLES "Build cio examples" ON)
 option(CIO_BUILD_BENCHMARKS "Build cio benchmarks" ON)
+option(CIO_METRICS "Count scheduler/reactor events (see detail/metrics.hpp)" OFF)
 # Not option(): that declares a BOOL, so the "none" default lands in the cache as
 # OFF, no UI can offer the real choices, and a misspelled value silently
 # produces an uninstrumented build that looks sanitized.
@@ -43,6 +44,7 @@ set(CIO_SOURCES
   src/blocking_pool.cpp
   src/runtime.cpp
   src/net.cpp
+  src/metrics.cpp
 )
 
 add_library(cio ${CIO_SOURCES})
@@ -57,6 +59,15 @@ target_compile_options(cio PRIVATE
   -Wall -Wextra -Wpedantic -Wshadow
   # GCC-only; clang reports it as an unknown warning once per TU.
   $<$<CXX_COMPILER_ID:GNU>:-Wno-interference-size>)
+
+# PRIVATE, and load-bearing that it is: every CIO_METRIC() call site is in a
+# .cpp file in this target. One in a header would make an inline function's
+# body depend on a macro consumers do not define, which is an ODR violation
+# that links cleanly and then misbehaves. runtime_metrics() is declared
+# unconditionally and defined either way, so consumers need no flag to call it.
+if(CIO_METRICS)
+  target_compile_definitions(cio PRIVATE CIO_METRICS=1)
+endif()
 
 # Load-bearing, and PUBLIC because it has to reach every translation unit that
 # awaits a task, not just the library's own.

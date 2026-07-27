@@ -10,7 +10,11 @@
 // perturbs the thing being measured as little as a counter can. It is still
 // off by default: a benchmark and a production build should not differ.
 //
-//     cmake -DCIO_METRICS=ON ...
+//     cmake -S . -B build-metrics -DCIO_METRICS=ON -DCMAKE_BUILD_TYPE=Release
+//
+// runtime_metrics() links in either build — it just returns zeroes when the
+// counters are compiled out — so a diagnostic can be written once and pointed
+// at whichever build is interesting.
 #pragma once
 
 #include <atomic>

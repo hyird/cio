@@ -22,6 +22,7 @@
 #include "cio/blocking.hpp"
 #include "cio/chan.hpp"
 #include "cio/clock.hpp"
+#include "cio/detail/metrics.hpp"
 #include "cio/group.hpp"
 #include "cio/main.hpp"
 #include "cio/net.hpp"

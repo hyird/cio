@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "cio/detail/metrics.hpp"
 #include "cio/detail/reactor.hpp"
 #include "cio/detail/scheduler.hpp"
 
@@ -154,6 +155,7 @@ void Reactor::poll(std::int64_t timeout_ns) {
 
     const int n = wait_for_events(backend_fd_, events, kMaxEvents, timeout_ns);
     if (n <= 0) return;  // 0 = timeout, <0 = EINTR or error; either way, retry later
+    CIO_METRIC(poll_events, static_cast<std::uint64_t>(n));
 
     // One syscall can make hundreds of tasks runnable. Queue them all, then
     // issue a single wake sized to the burst — see Scheduler::notify_batch.
@@ -182,6 +184,7 @@ void Reactor::poll(std::int64_t timeout_ns) {
         if (dirs != 0) dispatch(token, dirs, &made_runnable);
     }
 
+    CIO_METRIC(poll_wakeups, made_runnable);
     sched_.notify_batch(made_runnable);
 }
 
@@ -189,6 +192,7 @@ void Reactor::wake() noexcept {
     // Collapse redundant wakes: many schedule() calls can race to nudge one
     // parked poller, and each write is a syscall.
     if (wake_pending_.exchange(true, std::memory_order_acq_rel)) return;
+    CIO_METRIC(reactor_wakes, 1);
 
     const std::uint64_t one = 1;
     for (;;) {

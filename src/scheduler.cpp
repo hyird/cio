@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "cio/clock.hpp"
+#include "cio/detail/metrics.hpp"
 
 namespace cio::detail {
 namespace {
@@ -41,6 +42,7 @@ std::uint32_t Worker::rand_up_to(std::uint32_t n) noexcept {
 
 void Worker::push(void* item) noexcept {
     if (CIO_LIKELY(queue_.push(item))) return;
+    CIO_METRIC(local_overflow, 1);
     // Ring full: spill half of it plus the new item to the global queue in one
     // lock acquisition, so a burst of spawns degrades gracefully instead of
     // hammering the mutex once per task.
@@ -78,8 +80,10 @@ void* Worker::steal_from_peers() noexcept {
         Worker& victim = *sched_->workers_[(start + i) % worker_count];
         if (&victim == this) continue;
 
+        CIO_METRIC(steal_attempts, 1);
         const std::uint32_t got = victim.queue_.grab(batch, kLocalQueueCapacity / 2);
         if (got > 0) {
+            CIO_METRIC(steal_hits, 1);
             for (std::uint32_t k = 1; k < got; ++k) push(batch[k]);
             return batch[0];
         }
@@ -97,6 +101,8 @@ void* Worker::find_work() noexcept {
         const std::uint32_t n = sched.global_.pop_batch(
             batch, kLocalQueueCapacity / 2, static_cast<std::uint32_t>(sched.workers_.size()));
         if (n > 0) {
+            CIO_METRIC(global_batch_pops, 1);
+            CIO_METRIC(global_batch_items, n);
             for (std::uint32_t i = 1; i < n; ++i) push(batch[i]);
             return batch[0];
         }
@@ -119,6 +125,7 @@ void* Worker::find_work() noexcept {
         sched.polling_.compare_exchange_strong(unclaimed, true, std::memory_order_acq_rel,
                                                std::memory_order_acquire)) {
         sched.last_poll_ns_.store(now_ns(), std::memory_order_relaxed);
+        CIO_METRIC(polls_nonblocking, 1);
         sched.reactor_->poll(0);
         sched.polling_.store(false, std::memory_order_release);
         if (void* item = next_local()) return item;
@@ -157,6 +164,7 @@ void Worker::run() {
                     sched_->notify();
                 }
             }
+            CIO_METRIC(tasks_run, 1);
             std::coroutine_handle<>::from_address(item).resume();
             continue;
         }
@@ -300,6 +308,11 @@ void Scheduler::notify_batch(std::uint32_t count) noexcept {
         }
     }
 
+    if (granted > 0) {
+        CIO_METRIC(wake_batch_calls, 1);
+        CIO_METRIC(wake_batch_workers, granted);
+    }
+
     if (granted == 0) {
         // Nobody on the condition variable — fall back to the single-wake path,
         // which also knows how to nudge a worker parked inside the reactor.
@@ -341,6 +354,7 @@ void Scheduler::notify() noexcept {
     }
 
     if (handed_off) {
+        CIO_METRIC(wake_single, 1);
         idle_cv_.notify_one();
         return;
     }
@@ -370,6 +384,7 @@ bool Scheduler::any_work_available() const noexcept {
 }
 
 bool Scheduler::park(Worker& /*worker*/) {
+    CIO_METRIC(parks, 1);
     // Announce "idle" *before* dropping the searcher credit. notify() reads
     // idle_ then spinning_, both seq_cst; if it observes spinning_ == 0 then
     // our decrement already happened, so our increment did too and it is
@@ -410,6 +425,7 @@ bool Scheduler::park(Worker& /*worker*/) {
         poller_deadline_ns_.store(timeout_ns < 0 ? INT64_MAX : now_ns() + timeout_ns,
                                   std::memory_order_release);
         last_poll_ns_.store(now_ns(), std::memory_order_relaxed);
+        CIO_METRIC(polls_blocking, 1);
         reactor_->poll(timeout_ns);
         poller_deadline_ns_.store(INT64_MAX, std::memory_order_release);
 
@@ -423,6 +439,7 @@ bool Scheduler::park(Worker& /*worker*/) {
     }
 
     ++waiters_;
+    CIO_METRIC(park_cv_waits, 1);
     idle_cv_.wait(lock, [this] {
         return wake_tokens_ > 0 || stop_.load(std::memory_order_acquire);
     });
@@ -452,6 +469,7 @@ void Scheduler::monitor_main() {
             if (polling_.compare_exchange_strong(unclaimed, true, std::memory_order_acq_rel,
                                                  std::memory_order_acquire)) {
                 last_poll_ns_.store(now, std::memory_order_relaxed);
+                CIO_METRIC(polls_nonblocking, 1);
                 reactor_->poll(0);
                 polling_.store(false, std::memory_order_release);
             }

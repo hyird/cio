@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <stdexcept>
 #include <vector>
 
 #include "cio/cio.hpp"
@@ -120,6 +121,38 @@ void test_detached_task_runs() {
     CIO_CHECK_EQ(seen.load(), 100);
 }
 
+// Task, JoinHandle and go() are all publicly reachable with nothing behind
+// them; each used to dereference the null and crash.
+void test_invalid_async_handles_report_errors() {
+    auto body = []() -> cio::Task<bool> {
+        bool task_rejected = false;
+        try {
+            cio::Task<int> invalid_task;
+            (void)co_await invalid_task;
+        } catch (const std::logic_error&) {
+            task_rejected = true;
+        }
+
+        bool join_rejected = false;
+        try {
+            cio::JoinHandle<int> invalid_join;
+            (void)co_await invalid_join;
+        } catch (const std::logic_error&) {
+            join_rejected = true;
+        }
+
+        bool go_rejected = false;
+        try {
+            cio::go(cio::Task<>{});
+        } catch (const std::invalid_argument&) {
+            go_rejected = true;
+        }
+
+        co_return task_rejected && join_rejected && go_rejected;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 }  // namespace
 
 int main() {
@@ -129,5 +162,6 @@ int main() {
     RUN_TEST(test_many_tasks_across_workers);
     RUN_TEST(test_yield_round_trips);
     RUN_TEST(test_detached_task_runs);
+    RUN_TEST(test_invalid_async_handles_report_errors);
     return cio_test::summary();
 }

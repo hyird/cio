@@ -159,11 +159,19 @@ public:
         struct Awaiter {
             detail::JoinState<T>* state;
 
-            bool await_ready() const noexcept { return state->completed(); }
-            bool await_suspend(std::coroutine_handle<> joiner) noexcept {
-                return state->try_park(joiner);
+            bool await_ready() const noexcept {
+                return state == nullptr || state->completed();
             }
-            T await_resume() { return state->take(); }
+            bool await_suspend(std::coroutine_handle<> joiner) noexcept {
+                return state != nullptr && state->try_park(joiner);
+            }
+            T await_resume() {
+                // A default-constructed or detached JoinHandle has no state.
+                if (state == nullptr) {
+                    throw std::logic_error("cio: awaited an invalid JoinHandle");
+                }
+                return state->take();
+            }
         };
         return Awaiter{state_.get()};
     }
@@ -179,6 +187,7 @@ template <typename T>
 void go(Task<T> task) {
     detail::Scheduler& sched = detail::require_scheduler();
     auto handle = task.release();
+    if (!handle) throw std::invalid_argument("cio: cannot schedule an invalid Task");
     handle.promise().detached = true;
     sched.schedule(handle);
 }
@@ -188,6 +197,7 @@ namespace detail {
 template <typename T>
 inline void go_on(Scheduler& sched, Task<T> task) {
     auto handle = task.release();
+    if (!handle) throw std::invalid_argument("cio: cannot schedule an invalid Task");
     handle.promise().detached = true;
     sched.schedule(handle);
 }

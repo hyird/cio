@@ -18,6 +18,7 @@
 #include <coroutine>
 #include <exception>
 #include <optional>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -151,7 +152,14 @@ private:
             return coro;  // tail-call into the child
         }
 
-        decltype(auto) await_resume() { return coro.promise().result(); }
+        decltype(auto) await_resume() {
+            // await_ready() reports a null handle as "already done", so this is
+            // where a default-constructed or moved-from Task lands. Awaiting one
+            // is a programming error, and the codebase reports those as
+            // exceptions rather than Results.
+            if (!coro) throw std::logic_error("cio: awaited an invalid Task");
+            return coro.promise().result();
+        }
     };
 
     void destroy() noexcept {

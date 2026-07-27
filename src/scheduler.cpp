@@ -309,6 +309,7 @@ void Scheduler::notify_batch(std::uint32_t count) noexcept {
     }
 
     std::uint32_t granted = 0;
+    bool wake_everyone = false;
     {
         std::lock_guard<std::mutex> lock(idle_mutex_);
         const std::uint32_t claimable = waiters_ > wake_tokens_ ? waiters_ - wake_tokens_ : 0;
@@ -319,6 +320,12 @@ void Scheduler::notify_batch(std::uint32_t count) noexcept {
             // claim its token, so it cannot decrement before we have added.
             spinning_.fetch_add(granted, std::memory_order_seq_cst);
             wake_tokens_ += granted;
+            // There is now a token for every waiter, so one broadcast delivers
+            // them all. Below, the loop of notify_one() is `granted` separate
+            // FUTEX_WAKE syscalls issued back to back, which means the last
+            // worker to be told starts that whole sequence late — and it is on
+            // the critical path of whichever request its task belongs to.
+            wake_everyone = wake_tokens_ >= waiters_;
         }
     }
 
@@ -331,6 +338,10 @@ void Scheduler::notify_batch(std::uint32_t count) noexcept {
         // Nobody on the condition variable — fall back to the single-wake path,
         // which also knows how to nudge a worker parked inside the reactor.
         notify();
+        return;
+    }
+    if (wake_everyone) {
+        idle_cv_.notify_all();
         return;
     }
     for (std::uint32_t i = 0; i < granted; ++i) idle_cv_.notify_one();

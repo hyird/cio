@@ -206,30 +206,69 @@ void test_concurrent_selects() {
 // ready hands its rotations to whichever case follows it. With two ready cases
 // and one disabled, that used to produce a 2:1 split.
 void test_ready_cases_are_uniform_with_a_disabled_case() {
-    auto body = []() -> cio::Task<std::array<int, 2>> {
+    auto body = [](std::size_t disabled) -> cio::Task<std::array<int, 3>> {
+        std::array<cio::Chan<int>, 3> channels;
+        for (std::size_t i = 0; i < channels.size(); ++i) {
+            if (i == disabled) continue;
+            channels[i] = cio::make_chan<int>();
+            channels[i].close();
+        }
+
+        std::array<int, 3> picked{};
+        for (int i = 0; i < 6000; ++i) {
+            auto sel = cio::select(cio::recv(channels[0]), cio::recv(channels[1]),
+                                   cio::recv(channels[2]));
+            const std::size_t which = co_await sel;
+            CIO_CHECK(which < picked.size());
+            if (which < picked.size()) ++picked[which];
+        }
+
+        co_return picked;
+    };
+
+    for (std::size_t disabled = 0; disabled < 3; ++disabled) {
+        const auto picked = cio::run(body(disabled));
+        CIO_CHECK_EQ(picked[disabled], 0);
+        for (std::size_t i = 0; i < picked.size(); ++i) {
+            if (i == disabled) continue;
+            CIO_CHECK(picked[i] > 2500);
+            CIO_CHECK(picked[i] < 3500);
+        }
+        if (picked[disabled] != 0) {
+            std::fprintf(stderr, "  (disabled %zu was selected %d times)\n", disabled,
+                         picked[disabled]);
+        }
+    }
+}
+
+void test_three_ready_cases_are_uniform() {
+    auto body = []() -> cio::Task<std::array<int, 3>> {
         auto a = cio::make_chan<int>();
         auto b = cio::make_chan<int>();
-        cio::Chan<int> disabled;
+        auto c = cio::make_chan<int>();
         a.close();
         b.close();
+        c.close();
 
-        std::array<int, 2> picked{};
-        for (int i = 0; i < 6000; ++i) {
-            auto sel = cio::select(cio::recv(a), cio::recv(b), cio::recv(disabled));
+        std::array<int, 3> picked{};
+        for (int i = 0; i < 9000; ++i) {
+            auto sel = cio::select(cio::recv(a), cio::recv(b), cio::recv(c));
             const std::size_t which = co_await sel;
-            CIO_CHECK(which < 2);
-            if (which < 2) ++picked[which];
+            CIO_CHECK(which < picked.size());
+            if (which < picked.size()) ++picked[which];
         }
         co_return picked;
     };
 
     const auto picked = cio::run(body());
-    CIO_CHECK(picked[0] > 2500);
-    CIO_CHECK(picked[0] < 3500);
-    CIO_CHECK(picked[1] > 2500);
-    CIO_CHECK(picked[1] < 3500);
-    if (picked[0] <= 2500 || picked[0] >= 3500) {
-        std::fprintf(stderr, "  (split was %d / %d)\n", picked[0], picked[1]);
+    for (const int count : picked) {
+        CIO_CHECK(count > 2500);
+        CIO_CHECK(count < 3500);
+    }
+    if (picked[0] <= 2500 || picked[0] >= 3500 || picked[1] <= 2500 ||
+        picked[1] >= 3500 || picked[2] <= 2500 || picked[2] >= 3500) {
+        std::fprintf(stderr, "  (split was %d / %d / %d)\n", picked[0], picked[1],
+                     picked[2]);
     }
 }
 
@@ -309,6 +348,7 @@ int main() {
     RUN_TEST(test_cancellation_through_select);
     RUN_TEST(test_ready_cases_are_uniform_with_a_disabled_case);
     RUN_TEST(test_two_ready_cases_are_uniform);
+    RUN_TEST(test_three_ready_cases_are_uniform);
     RUN_TEST(test_four_ready_cases_are_uniform);
     RUN_TEST(test_concurrent_selects);
     return cio_test::summary();

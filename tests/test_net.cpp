@@ -224,6 +224,36 @@ void test_close_wakes_a_parked_reader() {
     CIO_CHECK(cio::run(body()));
 }
 
+void test_local_close_wakes_a_parked_reader() {
+    auto body = []() -> cio::Task<bool> {
+        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        CIO_CHECK(listener.has_value());
+        const auto addr = listener->local_addr().value();
+
+        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpStream> {
+            auto conn = co_await l.accept();
+            co_return std::move(conn.value());
+        }(std::move(*listener)));
+
+        auto client = co_await net::TcpStream::connect(addr);
+        CIO_CHECK(client.has_value());
+        auto server_side = co_await accepted;
+
+        auto reader = cio::spawn([](net::TcpStream& stream) -> cio::Task<cio::Error> {
+            std::byte buffer[16];
+            auto result = co_await stream.read(buffer);
+            co_return result.error();
+        }(*client));
+
+        co_await cio::sleep(20ms);
+        client->close();
+        const cio::Error error = co_await reader;
+        CIO_CHECK(error.is(cio::Errc::closed));
+        co_return error.is(cio::Errc::closed);
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 void test_udp_round_trip() {
     auto body = []() -> cio::Task<std::string> {
         auto server = net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
@@ -301,19 +331,29 @@ void test_invalid_socket_operations_return_ebadf() {
         CIO_CHECK(!read && read.error().is(EBADF));
         CIO_CHECK(!write && write.error().is(EBADF));
         CIO_CHECK(!readable && readable.error().is(EBADF));
+        const auto try_read = stream.try_read(buffer);
+        const auto try_write = stream.try_write(bytes_of("x"));
+        CIO_CHECK(!try_read && try_read.error().is(EBADF));
+        CIO_CHECK(!try_write && try_write.error().is(EBADF));
         // Void mutators must be a safe no-op, not a crash.
         stream.set_read_timeout(1s);
+        stream.set_write_timeout(1s);
         stream.clear_read_deadline();
+        stream.clear_write_deadline();
 
         net::TcpListener listener;
         auto accepted = co_await listener.accept();
         CIO_CHECK(!accepted && accepted.error().is(EBADF));
+        listener.set_deadline(cio::Clock::now());
+        listener.clear_deadline();
 
         net::UdpSocket udp;
         auto received = co_await udp.recv_from(buffer, from);
         auto sent = co_await udp.send_to(bytes_of("x"), net::SocketAddr::loopback_v4(9));
         CIO_CHECK(!received && received.error().is(EBADF));
         CIO_CHECK(!sent && sent.error().is(EBADF));
+        udp.set_read_deadline(cio::Clock::now());
+        udp.set_write_deadline(cio::Clock::now());
         co_return true;
     };
     CIO_CHECK(cio::run(body()));
@@ -327,6 +367,7 @@ int main() {
     RUN_TEST(test_connect_refused);
     RUN_TEST(test_many_concurrent_connections);
     RUN_TEST(test_close_wakes_a_parked_reader);
+    RUN_TEST(test_local_close_wakes_a_parked_reader);
     RUN_TEST(test_udp_round_trip);
     RUN_TEST(test_resolve_localhost);
     RUN_TEST(test_blocking_pool_offload);

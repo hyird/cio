@@ -119,6 +119,21 @@ public:
     // Wakes one parked worker if one exists and no searcher is already awake.
     void notify() noexcept;
 
+    // Pushes a task without waking anybody. The caller must follow up with
+    // notify_batch(). Only for callers that make many tasks runnable at once
+    // and know the count.
+    void schedule_deferred(std::coroutine_handle<> h) noexcept;
+
+    // Wakes up to `count` parked workers at once.
+    //
+    // notify() deliberately wakes exactly one, because the common case is a
+    // single task becoming runnable and any more would be wasted futex traffic.
+    // But a reactor poll can make two hundred tasks runnable in one syscall,
+    // and with single wakes the workers ramp up one at a time — each waking the
+    // next only after it has found work — which serialises a futex round trip
+    // per worker onto the critical path of every burst.
+    void notify_batch(std::uint32_t count) noexcept;
+
     // Called when a timer is armed with a deadline earlier than whatever the
     // parked poller is currently waiting for. Avoids an eventfd write for the
     // overwhelmingly common case of arming a timer that is not the earliest.

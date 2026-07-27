@@ -222,6 +222,28 @@ measure anything about the network.
 For reference, Go on comparable hardware lands around 300–400 ns for goroutine
 spawn and 250–350 ns for an unbuffered channel round trip.
 
+### Against other runtimes
+
+`bench/echo-comparison/` runs the same 8-thread echo workload against cio,
+Boost.Asio (shared-nothing: one `io_context` and one `SO_REUSEPORT` acceptor per
+thread, in both callback and coroutine form) and Go, with the server pinned to
+CPUs 0–7 and the load generator to 8–23. Round trips per second, 128-byte
+payload:
+
+| connections | cio | asio-callback | asio-coro | go |
+|---:|---:|---:|---:|---:|
+| 8 | 65,338 | 79,764 | 83,767 | 56,106 |
+| 64 | 439,374 | 645,816 | 617,365 | 468,098 |
+| 512 | 680,753 | 809,941 | 786,083 | 680,915 |
+
+cio and Go land in the same place, which is the expected result for two runtimes
+with the same architecture — dead even at 512 connections. Shared-nothing asio is
+17–47% ahead: pinning a connection to one thread for its lifetime removes every
+cross-thread cost that a work-stealing scheduler pays, and an echo benchmark
+never charges it for the load balancing it gives up. See
+[bench/echo-comparison/README.md](bench/echo-comparison/README.md) for the
+methodology and the caveats, which matter more than the numbers.
+
 ## Testing
 
 Seven test binaries (`ctest`) covering the scheduler, channels, `select`, timers,

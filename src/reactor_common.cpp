@@ -69,7 +69,7 @@ void Reactor::free_desc(IoDesc* desc) noexcept {
 
 // --------------------------------------------------------- readiness core ---
 
-void Reactor::unblock(IoDesc* desc, Dir dir, Error err) noexcept {
+void Reactor::unblock_impl(IoDesc* desc, Dir dir, Error err, std::uint32_t* deferred) noexcept {
     std::atomic<void*>& slot = desc->dir_slot(dir);
     for (;;) {
         void* old = slot.load(std::memory_order_acquire);
@@ -99,12 +99,19 @@ void Reactor::unblock(IoDesc* desc, Dir dir, Error err) noexcept {
         std::coroutine_handle<> handle = waiter->handle;
         // Nothing below may touch `waiter`: scheduling it hands the frame to
         // another thread, which may resume and destroy it immediately.
-        if (sched != nullptr) sched->schedule(handle);
+        if (sched != nullptr) {
+            if (deferred != nullptr) {
+                sched->schedule_deferred(handle);
+                ++*deferred;
+            } else {
+                sched->schedule(handle);
+            }
+        }
         return;
     }
 }
 
-void Reactor::dispatch(std::uint64_t token, unsigned dirs) noexcept {
+void Reactor::dispatch(std::uint64_t token, unsigned dirs, std::uint32_t* deferred) noexcept {
     const auto index = static_cast<std::uint32_t>(token & 0xFFFFFFFFu);
     const auto generation = static_cast<std::uint32_t>(token >> 32);
 
@@ -112,8 +119,8 @@ void Reactor::dispatch(std::uint64_t token, unsigned dirs) noexcept {
     if (desc == nullptr) return;
     if (desc->generation.load(std::memory_order_acquire) != generation) return;
 
-    if (dirs & 1u) unblock(desc, Dir::kRead, Error{});
-    if (dirs & 2u) unblock(desc, Dir::kWrite, Error{});
+    if (dirs & 1u) unblock_impl(desc, Dir::kRead, Error{}, deferred);
+    if (dirs & 2u) unblock_impl(desc, Dir::kWrite, Error{}, deferred);
 }
 
 // -------------------------------------------------------------- deadlines ---

@@ -7,3 +7,4 @@ compile_commands.json
 *.a
 *.so
 perf.data*
+bench/echo-comparison/build/

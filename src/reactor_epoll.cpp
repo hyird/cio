@@ -152,6 +152,10 @@ void Reactor::poll(std::int64_t timeout_ns) {
     const int n = wait_for_events(backend_fd_, events, kMaxEvents, timeout_ns);
     if (n <= 0) return;  // 0 = timeout, <0 = EINTR or error; either way, retry later
 
+    // One syscall can make hundreds of tasks runnable. Queue them all, then
+    // issue a single wake sized to the burst — see Scheduler::notify_batch.
+    std::uint32_t made_runnable = 0;
+
     for (int i = 0; i < n; ++i) {
         const std::uint64_t token = events[i].data.u64;
 
@@ -172,8 +176,10 @@ void Reactor::poll(std::int64_t timeout_ns) {
         // writer, not just a reader.
         if (mask & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) dirs |= 1u;
         if (mask & (EPOLLOUT | EPOLLHUP | EPOLLERR)) dirs |= 2u;
-        if (dirs != 0) dispatch(token, dirs);
+        if (dirs != 0) dispatch(token, dirs, &made_runnable);
     }
+
+    sched_.notify_batch(made_runnable);
 }
 
 void Reactor::wake() noexcept {

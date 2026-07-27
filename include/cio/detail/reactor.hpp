@@ -155,7 +155,9 @@ public:
 
     // Wakes the task parked on (desc, dir), or records readiness if none.
     // A default-constructed `err` means "ready".
-    void unblock(IoDesc* desc, Dir dir, Error err) noexcept;
+    void unblock(IoDesc* desc, Dir dir, Error err) noexcept {
+        unblock_impl(desc, dir, err, nullptr);
+    }
 
     Scheduler& scheduler() noexcept { return sched_; }
 
@@ -165,7 +167,12 @@ private:
     IoDesc* alloc_desc();
     void free_desc(IoDesc* desc) noexcept;
     IoDesc* desc_at(std::uint32_t index) noexcept;
-    void dispatch(std::uint64_t token, unsigned dirs) noexcept;
+
+    // When `deferred` is non-null the woken tasks are queued without waking a
+    // worker each, and the count is accumulated there so poll() can issue one
+    // batched wake for the whole readiness burst.
+    void unblock_impl(IoDesc* desc, Dir dir, Error err, std::uint32_t* deferred) noexcept;
+    void dispatch(std::uint64_t token, unsigned dirs, std::uint32_t* deferred) noexcept;
 
     // Slab: fixed-size chunks, never freed, so pointers stay stable and a stale
     // event is always safe to dereference. Recycling is detected by generation,

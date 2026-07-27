@@ -256,6 +256,47 @@ void Scheduler::schedule_batch(void* const* frames, std::uint32_t n) noexcept {
     notify();
 }
 
+void Scheduler::schedule_deferred(std::coroutine_handle<> h) noexcept {
+    Worker* worker = t_worker;
+    if (worker != nullptr && worker->sched_ == this) {
+        worker->push(h.address());
+    } else {
+        global_.push(h.address());
+    }
+    // No notify(): the caller batches it.
+}
+
+void Scheduler::notify_batch(std::uint32_t count) noexcept {
+    if (count == 0) return;
+    if (idle_.load(std::memory_order_seq_cst) == 0) return;
+    if (count == 1) {
+        notify();
+        return;
+    }
+
+    std::uint32_t granted = 0;
+    {
+        std::lock_guard<std::mutex> lock(idle_mutex_);
+        const std::uint32_t claimable = waiters_ > wake_tokens_ ? waiters_ - wake_tokens_ : 0;
+        granted = count < claimable ? count : claimable;
+        if (granted > 0) {
+            // Both under the lock, and spinning_ first: a woken worker inherits
+            // one of these searcher credits, and it needs this same lock to
+            // claim its token, so it cannot decrement before we have added.
+            spinning_.fetch_add(granted, std::memory_order_seq_cst);
+            wake_tokens_ += granted;
+        }
+    }
+
+    if (granted == 0) {
+        // Nobody on the condition variable — fall back to the single-wake path,
+        // which also knows how to nudge a worker parked inside the reactor.
+        notify();
+        return;
+    }
+    for (std::uint32_t i = 0; i < granted; ++i) idle_cv_.notify_one();
+}
+
 void Scheduler::notify() noexcept {
     // Nobody is parked or on their way to parking; every worker is running a
     // task and will loop back through its queues when that task suspends.

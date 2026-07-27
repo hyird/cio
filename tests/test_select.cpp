@@ -233,6 +233,68 @@ void test_ready_cases_are_uniform_with_a_disabled_case() {
     }
 }
 
+// The poll order is built by a different branch for each case count — one, two
+// and three cases each pick a permutation directly instead of shuffling — so
+// uniformity has to be checked at more than one count. This is the two-case
+// branch, where the permutation is a single random bit.
+void test_two_ready_cases_are_uniform() {
+    auto body = []() -> cio::Task<std::array<int, 2>> {
+        auto a = cio::make_chan<int>();
+        auto b = cio::make_chan<int>();
+        a.close();
+        b.close();
+
+        std::array<int, 2> picked{};
+        for (int i = 0; i < 6000; ++i) {
+            auto sel = cio::select(cio::recv(a), cio::recv(b));
+            const std::size_t which = co_await sel;
+            CIO_CHECK(which < 2);
+            if (which < 2) ++picked[which];
+        }
+        co_return picked;
+    };
+
+    const auto picked = cio::run(body());
+    CIO_CHECK(picked[0] > 2500);
+    CIO_CHECK(picked[0] < 3500);
+    CIO_CHECK(picked[1] > 2500);
+    CIO_CHECK(picked[1] < 3500);
+    if (picked[0] <= 2500 || picked[0] >= 3500) {
+        std::fprintf(stderr, "  (split was %d / %d)\n", picked[0], picked[1]);
+    }
+}
+
+// Four cases fall through to the general Fisher-Yates branch. Checking that
+// every ready case is reachable and roughly even keeps the generic path honest
+// once the specialised ones exist to be preferred.
+void test_four_ready_cases_are_uniform() {
+    auto body = []() -> cio::Task<std::array<int, 4>> {
+        std::array<cio::Chan<int>, 4> channels{cio::make_chan<int>(), cio::make_chan<int>(),
+                                               cio::make_chan<int>(), cio::make_chan<int>()};
+        for (auto& channel : channels) channel.close();
+
+        std::array<int, 4> picked{};
+        for (int i = 0; i < 8000; ++i) {
+            auto sel = cio::select(cio::recv(channels[0]), cio::recv(channels[1]),
+                                   cio::recv(channels[2]), cio::recv(channels[3]));
+            const std::size_t which = co_await sel;
+            CIO_CHECK(which < 4);
+            if (which < 4) ++picked[which];
+        }
+        co_return picked;
+    };
+
+    const auto picked = cio::run(body());
+    for (const int count : picked) {
+        CIO_CHECK(count > 1500);
+        CIO_CHECK(count < 2500);
+    }
+    if (picked[0] <= 1500 || picked[0] >= 2500) {
+        std::fprintf(stderr, "  (split was %d / %d / %d / %d)\n", picked[0], picked[1],
+                     picked[2], picked[3]);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -246,6 +308,8 @@ int main() {
     RUN_TEST(test_ready_cases_are_chosen_randomly);
     RUN_TEST(test_cancellation_through_select);
     RUN_TEST(test_ready_cases_are_uniform_with_a_disabled_case);
+    RUN_TEST(test_two_ready_cases_are_uniform);
+    RUN_TEST(test_four_ready_cases_are_uniform);
     RUN_TEST(test_concurrent_selects);
     return cio_test::summary();
 }

@@ -340,20 +340,9 @@ private:
         };
 
         // Phase 1: is anything ready right now?
-        //
-        // A full shuffle, not a random rotation. A rotation only randomises
-        // where the scan starts, so a case that is never ready still hands its
-        // rotations to whichever case follows it: with [ready, ready, nil] the
-        // first case wins two rotations out of three, a 2:1 bias against the
-        // uniform choice this is documented to make. Go's selectgo shuffles
-        // pollorder for the same reason.
         detail::ChanWaiter* to_wake = nullptr;
-        std::array<std::size_t, kCount> poll_order{};
-        for (std::size_t i = 0; i < kCount; ++i) poll_order[i] = i;
-        for (std::size_t i = kCount; i > 1; --i) {
-            const std::size_t j = detail::select_rand(static_cast<std::uint32_t>(i));
-            std::swap(poll_order[i - 1], poll_order[j]);
-        }
+        std::uint8_t poll_order[kCount];
+        fill_poll_order(poll_order);
 
         std::size_t ready = kCount;
         for (const std::size_t i : poll_order) {
@@ -432,6 +421,47 @@ private:
         [&]<std::size_t... I>(std::index_sequence<I...>) {
             (fn(std::get<I>(cases_), I), ...);
         }(std::make_index_sequence<kCount>{});
+    }
+
+    // A uniform random permutation of [0, kCount), written into `out`.
+    //
+    // It has to be a full permutation, not a random rotation. A rotation only
+    // randomises where the scan starts, so a case that is never ready still
+    // hands its rotations to whichever case follows it: with [ready, ready,
+    // nil] the first case wins two rotations out of three, a 2:1 bias against
+    // the uniform choice this is documented to make. Go's selectgo shuffles
+    // pollorder for the same reason.
+    //
+    // Fisher-Yates is the general answer, but it is not free and kCount is a
+    // compile-time constant that is almost always 2 or 3. A permutation of n
+    // items is just a number in [0, n!), so at those sizes one draw picks the
+    // whole permutation and the loop, the swaps and the n-1 bounded draws all
+    // disappear. Each branch below produces exactly the same distribution as
+    // the shuffle it replaces.
+    static void fill_poll_order(std::uint8_t (&out)[kCount]) noexcept {
+        static_assert(kCount <= 255, "poll order indices are uint8_t");
+        if constexpr (kCount == 1) {
+            out[0] = 0;
+        } else if constexpr (kCount == 2) {
+            // Both permutations of two items are rotations, so one bit decides.
+            const auto first = static_cast<std::uint8_t>(detail::select_rand(2));
+            out[0] = first;
+            out[1] = static_cast<std::uint8_t>(1 - first);
+        } else if constexpr (kCount == 3) {
+            static constexpr std::uint8_t kOrders[6][3] = {
+                {0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0},
+            };
+            const std::uint8_t* picked = kOrders[detail::select_rand(6)];
+            out[0] = picked[0];
+            out[1] = picked[1];
+            out[2] = picked[2];
+        } else {
+            for (std::size_t i = 0; i < kCount; ++i) out[i] = static_cast<std::uint8_t>(i);
+            for (std::size_t i = kCount; i > 1; --i) {
+                const std::size_t j = detail::select_rand(static_cast<std::uint32_t>(i));
+                std::swap(out[i - 1], out[j]);
+            }
+        }
     }
 
     // Applies `fn` to the case at a runtime index.

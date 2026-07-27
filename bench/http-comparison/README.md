@@ -29,6 +29,33 @@ Server hashes were
 `c9c978fb4b4c2aae98eecd886825fcf4206b7343f0cdae0a5f09c925189c1adf`
 (B).
 
+## Frozen A/B matrix runner
+
+`matrix_wrk.py` is the release-gate runner for comparing two cio HTTP server
+binaries. It defaults to the 1/8/64/256/1024-connection matrix, assigns an
+appropriate `wrk` thread count to each cell, alternates AB/BA pairs, rotates
+cell order, and pins the server and client to disjoint CPU sets.
+
+```sh
+python3 matrix_wrk.py \
+  path/to/pre-v2-server path/to/candidate-server \
+  --cells 1:1,8:2,64:8,256:8,1024:8 \
+  --pairs 10 --warmup 5 --duration 15 \
+  --expected-a-sha256 <sha256> \
+  --expected-b-sha256 <sha256> \
+  --expected-wrk-sha256 <sha256>
+```
+
+Every run performs an HTTP correctness probe, rejects socket/non-2xx/server
+failures, verifies input hashes again at the end, and retains the manifest, raw
+CSV, summaries and per-side logs. An interrupted or incomplete pair makes the
+matrix invalid rather than silently reducing the sample count. Default outputs
+go under `results/`, which is intentionally ignored; publish only a reviewed
+result set with its manifest and exact source revisions.
+
+For a quick three-runtime comparison using locally built `cio`, Asio and Go
+servers:
+
 ```
 ./run_wrk.sh [connections] [duration_s] [repeats] [threads]
 ```

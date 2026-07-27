@@ -121,6 +121,7 @@ class SideResult:
     status: str
     error: str
     warmup_rps: float | None = None
+    warmup_error_count: int | None = None
     rps: float | None = None
     total_requests: int | None = None
     latency_avg_us: float | None = None
@@ -142,7 +143,11 @@ class SideResult:
     pair_valid: bool = False
 
 
-RAW_FIELDS = [field.name for field in dataclasses.fields(SideResult)]
+RAW_FIELDS: list[str] = []
+for side_result_field in dataclasses.fields(SideResult):
+    RAW_FIELDS.append(side_result_field.name)
+    if side_result_field.name == "cell":
+        RAW_FIELDS.extend(("connections", "wrk_threads"))
 
 
 class MatrixError(RuntimeError):
@@ -172,18 +177,25 @@ def command_output(argv: Sequence[str]) -> str:
 
 def parse_cpu_set(spec: str) -> set[int]:
     cpus: set[int] = set()
-    for part in spec.split(","):
-        part = part.strip()
-        if not part:
-            raise argparse.ArgumentTypeError(f"empty CPU component in {spec!r}")
-        if "-" in part:
-            first_text, last_text = part.split("-", 1)
-            first, last = int(first_text), int(last_text)
-            if first > last:
-                raise argparse.ArgumentTypeError(f"descending CPU range {part!r}")
-            cpus.update(range(first, last + 1))
-        else:
-            cpus.add(int(part))
+    try:
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                raise argparse.ArgumentTypeError(
+                    f"empty CPU component in {spec!r}"
+                )
+            if "-" in part:
+                first_text, last_text = part.split("-", 1)
+                first, last = int(first_text), int(last_text)
+                if first > last:
+                    raise argparse.ArgumentTypeError(
+                        f"descending CPU range {part!r}"
+                    )
+                cpus.update(range(first, last + 1))
+            else:
+                cpus.add(int(part))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"invalid CPU set {spec!r}") from error
     if not cpus:
         raise argparse.ArgumentTypeError("CPU set must not be empty")
     return cpus
@@ -282,9 +294,14 @@ def parse_wrk_output(
     )
     non_2xx = int(non_2xx_match.group(1)) if non_2xx_match else 0
 
+    rps = float(rps_match.group(1))
+    total_requests = int(total_match.group(1))
+    if rps <= 0.0 or total_requests <= 0:
+        raise MatrixError("wrk reported zero throughput")
+
     return WrkResult(
-        rps=float(rps_match.group(1)),
-        total_requests=int(total_match.group(1)),
+        rps=rps,
+        total_requests=total_requests,
         latency_avg_us=latency_avg,
         latency_p50_us=percentiles.get(50),
         latency_p75_us=percentiles.get(75),
@@ -311,19 +328,28 @@ def process_cpu_seconds(pid: int) -> float | None:
 
 
 def stop_process_group(process: subprocess.Popen[Any]) -> None:
-    if process.poll() is not None:
-        return
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGINT)
+    if process.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGINT)
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    # taskset execs the target, so neither benchmark normally leaves child
+    # processes. Still clear any surviving member of the private process group
+    # before returning from an interrupted or timed-out run.
     try:
-        process.wait(timeout=0.5)
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
         return
-    except subprocess.TimeoutExpired:
-        pass
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    with contextlib.suppress(subprocess.TimeoutExpired):
+    os.killpg(process.pid, signal.SIGKILL)
+    try:
         process.wait(timeout=2)
+    except subprocess.TimeoutExpired as error:
+        raise MatrixError(
+            f"process group {process.pid} survived SIGKILL"
+        ) from error
 
 
 def free_loopback_port() -> int:
@@ -349,6 +375,55 @@ def wait_for_server(
             last_error = str(error)
             time.sleep(0.05)
     raise MatrixError(f"server did not accept connections: {last_error}")
+
+
+def validate_http_response(port: int) -> None:
+    request = (
+        b"GET / HTTP/1.1\r\n"
+        b"Host: 127.0.0.1\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+    )
+    with socket.create_connection(("127.0.0.1", port), timeout=1.0) as client:
+        client.settimeout(1.0)
+        client.sendall(request)
+        response = bytearray()
+        while b"\r\n\r\n" not in response:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+            if len(response) > 64 * 1024:
+                raise MatrixError("HTTP correctness response header is too large")
+        header, separator, body = bytes(response).partition(b"\r\n\r\n")
+        if not separator:
+            raise MatrixError("HTTP correctness probe returned no complete header")
+        lines = header.split(b"\r\n")
+        if not lines or lines[0] != b"HTTP/1.1 200 OK":
+            status = lines[0].decode(errors="replace") if lines else "<missing>"
+            raise MatrixError(f"HTTP correctness probe returned {status}")
+        content_length = None
+        for line in lines[1:]:
+            name, colon, value = line.partition(b":")
+            if colon and name.strip().lower() == b"content-length":
+                try:
+                    content_length = int(value.strip())
+                except ValueError as error:
+                    raise MatrixError(
+                        "HTTP correctness probe has invalid Content-Length"
+                    ) from error
+                break
+        if content_length != 13:
+            raise MatrixError(
+                f"HTTP correctness probe Content-Length={content_length!r}"
+            )
+        while len(body) < content_length:
+            chunk = client.recv(content_length - len(body))
+            if not chunk:
+                break
+            body += chunk
+        if body[:content_length] != b"Hello, World!":
+            raise MatrixError("HTTP correctness probe returned an unexpected body")
 
 
 def run_wrk(
@@ -379,6 +454,9 @@ def run_wrk(
     command.append(f"http://127.0.0.1:{port}/")
 
     start = time.monotonic()
+    deadline = start + duration_seconds + 30.0
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
     with log_path.open("w") as log:
         process = subprocess.Popen(
             command,
@@ -386,14 +464,21 @@ def run_wrk(
             stderr=subprocess.STDOUT,
             text=True,
             start_new_session=True,
+            env=environment,
         )
         first_cpu = process_cpu_seconds(process.pid) or 0.0
         last_cpu = first_cpu
         try:
-            while process.poll() is None:
+            while True:
                 sampled_cpu = process_cpu_seconds(process.pid)
                 if sampled_cpu is not None:
                     last_cpu = sampled_cpu
+                if process.poll() is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    raise MatrixError(
+                        f"wrk exceeded {duration_seconds + 30}s watchdog"
+                    )
                 time.sleep(0.05)
         except BaseException:
             stop_process_group(process)
@@ -437,6 +522,7 @@ def running_server(
         )
         try:
             wait_for_server(process, port)
+            validate_http_response(port)
             yield process
         finally:
             stop_process_group(process)
@@ -454,8 +540,6 @@ def one_side(
     args: argparse.Namespace,
     run_directory: pathlib.Path,
 ) -> SideResult:
-    run_directory.mkdir(parents=True, exist_ok=False)
-    port = free_loopback_port()
     timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
     base = SideResult(
         timestamp=timestamp,
@@ -465,11 +549,14 @@ def one_side(
         sequence=sequence,
         side=side,
         binary_sha256=binary_sha256,
-        port=port,
+        port=None,
         status="invalid",
         error="",
     )
     try:
+        run_directory.mkdir(parents=True, exist_ok=False)
+        port = free_loopback_port()
+        base.port = port
         if sha256(binary) != binary_sha256:
             raise MatrixError(f"{side} binary hash changed before run")
         with running_server(
@@ -490,6 +577,8 @@ def one_side(
                 latency=False,
                 log_path=run_directory / "warmup.log",
             )
+            base.warmup_rps = warmup.rps
+            base.warmup_error_count = warmup.error_count
             if warmup.error_count:
                 raise MatrixError(f"warmup reported {warmup.error_count} errors")
             if server.poll() is not None:
@@ -509,6 +598,21 @@ def one_side(
                 latency=True,
                 log_path=run_directory / "measure.log",
             )
+            base.rps = measured.rps
+            base.total_requests = measured.total_requests
+            base.latency_avg_us = measured.latency_avg_us
+            base.latency_p50_us = measured.latency_p50_us
+            base.latency_p75_us = measured.latency_p75_us
+            base.latency_p90_us = measured.latency_p90_us
+            base.latency_p99_us = measured.latency_p99_us
+            base.wrk_cpu_seconds = measured.cpu_seconds
+            base.wall_seconds = measured.wall_seconds
+            base.wrk_cores = measured.cpu_seconds / measured.wall_seconds
+            base.socket_connect = measured.socket_connect
+            base.socket_read = measured.socket_read
+            base.socket_write = measured.socket_write
+            base.socket_timeout = measured.socket_timeout
+            base.non_2xx = measured.non_2xx
             server_cpu_end = process_cpu_seconds(server.pid)
             if server_cpu_end is None:
                 raise MatrixError("server exited during measurement")
@@ -522,29 +626,14 @@ def one_side(
             server_cpu = max(0.0, server_cpu_end - server_cpu_start)
             if server_cpu <= 0.0:
                 raise MatrixError("server CPU measurement is zero")
-            base.status = "valid"
-            base.warmup_rps = warmup.rps
-            base.rps = measured.rps
-            base.total_requests = measured.total_requests
-            base.latency_avg_us = measured.latency_avg_us
-            base.latency_p50_us = measured.latency_p50_us
-            base.latency_p75_us = measured.latency_p75_us
-            base.latency_p90_us = measured.latency_p90_us
-            base.latency_p99_us = measured.latency_p99_us
             base.server_cpu_seconds = server_cpu
-            base.wrk_cpu_seconds = measured.cpu_seconds
-            base.wall_seconds = measured.wall_seconds
             base.server_cores = server_cpu / measured.wall_seconds
-            base.wrk_cores = measured.cpu_seconds / measured.wall_seconds
             base.requests_per_server_cpu_second = (
-                measured.rps * measured.wall_seconds / server_cpu
+                measured.total_requests / server_cpu
             )
-            base.socket_connect = measured.socket_connect
-            base.socket_read = measured.socket_read
-            base.socket_write = measured.socket_write
-            base.socket_timeout = measured.socket_timeout
-            base.non_2xx = measured.non_2xx
+        base.status = "valid"
     except (MatrixError, OSError, subprocess.SubprocessError) as error:
+        base.status = "invalid"
         base.error = str(error)
     return base
 
@@ -552,6 +641,8 @@ def one_side(
 def dataclass_row(result: SideResult) -> dict[str, Any]:
     row = dataclasses.asdict(result)
     row["cell"] = result.cell.name
+    row["connections"] = result.cell.connections
+    row["wrk_threads"] = result.cell.wrk_threads
     return row
 
 
@@ -587,7 +678,10 @@ def summarize(
     results: Sequence[SideResult],
     expected_pairs: int,
     output_directory: pathlib.Path,
-) -> tuple[list[dict[str, Any]], int]:
+    *,
+    interrupted: bool,
+    hashes_unchanged: bool,
+) -> tuple[list[dict[str, Any]], int, bool]:
     summaries: list[dict[str, Any]] = []
     invalid_pairs = 0
     for cell in cells:
@@ -689,6 +783,10 @@ def summarize(
             "b_mean_requests_per_server_cpu_second": statistics.fmean(
                 float(run.requests_per_server_cpu_second) for run in b_runs
             ),
+            "client_saturation_warning": any(
+                float(run.wrk_cores) >= cell.wrk_threads * 0.95
+                for run in [*a_runs, *b_runs]
+            ),
         }
         summaries.append(summary)
 
@@ -702,8 +800,29 @@ def summarize(
         writer.writeheader()
         writer.writerows(summaries)
 
+    matrix_valid = (
+        not interrupted
+        and hashes_unchanged
+        and invalid_pairs == 0
+        and all(
+            int(summary.get("valid_pairs", 0)) == expected_pairs
+            for summary in summaries
+        )
+    )
+    if matrix_valid:
+        status = (
+            f"**Status: VALID.** All {expected_pairs * len(cells)} expected "
+            "pairs passed."
+        )
+    else:
+        status = (
+            f"**Status: INVALID.** invalid/incomplete pairs={invalid_pairs}, "
+            f"interrupted={interrupted}, hashes_unchanged={hashes_unchanged}."
+        )
     lines = [
         "# wrk frozen A/B matrix",
+        "",
+        status,
         "",
         "| connections | wrk threads | pairs | A mean req/s | B mean req/s | paired B/A geo | 95% CI | median p50 A/B us | median p99 A/B us | server cores A/B | wrk cores A/B |",
         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -739,10 +858,27 @@ def summarize(
             "errors, zero non-2xx responses, successful wrk exits and a live server",
             "through the complete measurement window.",
             "",
+            "The confidence intervals are per-cell, unadjusted paired log-ratio",
+            "Student-t intervals. Cross-cell family-wise claims require a multiple-",
+            "comparison correction.",
+            "",
         ]
     )
+    saturated = [
+        f"c{summary['connections']}/t{summary['wrk_threads']}"
+        for summary in summaries
+        if summary.get("client_saturation_warning")
+    ]
+    if saturated:
+        lines.extend(
+            [
+                "Client saturation warning: wrk reached at least 95% of its",
+                f"configured thread capacity in {', '.join(saturated)}.",
+                "",
+            ]
+        )
     (output_directory / "summary.md").write_text("\n".join(lines))
-    return summaries, invalid_pairs
+    return summaries, invalid_pairs, matrix_valid
 
 
 def environment_snapshot() -> dict[str, Any]:
@@ -921,107 +1057,135 @@ def main(argv: Sequence[str]) -> int:
 
     raw_path = output_directory / "raw.csv"
     results: list[SideResult] = []
+    active_pair_results: list[SideResult] = []
     sequence = 0
     interrupted = False
-    with raw_path.open("w", newline="") as raw_output:
-        writer = csv.DictWriter(raw_output, fieldnames=RAW_FIELDS)
-        writer.writeheader()
-        raw_output.flush()
-        try:
-            for pair in range(1, args.pairs + 1):
-                shift = (pair - 1) % len(cells)
-                round_cells = [*cells[shift:], *cells[:shift]]
-                order = "AB" if pair % 2 else "BA"
-                print(
-                    f"\nround {pair}/{args.pairs} order={order} "
-                    f"cells={','.join(cell.name for cell in round_cells)}",
-                    flush=True,
-                )
-                for cell in round_cells:
-                    pair_results: list[SideResult] = []
-                    for side in order:
-                        sequence += 1
-                        binary = args.binary_a if side == "A" else args.binary_b
-                        binary_hash = hashes[side]
-                        run_directory = (
-                            output_directory
-                            / "logs"
-                            / cell.name
-                            / f"pair-{pair:02d}-{order}"
-                            / side
-                        )
-                        result = one_side(
-                            binary=binary,
-                            binary_sha256=binary_hash,
-                            side=side,
-                            cell=cell,
-                            pair=pair,
-                            order=order,
-                            sequence=sequence,
-                            args=args,
-                            run_directory=run_directory,
-                        )
-                        pair_results.append(result)
-                        if result.status == "valid":
-                            print(
-                                f"  {cell.name:11s} pair={pair:02d} {side} "
-                                f"rps={result.rps:10.0f} "
-                                f"p50={result.latency_p50_us:8.1f}us "
-                                f"p99={result.latency_p99_us:8.1f}us "
-                                f"srv={result.server_cores:4.2f}c "
-                                f"wrk={result.wrk_cores:4.2f}c",
-                                flush=True,
-                            )
-                        else:
-                            print(
-                                f"  {cell.name:11s} pair={pair:02d} {side} "
-                                f"INVALID: {result.error}",
-                                flush=True,
-                            )
-                        if args.cooldown:
-                            time.sleep(args.cooldown)
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
 
-                    pair_is_valid = (
-                        len(pair_results) == 2
-                        and all(result.status == "valid" for result in pair_results)
+    def handle_sigterm(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    try:
+        with raw_path.open("w", newline="") as raw_output:
+            writer = csv.DictWriter(raw_output, fieldnames=RAW_FIELDS)
+            writer.writeheader()
+            raw_output.flush()
+            try:
+                for pair in range(1, args.pairs + 1):
+                    shift = (pair - 1) % len(cells)
+                    round_cells = [*cells[shift:], *cells[:shift]]
+                    order = "AB" if pair % 2 else "BA"
+                    print(
+                        f"\nround {pair}/{args.pairs} order={order} "
+                        f"cells={','.join(cell.name for cell in round_cells)}",
+                        flush=True,
                     )
-                    for result in pair_results:
-                        result.pair_valid = pair_is_valid
-                        writer.writerow(dataclass_row(result))
-                        results.append(result)
-                    raw_output.flush()
-        except KeyboardInterrupt:
-            interrupted = True
-            print("\ninterrupted; completed raw results were preserved", file=sys.stderr)
+                    for cell in round_cells:
+                        active_pair_results = []
+                        for side in order:
+                            sequence += 1
+                            binary = args.binary_a if side == "A" else args.binary_b
+                            binary_hash = hashes[side]
+                            run_directory = (
+                                output_directory
+                                / "logs"
+                                / cell.name
+                                / f"pair-{pair:02d}-{order}"
+                                / side
+                            )
+                            result = one_side(
+                                binary=binary,
+                                binary_sha256=binary_hash,
+                                side=side,
+                                cell=cell,
+                                pair=pair,
+                                order=order,
+                                sequence=sequence,
+                                args=args,
+                                run_directory=run_directory,
+                            )
+                            active_pair_results.append(result)
+                            if result.status == "valid":
+                                print(
+                                    f"  {cell.name:11s} pair={pair:02d} {side} "
+                                    f"rps={result.rps:10.0f} "
+                                    f"p50={result.latency_p50_us:8.1f}us "
+                                    f"p99={result.latency_p99_us:8.1f}us "
+                                    f"srv={result.server_cores:4.2f}c "
+                                    f"wrk={result.wrk_cores:4.2f}c",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"  {cell.name:11s} pair={pair:02d} {side} "
+                                    f"INVALID: {result.error}",
+                                    flush=True,
+                                )
+                            if args.cooldown:
+                                time.sleep(args.cooldown)
 
-    end_hashes = {
-        "A": sha256(args.binary_a),
-        "B": sha256(args.binary_b),
-        "wrk": sha256(args.wrk),
-    }
+                        pair_is_valid = (
+                            len(active_pair_results) == 2
+                            and all(
+                                result.status == "valid"
+                                for result in active_pair_results
+                            )
+                        )
+                        for result in active_pair_results:
+                            result.pair_valid = pair_is_valid
+                            writer.writerow(dataclass_row(result))
+                            results.append(result)
+                        raw_output.flush()
+                        active_pair_results = []
+            except KeyboardInterrupt:
+                interrupted = True
+                for result in active_pair_results:
+                    result.pair_valid = False
+                    writer.writerow(dataclass_row(result))
+                    results.append(result)
+                raw_output.flush()
+                print(
+                    "\ninterrupted; completed side results and logs were preserved",
+                    file=sys.stderr,
+                )
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
+
+    try:
+        end_hashes = {
+            "A": sha256(args.binary_a),
+            "B": sha256(args.binary_b),
+            "wrk": sha256(args.wrk),
+        }
+    except OSError as error:
+        end_hashes = {}
+        print(f"matrix invalid: cannot re-hash inputs: {error}", file=sys.stderr)
+    hashes_unchanged = end_hashes == hashes
+    summaries, invalid_pairs, matrix_valid = summarize(
+        cells,
+        results,
+        args.pairs,
+        output_directory,
+        interrupted=interrupted,
+        hashes_unchanged=hashes_unchanged,
+    )
     manifest["environment_end"] = environment_snapshot()
     manifest["end_hashes"] = end_hashes
     manifest["interrupted"] = interrupted
     manifest["completed_runs"] = len(results)
+    manifest["invalid_pairs"] = invalid_pairs
+    manifest["matrix_valid"] = matrix_valid
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
-    if end_hashes != hashes:
-        print("matrix invalid: an input binary changed during the run", file=sys.stderr)
-        return 1
-
-    summaries, invalid_pairs = summarize(
-        cells, results, args.pairs, output_directory
-    )
     print()
     print((output_directory / "summary.md").read_text(), end="")
-    if interrupted or invalid_pairs:
+    if not matrix_valid:
         print(
-            f"matrix invalid: interrupted={interrupted}, invalid_pairs={invalid_pairs}",
+            f"matrix invalid: interrupted={interrupted}, "
+            f"invalid_pairs={invalid_pairs}, hashes_unchanged={hashes_unchanged}",
             file=sys.stderr,
         )
-        return 1
-    if any(int(summary["valid_pairs"]) != args.pairs for summary in summaries):
-        print("matrix invalid: incomplete cell", file=sys.stderr)
         return 1
     print(f"raw data and logs: {output_directory}")
     return 0

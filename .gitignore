@@ -11,3 +11,4 @@ __pycache__/
 perf.data*
 bench/echo-comparison/build/
 bench/http-comparison/build/
+bench/http-comparison/results/

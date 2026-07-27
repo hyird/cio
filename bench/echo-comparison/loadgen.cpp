@@ -15,7 +15,12 @@
 //    result says more about the generator than the server, and the run script
 //    prints both so that is visible rather than assumed.
 //
-//     ./loadgen <host> <port> <connections> <warmup_s> <duration_s> [payload] [workers]
+//     ./loadgen <host> <port> <conns> <warmup_s> <dur_s> [payload] [workers]
+//             [work_us] [heavy_pct] [churn_every]
+//
+//  work_us      microseconds of CPU the server should burn per request
+//  heavy_pct    percentage of connections that ask for it (the rest ask for 0)
+//  churn_every  reconnect after this many requests; 0 keeps connections open
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -100,43 +105,59 @@ double process_cpu_seconds() {
            static_cast<double>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
 }
 
-cio::Task<> connection(net::SocketAddr target, std::size_t payload, Histogram* histogram) {
-    auto stream = co_await net::TcpStream::connect(target);
-    if (!stream) {
-        g_failed.fetch_add(1, std::memory_order_relaxed);
-        co_return;
-    }
-    stream->set_nodelay(true);
-    g_connected.fetch_add(1, std::memory_order_relaxed);
-
+cio::Task<> connection(net::SocketAddr target, std::size_t payload, Histogram* histogram,
+                       unsigned work_us, long churn_every) {
+    // The first payload byte tells the server how many microseconds of CPU work
+    // to spend on this request. Assigning it per connection is what creates an
+    // uneven load: a shared-nothing server cannot move a heavy connection off a
+    // busy shard, a work-stealing one does not have to.
     std::vector<std::byte> request(payload, std::byte{0x5A});
+    request[0] = static_cast<std::byte>(work_us);
     std::vector<std::byte> response(payload);
 
     while (!g_stop.load(std::memory_order_relaxed)) {
-        const auto started = cio::Clock::now();
+        auto stream = co_await net::TcpStream::connect(target);
+        if (!stream) {
+            g_failed.fetch_add(1, std::memory_order_relaxed);
+            co_await cio::sleep(std::chrono::milliseconds(1));
+            continue;
+        }
+        stream->set_nodelay(true);
+        g_connected.fetch_add(1, std::memory_order_relaxed);
 
-        if (!(co_await stream->write_all(request))) break;
+        long on_this_connection = 0;
+        while (!g_stop.load(std::memory_order_relaxed)) {
+            const auto started = cio::Clock::now();
 
-        std::size_t got = 0;
-        bool broken = false;
-        while (got < payload) {
-            auto n = co_await stream->read(std::span(response).subspan(got));
-            if (!n || *n == 0) {
-                broken = true;
-                break;
+            if (!(co_await stream->write_all(request))) break;
+
+            std::size_t got = 0;
+            bool broken = false;
+            while (got < payload) {
+                auto n = co_await stream->read(std::span(response).subspan(got));
+                if (!n || *n == 0) {
+                    broken = true;
+                    break;
+                }
+                got += *n;
             }
-            got += *n;
-        }
-        if (broken) break;
+            if (broken) break;
 
-        if (g_measuring.load(std::memory_order_relaxed)) {
-            histogram->record(cio::to_ns(cio::Clock::now() - started));
+            if (g_measuring.load(std::memory_order_relaxed)) {
+                histogram->record(cio::to_ns(cio::Clock::now() - started));
+            }
+            if (churn_every > 0 && ++on_this_connection >= churn_every) break;
         }
+        stream->close();
+        // Without churn the connection is meant to last the whole run, so a
+        // break here was a real failure and reconnecting would mask it.
+        if (churn_every <= 0) break;
     }
 }
 
 cio::Task<int> run(std::string host, std::uint16_t port, int connections, int warmup_s,
-                   int duration_s, std::size_t payload) {
+                   int duration_s, std::size_t payload, unsigned work_us, int heavy_pct,
+                   long churn_every) {
     auto target = net::SocketAddr::parse(host, port);
     if (!target) {
         std::fprintf(stderr, "bad host %s\n", host.c_str());
@@ -147,9 +168,12 @@ cio::Task<int> run(std::string host, std::uint16_t port, int connections, int wa
     histograms.reserve(static_cast<std::size_t>(connections));
     for (int i = 0; i < connections; ++i) histograms.push_back(std::make_unique<Histogram>());
 
+    const int heavy = connections * heavy_pct / 100;
     cio::TaskGroup clients;
     for (int i = 0; i < connections; ++i) {
-        clients.spawn(connection(*target, payload, histograms[static_cast<std::size_t>(i)].get()));
+        clients.spawn(connection(*target, payload,
+                                 histograms[static_cast<std::size_t>(i)].get(),
+                                 i < heavy ? work_us : 0u, churn_every));
     }
 
     co_await cio::sleep(std::chrono::seconds(warmup_s));
@@ -204,6 +228,13 @@ int main(int argc, char** argv) {
     cio::RuntimeOptions options;
     options.worker_threads = static_cast<std::size_t>(argc > 7 ? std::atoi(argv[7]) : 16);
 
+    // Optional: per-request server-side CPU work, what fraction of connections
+    // request it, and how often to reconnect.
+    const auto work_us = static_cast<unsigned>(argc > 8 ? std::atoi(argv[8]) : 0);
+    const int heavy_pct = argc > 9 ? std::atoi(argv[9]) : 0;
+    const long churn_every = argc > 10 ? std::atol(argv[10]) : 0;
+
     cio::Runtime runtime(options);
-    return runtime.block_on(run(host, port, connections, warmup_s, duration_s, payload));
+    return runtime.block_on(run(host, port, connections, warmup_s, duration_s, payload,
+                                work_us, heavy_pct, churn_every));
 }

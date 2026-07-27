@@ -6,6 +6,7 @@
 // capacity. That is the design being measured.
 //
 //     ./cio_echo <port> <workers>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <span>
@@ -16,11 +17,25 @@ namespace net = cio::net;
 
 namespace {
 
+// Per-request CPU work, in microseconds, taken from the first request byte.
+//
+// A busy-wait on the clock rather than a counted loop: a loop compiles to
+// different amounts of work under gcc and the Go compiler, which would make the
+// servers incomparable. Spinning until a deadline is identical by construction.
+inline void burn_microseconds(unsigned us) {
+    if (us == 0) return;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+    while (std::chrono::steady_clock::now() < deadline) {
+    }
+}
+
 cio::Task<> serve(net::TcpStream stream) {
     std::byte buffer[4096];
     for (;;) {
         auto n = co_await stream.read(buffer);
         if (!n || *n == 0) break;
+        burn_microseconds(static_cast<unsigned>(buffer[0]));
         if (auto written = co_await stream.write_all(std::span(buffer, *n)); !written) break;
     }
 }

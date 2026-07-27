@@ -224,25 +224,39 @@ spawn and 250–350 ns for an unbuffered channel round trip.
 
 ### Against other runtimes
 
-`bench/echo-comparison/` runs the same 8-thread echo workload against cio,
-Boost.Asio (shared-nothing: one `io_context` and one `SO_REUSEPORT` acceptor per
-thread, in both callback and coroutine form) and Go, with the server pinned to
-CPUs 0–7 and the load generator to 8–23. Round trips per second, 128-byte
-payload:
+`bench/echo-comparison/` runs an 8-thread echo workload against cio, Boost.Asio
+(shared-nothing: one `io_context` and one `SO_REUSEPORT` acceptor per thread, in
+both callback and coroutine form) and Go, with the server pinned to CPUs 0-7 and
+the load generator to 8-23. `run_matrix.sh` sweeps payload, thread count,
+connection count, load skew and connection churn; `results.csv` has all 112
+cells.
 
-| connections | cio | asio-callback | asio-coro | go |
-|---:|---:|---:|---:|---:|
-| 8 | 66,151 | 83,830 | 84,580 | 57,407 |
-| 64 | 449,598 | 634,477 | 644,877 | 470,443 |
-| 512 | 700,392 | 813,485 | 812,531 | 674,611 |
+The single headline number is misleading, so here is the shape of it. At 128
+bytes with connections held open, shared-nothing asio leads by 14-23% and cio
+tracks Go. But:
 
-cio and Go land within a few percent of each other, which is the expected result
-for two runtimes with the same architecture. Shared-nothing asio is 16-27%
-ahead, and profiling says why: cio retires *fewer* instructions per request than
-asio and spends 27% more cycles doing it (IPC 0.46 against 0.61). It is not
-doing more work, it is stalling on coherence traffic over shared scheduler
-state, which a shared-nothing design does not have. Two earlier explanations —
-the wake path, then syscall count — were measured and rejected; see
+| workload | winner | margin |
+|---|---|---|
+| small payloads, many held-open connections | shared-nothing asio | 14-23% |
+| payloads >= 16 KiB | tie | 0% |
+| below CPU saturation (<= 4 of 8 cores) | tie | 2-4% |
+| CPU-heavy requests, evenly spread | tie | 2% |
+| **uneven load, few connections** | **cio / Go** | **19-108%** |
+| connection churn | asio, then Go | cio 24-36% behind |
+
+asio's advantage is a fixed per-request cost — coherence traffic that cio pays
+for sharing run queues and that shared-nothing does not have — so it vanishes as
+soon as a request does any real work. Its cost is that a connection is stuck on
+the thread that accepted it: with 32 connections and a quarter of them CPU-heavy,
+asio uses 26.5 of its 40 core-seconds while cio uses 38.2, because seven idle
+threads cannot help the busy one. cio is 2.1x faster there.
+
+The churn row is a genuine cio weakness rather than a trade-off: it leaves 30% of
+the machine idle because it has one acceptor task where asio has one per thread.
+Sharding the acceptor would cost nothing in load balancing.
+
+Two earlier explanations for the flat-echo gap — the wake path, then syscall
+count — were measured and rejected; see
 [bench/echo-comparison/README.md](bench/echo-comparison/README.md) for how, and
 for the methodology and caveats, which matter more than the numbers.
 

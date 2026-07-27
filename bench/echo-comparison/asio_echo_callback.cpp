@@ -12,6 +12,7 @@
 //     ./asio_echo_callback <port> <threads>
 #include <boost/asio.hpp>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -24,6 +25,18 @@ using asio::ip::tcp;
 namespace {
 
 constexpr std::size_t kBufferSize = 4096;
+// Per-request CPU work, in microseconds, taken from the first request byte.
+//
+// A busy-wait on the clock rather than a counted loop: a loop compiles to
+// different amounts of work under gcc and the Go compiler, which would make the
+// servers incomparable. Spinning until a deadline is identical by construction.
+inline void burn_microseconds(unsigned us) {
+    if (us == 0) return;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+    while (std::chrono::steady_clock::now() < deadline) {
+    }
+}
 
 class Session : public std::enable_shared_from_this<Session> {
 public:
@@ -40,6 +53,8 @@ private:
         socket_.async_read_some(asio::buffer(buffer_),
                                 [this, self](boost::system::error_code ec, std::size_t n) {
                                     if (ec || n == 0) return;
+                                    burn_microseconds(
+                                        static_cast<unsigned char>(buffer_[0]));
                                     write(n);
                                 });
     }

@@ -55,47 +55,120 @@ the workload that flatters shared-nothing designs most.
 ## Results
 
 24-core EPYC 7402, Linux 6.12, GCC 13.3 `-O3 -march=native`, Boost 1.83, Go
-1.24. 128-byte payload, 5 s measurement, server on 8 cores.
+1.24. Server on 8 cores, load generator on 16, 5 s measurement after 3 s
+warm-up. Full data in `results.csv`; `./run_matrix.sh` regenerates it.
 
-Round trips per second:
+The headline case — 128-byte payload, connections held open — is the one every
+echo benchmark reports, and on its own it is misleading. Round trips per second:
 
 | connections | cio | asio-callback | asio-coro | go |
 |---:|---:|---:|---:|---:|
-| 8 | 66,151 | 83,830 | 84,580 | 57,407 |
-| 64 | 449,598 | 634,477 | 644,877 | 470,443 |
-| 512 | 700,392 | 813,485 | 812,531 | 674,611 |
+| 1 | 11,265 | 13,104 | 13,242 | 11,900 |
+| 8 | 65,384 | 90,998 | 95,174 | 54,676 |
+| 64 | 458,518 | 634,120 | 633,994 | 468,220 |
+| 256 | 624,340 | 764,534 | 751,407 | 644,801 |
+| 1024 | 700,473 | 823,452 | 816,809 | 682,098 |
+| 4096 | 648,711 | 780,519 | 767,909 | 583,976 |
 
-Median / p99 latency (µs) at 512 connections:
+Shared-nothing leads everywhere, cio and Go track each other. Then the other
+four sweeps say when that lead is real and when it is an artifact of the
+workload.
+
+### Payload: the lead is fixed overhead, and it disappears
+
+512 connections, 8 threads:
+
+| payload | cio | asio-callback | asio-coro | go | asio lead |
+|---:|---:|---:|---:|---:|---:|
+| 16 B | 675,372 | 813,176 | 807,186 | 674,445 | +20% |
+| 128 B | 670,503 | 823,571 | 803,145 | 673,091 | +23% |
+| 1 KiB | 611,871 | 711,288 | 708,293 | 604,239 | +16% |
+| 4 KiB | 420,079 | 480,154 | 477,837 | 434,802 | +14% |
+| 16 KiB | 25,297 | 25,185 | 25,263 | 25,012 | **0%** |
+
+The advantage is a constant per-request cost, not a per-byte one. Once a request
+moves 16 KiB, the memcpy and the TCP stack dominate and all four are within 1%.
+
+### Threads: it needs saturation to show up
+
+512 connections, 128 B, everything pinned to the same 8 cores:
+
+| threads | cio | asio-callback | asio lead | cio µs CPU/req | asio µs CPU/req |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 117,275 | 119,798 | +2.1% | 10.1 | 8.4 |
+| 2 | 233,726 | 242,462 | +3.7% | 9.6 | 8.3 |
+| 4 | 461,107 | 472,668 | +2.5% | 9.5 | 8.5 |
+| 8 | 678,912 | 827,596 | **+21.9%** | 11.4 | 9.3 |
+
+The right-hand columns are the real story. cio costs more CPU per request at
+every thread count, and the cost *grows* with thread count (12% at 4 threads,
+23% at 8) while asio's stays flat — the signature of coherence traffic on shared
+state. Below saturation the spare cores absorb it and throughput matches; at 8
+threads on 8 cores it converts directly into lost throughput.
+
+### Skew: where work stealing is worth what it costs
+
+Some connections ask the server to burn CPU per request; the rest ask for none.
+
+With 256 connections the answer is nothing (asio stays ahead, gap narrowing from
+26% to 2% as the CPU work grows) — but that is a flaw in the test, not a result.
+`SO_REUSEPORT` spreads 256 connections evenly enough that every shard gets its
+fair share of heavy ones, so no shard is ever the unlucky one.
+
+Fewer connections, where that averaging does not happen (200 µs of CPU on the
+heavy ones):
 
 | | cio | asio-callback | asio-coro | go |
 |---|---:|---:|---:|---:|
-| p50 | 662 | 581 | 587 | 647 |
-| p99 | 2176 | 1718 | 1673 | 2304 |
+| 16 conns, 25% heavy | **151,887** | 127,286 | 145,445 | 143,161 |
+| 16 conns, 50% heavy | **109,401** | 88,325 | 86,309 | 100,757 |
+| 32 conns, 25% heavy | **225,382** | 108,254 | 198,421 | 211,444 |
+| 32 conns, 50% heavy | **93,272** | 72,791 | 90,760 | 89,494 |
 
-Server CPU across the 512-connection window was 38.9 / 38.2 / 38.5 / 37.7
-core-seconds out of 40 available — everything is saturated and the differences
-are pure efficiency, not headroom. The load generator sat at 78-83% of its 16
-cores, so nothing here is client-bound.
+cio wins all four, by 19% to 108%. The server CPU column says why: at 32
+connections and 25% heavy, cio uses 38.2 of its 40 core-seconds while
+asio-callback uses 26.5. asio is not slower because it is inefficient — it is
+slower because it *cannot reach* the idle cores. The heavy connections are
+pinned to the shards that accepted them, and seven idle threads cannot help.
 
-### Reading them
+This is the load balancing that a flat echo benchmark never charges shared-
+nothing for, and it is worth about as much as shared-nothing's advantage is on
+the flat case.
 
-**cio and Go land in the same place**, which is what you would expect from two
-runtimes with the same architecture: cio 3.8% ahead at 512 connections, Go 4.6%
-ahead at 64, cio 15% ahead at 8. None of those differences is architectural;
-they are different tunings of the same design. (Before the two changes described
-below, cio was 404k at 64 connections against Go's 469k.)
+### Churn: cio's real weakness
 
-**Shared-nothing asio is 16–27% faster**, and that is the real finding. Pinning a
-connection to one thread for its lifetime removes every cross-thread cost cio and
-Go pay: no run queue shared between workers, no stealing, no futex wakeups to
-hand a ready connection to an idle thread. What it gives up is load balancing —
-one shard with the expensive connections cannot be helped by seven idle ones —
-which an echo benchmark, where every connection costs the same, never charges it
-for.
+Reconnect every N requests, 256 connections:
 
-**asio's coroutines are close to free** here: the callback and `awaitable`
-variants are within 4% of each other, and the coroutine one is actually ahead at
-8 connections. Coroutines are not what separates these numbers.
+| requests per connection | cio | asio-callback | asio-coro | go |
+|---:|---:|---:|---:|---:|
+| never (held open) | 616,628 | 767,292 | 770,281 | 651,801 |
+| 100 | 605,686 | 735,642 | 720,847 | 625,868 |
+| 10 | 325,673 | 506,403 | 322,210 | 428,109 |
+| 1 | 33,020 | 32,977 | 32,769 | 64,615 |
+
+At 10 requests per connection cio is 24% behind Go and 36% behind
+asio-callback — and its server CPU is 28.2 core-seconds against asio's 34.7. It
+is leaving 30% of the machine idle, which means accept is the bottleneck, not
+throughput. cio has one acceptor task on one listening socket; asio has a
+`SO_REUSEPORT` acceptor per thread and the kernel spreads new connections across
+them. This is the one place in the matrix where a concrete, architecture-
+preserving fix is indicated: shard the acceptor, which costs cio nothing in load
+balancing.
+
+(At 1 request per connection everything collapses into kernel connection setup
+and the runtimes stop mattering — except Go, which is 2x everyone else there and
+worth a look on its own.)
+
+### Summary
+
+| workload | winner | margin |
+|---|---|---|
+| small payloads, many held-open connections | shared-nothing asio | 14-23% |
+| payloads >= 16 KiB | tie | 0% |
+| below CPU saturation (<= 4 of 8 cores) | tie | 2-4% |
+| CPU-heavy requests, evenly spread | tie | 2% |
+| uneven load, few connections | **cio / Go** | 19-108% |
+| connection churn | asio, then Go | cio 24-36% behind |
 
 ### Where the gap actually is
 

@@ -14,6 +14,7 @@
 #include <boost/asio/detached.hpp>
 #include <boost/asio/use_awaitable.hpp>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -30,6 +31,18 @@ using asio::use_awaitable;
 namespace {
 
 constexpr std::size_t kBufferSize = 4096;
+// Per-request CPU work, in microseconds, taken from the first request byte.
+//
+// A busy-wait on the clock rather than a counted loop: a loop compiles to
+// different amounts of work under gcc and the Go compiler, which would make the
+// servers incomparable. Spinning until a deadline is identical by construction.
+inline void burn_microseconds(unsigned us) {
+    if (us == 0) return;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+    while (std::chrono::steady_clock::now() < deadline) {
+    }
+}
 
 awaitable<void> serve(tcp::socket socket) {
     try {
@@ -39,6 +52,7 @@ awaitable<void> serve(tcp::socket socket) {
             const std::size_t n =
                 co_await socket.async_read_some(asio::buffer(buffer), use_awaitable);
             if (n == 0) break;
+            burn_microseconds(static_cast<unsigned char>(buffer[0]));
             co_await asio::async_write(socket, asio::buffer(buffer, n), use_awaitable);
         }
     } catch (const std::exception&) {

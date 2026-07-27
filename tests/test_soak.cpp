@@ -86,6 +86,7 @@ cio::Task<> echo_connection(net::TcpStream stream) {
 
 cio::Task<> echo_server(net::TcpListener listener, cio::CancelToken stop) {
     cio::TaskGroup connections;
+    long accepted = 0;
     for (;;) {
         if (stop.cancelled()) break;
         // See test_net.cpp: a deadline is what makes a parked accept observe
@@ -97,6 +98,27 @@ cio::Task<> echo_server(net::TcpListener listener, cio::CancelToken stop) {
             break;
         }
         connections.spawn(echo_connection(std::move(*conn)));
+
+        // Break the symmetric-transfer chain every so often.
+        //
+        // A backlog drained without ever suspending is not a loop: awaiting
+        // accept() tail-calls into it and it tail-calls back on return, so N
+        // back-to-back accepts are N nested resumes. That is constant-stack
+        // only because the compiler turns both transfers into jumps, which a
+        // sanitizer build cannot do — and it is not, as the README used to
+        // say, that ASan disables sibling calls. It does not; ordinary tail
+        // calls survive it. What defeats the coroutine tail call is ASan's own
+        // stack instrumentation, which has to run after the call returns.
+        // Measured with a 100k-iteration `co_await leaf()` chain: 0 bytes of
+        // growth at -O3, immediate overflow under ASan.
+        //
+        // So the depth this loop reaches is the length of an accept burst, and
+        // once cio got fast enough to drain a few hundred at once, an 8 MB
+        // stack ran out. Yielding suspends for real, which unwinds the chain
+        // and bounds the depth at something no build can overflow. Every 16 is
+        // far below the limit and far too rare to change what this test
+        // measures, which is descriptor and RSS hygiene under churn.
+        if ((++accepted & 15) == 0) co_await cio::yield();
     }
     co_await connections.join();
 }

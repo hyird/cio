@@ -70,6 +70,10 @@ void Reactor::free_desc(IoDesc* desc) noexcept {
 // --------------------------------------------------------- readiness core ---
 
 void Reactor::unblock_impl(IoDesc* desc, Dir dir, Error err, std::uint32_t* deferred) noexcept {
+    // An edge arrived (or the descriptor is being torn down and the waiter has
+    // to re-check): a syscall on this direction may succeed again.
+    desc->note_readable(dir);
+
     std::atomic<void*>& slot = desc->dir_slot(dir);
     for (;;) {
         void* old = slot.load(std::memory_order_acquire);
@@ -237,6 +241,16 @@ bool IoAwaiter::await_suspend(std::coroutine_handle<> h) noexcept {
 }
 
 Result<void> IoAwaiter::await_resume() noexcept {
+    // Every completion of this awaiter means readiness was signalled, so the
+    // hint must be set here and not left to unblock().
+    //
+    // The race it closes: the reactor sets the hint and records kIoReady, then
+    // the task's in-flight short read stores hint=false over the top. The task
+    // then skips the syscall, consumes the recorded kIoReady, skips the syscall
+    // again because the hint is still false, and parks with data sitting in the
+    // socket and no further edge coming. Setting it on the path that observed
+    // readiness makes the last writer the one that is right.
+    desc_->note_readable(dir_);
     if (wait_.err) return wait_.err;
     return ok();
 }

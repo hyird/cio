@@ -84,7 +84,34 @@ struct CIO_CACHE_ALIGNED IoDesc {
     std::atomic<std::uint32_t> deadline_seq[kDirCount]{{1}, {1}};
     std::atomic<std::uint32_t> expired_seq[kDirCount]{{0}, {0}};
 
+    // "A syscall on this direction might succeed."
+    //
+    // Edge-triggered readiness means an operation is only complete once it has
+    // seen EAGAIN, so the naive loop costs two syscalls per message: one that
+    // returns data and one that returns EAGAIN to prove the edge is consumed.
+    // Measured against an echo server: 1.98 recv per request, and throughput
+    // that tracks 1/syscalls almost exactly.
+    //
+    // A short read removes the need for the second one. If recv returns fewer
+    // bytes than asked for, the receive queue was empty when it returned, so the
+    // next call would EAGAIN — and any data arriving later re-arms the epoll
+    // edge, which sets this back to true. So the task can skip straight to
+    // parking. Starts true because nothing is known about a fresh descriptor.
+    std::atomic<bool> ready_hint[kDirCount]{{true}, {true}};
+
     std::atomic<void*>& dir_slot(Dir d) noexcept { return slot[static_cast<unsigned>(d)]; }
+
+    bool may_be_ready(Dir d) const noexcept {
+        return ready_hint[static_cast<unsigned>(d)].load(std::memory_order_acquire);
+    }
+    // Called by the owning task when a syscall proved the direction is drained.
+    void note_would_block(Dir d) noexcept {
+        ready_hint[static_cast<unsigned>(d)].store(false, std::memory_order_release);
+    }
+    // Called by the reactor when an edge arrives.
+    void note_readable(Dir d) noexcept {
+        ready_hint[static_cast<unsigned>(d)].store(true, std::memory_order_release);
+    }
 
     bool timed_out(Dir d) const noexcept {
         const unsigned i = static_cast<unsigned>(d);

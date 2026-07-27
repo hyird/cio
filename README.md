@@ -232,17 +232,19 @@ payload:
 
 | connections | cio | asio-callback | asio-coro | go |
 |---:|---:|---:|---:|---:|
-| 8 | 65,338 | 79,764 | 83,767 | 56,106 |
-| 64 | 439,374 | 645,816 | 617,365 | 468,098 |
-| 512 | 680,753 | 809,941 | 786,083 | 680,915 |
+| 8 | 66,151 | 83,830 | 84,580 | 57,407 |
+| 64 | 449,598 | 634,477 | 644,877 | 470,443 |
+| 512 | 700,392 | 813,485 | 812,531 | 674,611 |
 
-cio and Go land in the same place, which is the expected result for two runtimes
-with the same architecture — dead even at 512 connections. Shared-nothing asio is
-17–47% ahead: pinning a connection to one thread for its lifetime removes every
-cross-thread cost that a work-stealing scheduler pays, and an echo benchmark
-never charges it for the load balancing it gives up. See
-[bench/echo-comparison/README.md](bench/echo-comparison/README.md) for the
-methodology and the caveats, which matter more than the numbers.
+cio and Go land within a few percent of each other, which is the expected result
+for two runtimes with the same architecture. Shared-nothing asio is 16-27%
+ahead, and profiling says why: cio retires *fewer* instructions per request than
+asio and spends 27% more cycles doing it (IPC 0.46 against 0.61). It is not
+doing more work, it is stalling on coherence traffic over shared scheduler
+state, which a shared-nothing design does not have. Two earlier explanations —
+the wake path, then syscall count — were measured and rejected; see
+[bench/echo-comparison/README.md](bench/echo-comparison/README.md) for how, and
+for the methodology and caveats, which matter more than the numbers.
 
 ## Testing
 

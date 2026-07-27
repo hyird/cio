@@ -107,6 +107,9 @@ Result<IoDesc*> Reactor::attach(int fd) {
         desc->expired_seq[i].store(0, std::memory_order_relaxed);
         desc->deadline_timer[i].state.store(Timer::kIdle, std::memory_order_relaxed);
         desc->deadline_timer[i].heap_index = ~0u;
+        // Nothing is known about a fresh descriptor, so let the first operation
+        // try the syscall.
+        desc->ready_hint[i].store(true, std::memory_order_relaxed);
     }
 
     // Register both directions once, edge-triggered, and never touch epoll_ctl

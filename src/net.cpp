@@ -222,9 +222,18 @@ Result<SocketAddr> Socket::peer_addr() const {
 
 // ------------------------------------------------------------- TcpStream ---
 
+// The try_* forms always attempt the syscall — a caller asking to "try" wants
+// an attempt — but they keep the readiness hint coherent so that mixing them
+// with the awaiting forms does not confuse it.
 Result<std::size_t> TcpStream::try_read(std::span<std::byte> buffer) {
     const ssize_t n = ::recv(fd_, buffer.data(), buffer.size(), 0);
-    if (n >= 0) return static_cast<std::size_t>(n);
+    if (n >= 0) {
+        if (static_cast<std::size_t>(n) < buffer.size()) {
+            desc_->note_would_block(detail::Dir::kRead);
+        }
+        return static_cast<std::size_t>(n);
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) desc_->note_would_block(detail::Dir::kRead);
     return Error::from_errno();
 }
 
@@ -232,18 +241,35 @@ Result<std::size_t> TcpStream::try_write(std::span<const std::byte> buffer) {
     // MSG_NOSIGNAL: a write to a closed peer must be an EPIPE return, not a
     // process-wide SIGPIPE.
     const ssize_t n = ::send(fd_, buffer.data(), buffer.size(), MSG_NOSIGNAL);
-    if (n >= 0) return static_cast<std::size_t>(n);
+    if (n >= 0) {
+        if (static_cast<std::size_t>(n) < buffer.size()) {
+            desc_->note_would_block(detail::Dir::kWrite);
+        }
+        return static_cast<std::size_t>(n);
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) desc_->note_would_block(detail::Dir::kWrite);
     return Error::from_errno();
 }
 
 Task<Result<std::size_t>> TcpStream::read(std::span<std::byte> buffer) {
     for (;;) {
-        // Try first: on a busy connection the data is already there and this
-        // completes without ever suspending.
-        const ssize_t n = ::recv(fd_, buffer.data(), buffer.size(), 0);
-        if (n >= 0) co_return static_cast<std::size_t>(n);
-        if (errno == EINTR) continue;
-        if (errno != EAGAIN && errno != EWOULDBLOCK) co_return Error::from_errno();
+        // Skip the syscall when the last one proved the queue empty and no edge
+        // has arrived since. This is what removes the EAGAIN read that
+        // edge-triggered polling would otherwise cost on every message.
+        if (desc_->may_be_ready(detail::Dir::kRead)) {
+            const ssize_t n = ::recv(fd_, buffer.data(), buffer.size(), 0);
+            if (n >= 0) {
+                // Short read: the receive queue is empty, so the next recv
+                // would EAGAIN until a new edge arrives.
+                if (static_cast<std::size_t>(n) < buffer.size()) {
+                    desc_->note_would_block(detail::Dir::kRead);
+                }
+                co_return static_cast<std::size_t>(n);
+            }
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) co_return Error::from_errno();
+            desc_->note_would_block(detail::Dir::kRead);
+        }
 
         if (auto ready = co_await detail::IoAwaiter{desc_, detail::Dir::kRead}; !ready) {
             co_return ready.error();
@@ -253,10 +279,19 @@ Task<Result<std::size_t>> TcpStream::read(std::span<std::byte> buffer) {
 
 Task<Result<std::size_t>> TcpStream::write(std::span<const std::byte> buffer) {
     for (;;) {
-        const ssize_t n = ::send(fd_, buffer.data(), buffer.size(), MSG_NOSIGNAL);
-        if (n >= 0) co_return static_cast<std::size_t>(n);
-        if (errno == EINTR) continue;
-        if (errno != EAGAIN && errno != EWOULDBLOCK) co_return Error::from_errno();
+        if (desc_->may_be_ready(detail::Dir::kWrite)) {
+            const ssize_t n = ::send(fd_, buffer.data(), buffer.size(), MSG_NOSIGNAL);
+            if (n >= 0) {
+                // A partial write means the send buffer filled up.
+                if (static_cast<std::size_t>(n) < buffer.size()) {
+                    desc_->note_would_block(detail::Dir::kWrite);
+                }
+                co_return static_cast<std::size_t>(n);
+            }
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) co_return Error::from_errno();
+            desc_->note_would_block(detail::Dir::kWrite);
+        }
 
         if (auto ready = co_await detail::IoAwaiter{desc_, detail::Dir::kWrite}; !ready) {
             co_return ready.error();
@@ -395,14 +430,19 @@ Result<TcpListener> TcpListener::bind(std::string_view host, std::uint16_t port,
 
 Task<Result<TcpStream>> TcpListener::accept() {
     for (;;) {
-        const int fd = ::accept4(fd_, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
-        if (fd >= 0) {
-            TcpStream stream;
-            if (auto adopted = stream.adopt(fd); !adopted) co_return adopted.error();
-            co_return std::move(stream);
+        if (desc_->may_be_ready(detail::Dir::kRead)) {
+            const int fd = ::accept4(fd_, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
+            if (fd >= 0) {
+                // A success says nothing about whether more are queued, so the
+                // hint stays set and the next accept tries again.
+                TcpStream stream;
+                if (auto adopted = stream.adopt(fd); !adopted) co_return adopted.error();
+                co_return std::move(stream);
+            }
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) co_return Error::from_errno();
+            desc_->note_would_block(detail::Dir::kRead);
         }
-        if (errno == EINTR || errno == ECONNABORTED) continue;
-        if (errno != EAGAIN && errno != EWOULDBLOCK) co_return Error::from_errno();
 
         if (auto ready = co_await detail::IoAwaiter{desc_, detail::Dir::kRead}; !ready) {
             co_return ready.error();
@@ -452,6 +492,9 @@ Task<Result<std::size_t>> UdpSocket::recv_from(std::span<std::byte> buffer, Sock
         }
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) co_return Error::from_errno();
+        // Unlike a stream, a short datagram says nothing about whether more are
+        // queued, so only EAGAIN can clear the hint here.
+        desc_->note_would_block(detail::Dir::kRead);
 
         if (auto ready = co_await detail::IoAwaiter{desc_, detail::Dir::kRead}; !ready) {
             co_return ready.error();
@@ -467,6 +510,7 @@ Task<Result<std::size_t>> UdpSocket::send_to(std::span<const std::byte> buffer,
         if (n >= 0) co_return static_cast<std::size_t>(n);
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) co_return Error::from_errno();
+        desc_->note_would_block(detail::Dir::kWrite);
 
         if (auto ready = co_await detail::IoAwaiter{desc_, detail::Dir::kWrite}; !ready) {
             co_return ready.error();

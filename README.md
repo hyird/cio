@@ -106,12 +106,35 @@ and letting peers take it destroys exactly the locality it was added for. This i
 safe because only the owning worker ever writes it, so it can never strand a task
 under a parked worker.
 
+**Finding work.** A searcher checks its own queues, then the global queue, then
+*drains the reactor*, and only then steals from peers. That order matters more
+than it looks: in an I/O-bound server essentially every runnable task originates
+in the reactor, so stealing first means scanning every peer — two cache lines
+each, on lines those peers are writing — to discover what one `epoll_wait` was
+about to hand over in bulk. Measured at 256 connections before the reorder: 3.33M
+steal attempts against 701k hits, a 21% hit rate, with one epoll event per
+request. Go's `findRunnable` polls the network before it resorts to stealing for
+the same reason. Afterwards, steal attempts fell 47% and parks 55%.
+
+The drain backs off for 20 µs whenever it comes back empty, because the ordering
+is a loss without load: with more workers than in-flight work, every worker runs
+dry constantly and each trip spent a syscall to be told the reactor had nothing.
+Only the non-blocking drain is throttled — the blocking poll a parking worker
+does is not, so nothing waits longer for an event.
+
 **Wakeups.** Idle workers follow Go's spinning protocol, and `notify()` is gated
 by a CAS that claims the right to create *the* searcher; a worker woken that way
 inherits the searcher credit instead of re-entering the notify path. Without that
 gate, a hot channel wakes and re-parks a thread on every message and the futex
 round trip dwarfs the work being scheduled — measured at 23 µs per channel round
 trip before the gate, 140 ns after.
+
+A reactor poll that makes N tasks runnable wakes N−1 peers, not N: the poller
+returns to its own run loop and takes one itself, and waking somebody for that
+one buys a futex round trip to a worker that finds the queue already emptied.
+When the grant leaves a token for every waiter, one broadcast delivers them all
+in a single syscall instead of N sequential ones — the worker told last would
+otherwise start that whole sequence late, on the critical path of its request.
 
 **Reactor.** One edge-triggered epoll registration per fd for the life of the fd,
 never rearmed. Per-direction readiness is a single atomic word with three states
@@ -224,7 +247,56 @@ spawn and 250–350 ns for an unbuffered channel round trip.
 
 ### Against other runtimes
 
-`bench/echo-comparison/` runs an 8-thread echo workload against cio, Boost.Asio
+There are two comparisons here, and the newer one exists because of a flaw in
+the older one.
+
+**`bench/http-comparison/`, driven by wrk.** A minimal HTTP/1.1 server on each
+of cio, shared-nothing Boost.Asio and Go — hand-rolled in all three, so what is
+compared is the runtime and not `net/http` against an asio HTTP library. Server
+pinned to CPUs 0-7, wrk to 8-23, servers interleaved with the order rotating
+each repeat. Requests/sec, three repeats, and server CPU out of the 64
+core-seconds those 8 cores can supply over the measured window:
+
+| connections | cio | asio | go | cio CPU | go CPU |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 75,483 | **123,134** | 72,714 | 23.6 | 28.6 |
+| 64 | 636,751 | **722,608** | 629,971 | 58.5 | 60.4 |
+| 256 | 770,606 | **816,972** | 716,889 | 61.8 | 62.9 |
+| 1024 | 770,628 | **835,326** | 721,637 | 61.1 | 63.5 |
+
+cio is ahead of Go at every point — by 1.1% at 64 and 7.5% at 256 — and uses
+less CPU than Go at all of them. Shared-nothing asio leads by 5.7-11.9% above 64
+connections and by much more below, for the reason the skew sweep below charges
+it for.
+
+**Why wrk.** The echo comparison's load generator is written in cio, which it
+says and mitigates but cannot fix: an improvement to cio makes the generator
+faster too. That is not a hypothetical. The reactor-ordering change measured
++7.9% against the generator as it stood and +50% after the generator was rebuilt
+on the improved runtime, and neither number is the server on its own. Worse, at
+8 connections the same harness reported +4.1% for a change that costs 4.6%
+there — a real regression, hidden by the client speeding up in step with the
+server. wrk is not built on any runtime under test and does not change when they
+do.
+
+Against wrk, the same server source with only the runtime swapped, from the
+first commit of this series to the last:
+
+| connections | before | after | |
+|---:|---:|---:|---:|
+| 1 | 12,312 | 14,047 | **+14.1%** |
+| 8 | 80,384 | 76,663 | **−4.6%** |
+| 64 | 384,256 | 635,822 | **+65.5%** |
+| 256 | 544,376 | 758,177 | **+39.3%** |
+| 1024 | 596,095 | 766,982 | **+28.7%** |
+
+The 8-connection column is not a rounding error and is not fixed. With more
+workers than in-flight work every worker runs dry constantly, and draining the
+reactor before stealing costs a syscall each time it finds nothing; a 20 µs
+backoff recovers about half of it. It is the same regime where asio is 39%
+ahead, and for the same reason — one shared reactor against eight private ones.
+
+**`bench/echo-comparison/`** runs an 8-thread echo workload against cio, Boost.Asio
 (shared-nothing: one `io_context` and one `SO_REUSEPORT` acceptor per thread, in
 both callback and coroutine form) and Go, with the server pinned to CPUs 0-7 and
 the load generator to 8-23. `run_matrix.sh` sweeps payload, thread count,
@@ -260,6 +332,23 @@ Two earlier explanations for the flat-echo gap — the wake path, then syscall
 count — were measured and rejected; see
 [bench/echo-comparison/README.md](bench/echo-comparison/README.md) for how, and
 for the methodology and caveats, which matter more than the numbers.
+
+### Counters
+
+A sampling profiler answers "which symbol has the most cycles", which is not the
+question worth asking about a scheduler. How many futex wakes a request costs,
+how many events an `epoll_wait` returns, how often a searcher finds nothing —
+those are the numbers that decide what to change, and the 21% steal hit rate
+that produced the reordering above was the first thing they showed.
+
+```
+cmake -S . -B build-metrics -DCIO_METRICS=ON -DCMAKE_BUILD_TYPE=Release
+```
+
+`cio::runtime_metrics()` returns a snapshot. It links either way and returns
+zeroes when the counters are compiled out, so a diagnostic can be written once
+and pointed at whichever build is interesting. Off by default: a benchmark and a
+production build should not differ.
 
 ## Testing
 

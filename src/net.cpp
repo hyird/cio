@@ -323,8 +323,8 @@ Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr) {
 
     TcpStream stream;
     if (auto adopted = stream.adopt(fd, /*already_nonblocking=*/true); !adopted) {
-                co_return adopted.error();
-            }
+        co_return adopted.error();
+    }
 
     if (::connect(stream.fd_, addr.raw(), addr.length()) == 0) co_return std::move(stream);
     if (errno != EINPROGRESS) co_return Error::from_errno();
@@ -454,8 +454,8 @@ Task<Result<TcpStream>> TcpListener::accept() {
                 // hint stays set and the next accept tries again.
                 TcpStream stream;
                 if (auto adopted = stream.adopt(fd, /*already_nonblocking=*/true); !adopted) {
-                co_return adopted.error();
-            }
+                    co_return adopted.error();
+                }
                 co_return std::move(stream);
             }
             if (errno == EINTR || errno == ECONNABORTED) continue;

@@ -5,6 +5,13 @@
 // completion. Neither transition goes through a run queue, so composing tasks
 // costs a jump, not a scheduling round-trip. Only spawn/go put a task on the
 // scheduler; plain composition never does.
+//
+// That "tail-call" is a requirement, not an optimisation: without it a loop
+// like `for (;;) co_await handle(co_await listener.accept());` grows the stack
+// on every iteration and eventually overflows. GCC needs
+// -foptimize-sibling-calls for it (see CMakeLists.txt); clang emits a musttail
+// unconditionally. Sanitizer builds disable sibling calls outright, so they
+// cannot run unbounded coroutine loops — keep sanitizer runs short.
 #pragma once
 
 #include <concepts>
@@ -15,6 +22,7 @@
 #include <utility>
 
 #include "cio/config.hpp"
+#include "cio/detail/frame_pool.hpp"
 
 namespace cio {
 
@@ -29,6 +37,15 @@ namespace detail {
 [[noreturn]] void abort_on_unhandled_exception(std::exception_ptr e) noexcept;
 
 struct TaskPromiseBase {
+    // Route every task frame through the per-thread pool. Only the sized delete
+    // is declared: the coroutine machinery always knows the frame size, and
+    // offering only this form means a compiler that wanted the unsized one
+    // would fail loudly rather than silently bypassing the pool.
+    static void* operator new(std::size_t size) { return FramePool::allocate(size); }
+    static void operator delete(void* frame, std::size_t size) noexcept {
+        FramePool::deallocate(frame, size);
+    }
+
     struct FinalAwaiter {
         TaskPromiseBase* promise;
 

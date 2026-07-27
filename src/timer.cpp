@@ -1,6 +1,7 @@
 #include "cio/detail/timer.hpp"
 
 #include <algorithm>
+#include <cassert>
 
 #include "cio/detail/scheduler.hpp"
 
@@ -89,6 +90,11 @@ void TimerService::arm(Timer* timer) {
         worker != nullptr ? static_cast<std::uint32_t>(worker->index() % shards_.size()) : 0u;
     Shard& shard = *shards_[shard_index];
 
+    // Arming a node that is already linked into a heap corrupts it: heap_index
+    // gets overwritten and the old slot keeps pointing here. Callers must
+    // disarm() first, unconditionally.
+    assert(timer->heap_index == kNotInHeap && "cio: timer armed while already in a heap");
+
     timer->shard = shard_index;
     timer->state.store(Timer::kArmed, std::memory_order_relaxed);
 
@@ -113,13 +119,42 @@ void TimerService::arm(Timer* timer) {
 }
 
 bool TimerService::disarm(Timer* timer) {
-    Shard& shard = *shards_[timer->shard];
-    {
+    // Safe to call in any state, and callers must call it unconditionally.
+    //
+    // Testing `state == kArmed` at the call site and skipping this is a trap:
+    // it silently skips the kFiring wait below, so the caller can go on to
+    // recycle or re-arm the node while the firing callback is still running.
+    // That callback's final `state = kFired` then lands on the node's next
+    // incarnation, and the next disarm sees a state that does not match
+    // reality — which ends with the same Timer linked into a heap twice and
+    // heap_index pointing at the wrong slot.
+    for (;;) {
+        const std::uint32_t state = timer->state.load(std::memory_order_acquire);
+
+        if (state == Timer::kIdle || state == Timer::kCancelled ||
+            state == Timer::kFired) {
+            // Not in any heap, and nobody is touching it.
+            return false;
+        }
+
+        if (state == Timer::kFiring) {
+            // The callback is still reading this node and our caller is about
+            // to destroy or re-arm it. Wait for it to publish kFired. Bounded
+            // and rare: a callback is a compare-exchange, not work.
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            __asm__ __volatile__("yield");
+#endif
+            continue;
+        }
+
+        // kArmed. The shard lock is what serialises us against run_expired():
+        // it moves the timer out of kArmed while holding the lock, so exactly
+        // one of disarm and fire can win.
+        Shard& shard = *shards_[timer->shard];
         std::lock_guard<std::mutex> lock(shard.mutex);
 
-        // The shard lock is what serialises us against run_expired(): it moves
-        // the timer out of kArmed while holding the lock, so exactly one of
-        // disarm and fire can win.
         std::uint32_t expected = Timer::kArmed;
         if (timer->state.compare_exchange_strong(expected, Timer::kCancelled,
                                                  std::memory_order_acq_rel,
@@ -131,19 +166,8 @@ bool TimerService::disarm(Timer* timer) {
             republish(shard);
             return true;
         }
+        // Lost the race; re-examine (it is now kFiring or kFired).
     }
-
-    // We lost. If the callback is mid-flight it is still reading this node, and
-    // our caller is about to destroy it — wait for the callback to publish
-    // kFired. Bounded and rare: callbacks are a compare-exchange, not work.
-    while (timer->state.load(std::memory_order_acquire) == Timer::kFiring) {
-#if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
-#elif defined(__aarch64__)
-        __asm__ __volatile__("yield");
-#endif
-    }
-    return false;
 }
 
 std::int64_t TimerService::next_deadline_ns() const noexcept {

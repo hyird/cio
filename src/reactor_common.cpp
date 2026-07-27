@@ -138,9 +138,11 @@ void Reactor::set_deadline(IoDesc* desc, Dir dir, std::int64_t deadline_ns) {
     const auto i = static_cast<unsigned>(dir);
     IoTimer& timer = desc->deadline_timer[i];
 
-    if (timer.state.load(std::memory_order_acquire) == Timer::kArmed) {
-        sched_.timers().disarm(&timer);
-    }
+    // Unconditionally: disarm() is what waits out a callback that is still
+    // running on this node. Guarding it with a state check would let us re-arm
+    // underneath that callback.
+    sched_.timers().disarm(&timer);
+
     const std::uint32_t seq =
         desc->deadline_seq[i].fetch_add(1, std::memory_order_acq_rel) + 1;
 

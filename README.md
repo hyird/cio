@@ -3,8 +3,8 @@
 Goroutine-style concurrency for C++20, on stackless coroutines.
 
 The public API has no thread in it. You write tasks, channels, and `select`, and
-the runtime handles M:N scheduling, work stealing, an edge-triggered reactor,
-sharded timer heaps and a blocking pool underneath.
+the runtime handles M:N scheduling, work stealing, an edge-triggered epoll
+reactor, sharded timer heaps and a blocking pool underneath.
 
 ```cpp
 #include <cio/cio.hpp>
@@ -20,25 +20,29 @@ cio::Task<> worker(int id, cio::Chan<int> jobs, cio::Chan<int> out,
     }
 }
 
-int main() {
-    return cio::run([]() -> cio::Task<int> {
-        auto jobs = cio::make_chan<int>(64);
-        auto out  = cio::make_chan<int>(64);
-        cio::CancelSource stop;
+CIO_MAIN {
+    auto jobs = cio::make_chan<int>(64);
+    auto out  = cio::make_chan<int>(64);
+    cio::CancelSource stop;
 
-        cio::TaskGroup group;
-        for (int i = 0; i < 4; ++i) group.spawn(worker(i, jobs, out, stop.token()));
+    cio::TaskGroup group;
+    for (int i = 0; i < 4; ++i) group.spawn(worker(i, jobs, out, stop.token()));
 
-        for (int i = 1; i <= 100; ++i) co_await jobs.send(i);
-        jobs.close();
+    for (int i = 1; i <= 100; ++i) co_await jobs.send(i);
+    jobs.close();
 
-        int total = 0;
-        for (int i = 0; i < 100; ++i) total += *co_await out.recv();
-        co_await group.join();
-        co_return total;
-    }());
+    int total = 0;
+    for (int i = 0; i < 100; ++i) total += *co_await out.recv();
+    co_await group.join();
+    co_return 0;
 }
 ```
+
+`CIO_MAIN` makes the body of main a coroutine. The standard forbids `main`
+itself from being one ([basic.start.main]: "The function main shall not be a
+coroutine"), so the macro declares your body as a `cio::Task<int>` and emits the
+real `main` that stands up a runtime and blocks on it. Use `cio::Runtime`
+directly when you need to configure worker counts.
 
 ## Build
 
@@ -48,8 +52,8 @@ cmake --build build -j
 cd build && ctest
 ```
 
-Requires C++20 and Linux. Tested with GCC 13.3 and Clang 19 on Linux 6.12.
-No external dependencies.
+Linux only, C++20. Tested with GCC 13.3 and Clang 19 on Linux 6.12. No external
+dependencies.
 
 ## The public surface
 
@@ -68,7 +72,7 @@ No external dependencies.
 | `cio::WaitGroup`, `cio::Mutex` | suspend the task, never the worker |
 | `cio::blocking(fn)` | run `fn` on a real thread and resume with its result |
 | `cio::net::TcpListener/TcpStream/UdpSocket` | with Go-style deadlines |
-| `cio::Runtime`, `cio::run(task)` | the one place threads are mentioned |
+| `CIO_MAIN`, `cio::Runtime`, `cio::run(task)` | the one place threads are mentioned |
 
 Channel receive returns `std::optional<T>` — `nullopt` means closed and drained,
 so the Go range loop transcribes directly:
@@ -88,8 +92,9 @@ ordinary code in the enclosing coroutine and can `co_await` freely.
   ─────────────────────────────────────
    Scheduler        M:N workers, runnext + bounded ring + global queue,
                     steal-half, Go-style spinning/parking protocol
-   Reactor          epoll ET (kqueue/IOCP behind the same seam)
+   Reactor          epoll, edge-triggered
    TimerService     per-worker 4-ary heaps, atomic earliest-deadline
+   FramePool        size-classed thread caches + central list
    BlockingPool     lazily grown, retires on idle
 ```
 
@@ -106,7 +111,7 @@ by a CAS that claims the right to create *the* searcher; a worker woken that way
 inherits the searcher credit instead of re-entering the notify path. Without that
 gate, a hot channel wakes and re-parks a thread on every message and the futex
 round trip dwarfs the work being scheduled — measured at 23 µs per channel round
-trip before the gate, 200 ns after.
+trip before the gate, 140 ns after.
 
 **Reactor.** One edge-triggered epoll registration per fd for the life of the fd,
 never rearmed. Per-direction readiness is a single atomic word with three states
@@ -126,6 +131,15 @@ worker parked in the reactor computes its timeout by reading N atomics rather
 than locking N heaps. Waits use `epoll_pwait2`, so a 200 µs sleep is not rounded
 up to a millisecond.
 
+**Frame pool.** Coroutine frames are the runtime's most frequent allocation — one
+per spawned task, one per socket read or write — so they go through a
+size-classed allocator instead of malloc. A thread cache serves the common case
+(a task allocates and frees its own frames) with no atomics; a central list with
+batched transfer serves the fan-out case, where one task allocates every frame
+and 24 workers free them, which a purely thread-local cache cannot recycle at
+all. Measured: 1.008 → 0.000 allocations per socket read, and 1.000 → 0.008 per
+cross-thread spawn.
+
 **Watchdog.** A sysmon-style monitor thread polls the reactor and fires timers
 when every worker is busy with CPU-bound work, so I/O latency does not degrade
 under load.
@@ -141,44 +155,82 @@ That single rule is what lets `select` retract its unfired cases with nothing bu
 the channel lock — no refcounting on the wakeup path. The two places without a
 shared lock get explicit handshakes instead: `select`'s timeout publishes through
 a phase word so a case that fires mid-registration defers the resume back to the
-setup code, and `Timer::disarm()` does not return until a firing callback has
-stopped touching the node.
+setup code, and `TimerService::disarm()` does not return until a firing callback
+has stopped touching the node.
+
+The corollary is that `disarm()` must be called *unconditionally*. Guarding it
+with `if (state == kArmed)` skips the wait for an in-flight callback, which lets
+the caller recycle or re-arm the node underneath it — the callback's final state
+write then lands on the node's next incarnation, and the same timer ends up
+linked into a heap twice with a stale `heap_index`. That was a real crash, found
+by the soak test at ~60 seconds and not by any unit test.
 
 ## Measurements
 
 AMD EPYC 7402, 24 cores, Linux 6.12, GCC 13.3, `-O3`. `./build/bench_core [workers]`.
+These are microbenchmarks on one machine; the multi-worker numbers vary ±20% run
+to run because they depend on which workers happen to be parked.
 
 | benchmark | 1 worker | 24 workers |
 |---|---:|---:|
-| `co_await` child task | 19.7 ns | 26.1 ns |
-| `co_await cio::yield()` | 12.6 ns | 24.3 ns |
-| `go()` detached spawn | 144 ns | 567 ns |
-| `spawn()` + `co_await` join | 302 ns | 1393 ns |
-| unbuffered chan round trip | 100 ns | 137 ns |
-| buffered chan round trip | 102 ns | 199 ns |
-| chan throughput, 1p/1c | 34.5 ns/op | 63.4 ns/op |
-| chan throughput, 8p/8c | — | 352 ns/op |
-| `select`, a case ready | — | 177 ns |
-| `select`, parks every round | — | 232 ns |
-| timer arm + fire | — | 1.3 µs |
+| `co_await` child task | 15.8 ns | 16 ns |
+| `co_await cio::yield()` | 12.6 ns | 15–24 ns |
+| `go()` detached spawn | 144 ns | 288 ns |
+| `spawn()` + `co_await` join | 302 ns | 690 ns |
+| unbuffered chan round trip | 100 ns | 130–200 ns |
+| buffered chan round trip | 102 ns | 115–190 ns |
+| chan throughput, 1p/1c | 34.5 ns/op | 36–76 ns/op |
+| chan throughput, 8p/8c | — | 330–390 ns/op |
+| `select`, a case ready | — | 130–185 ns |
+| `select`, parks every round | — | 150–215 ns |
+| timer arm + fire | — | 625 ns |
 
-`./build/bench_echo 256 2000` — echo server and 256 client connections in one
-process over loopback, 24 workers: **497k round trips/sec**, 512k requests in
-1.03 s.
+`./build/bench_io` isolates the socket read path against the raw syscall and
+counts allocations directly:
+
+| | ns/op | allocs/op |
+|---|---:|---:|
+| `try_read()` (raw `recv`) | 324 | 0.000 |
+| `co_await stream.read()` | 339 | 0.000 |
+
+So an awaited read costs ~15 ns over the syscall, all of it coroutine frame
+setup rather than allocation. That is 4.5% of a 128-byte loopback read, which is
+why `read`/`write` are still ordinary coroutines: removing the frame entirely
+would mean running the retry syscall on the waking thread, and serialising every
+completion through the poller is a worse trade than 15 ns.
+
+`./build/bench_echo` — echo round trips over loopback. Run the server and client
+as separate processes; the convenient in-process mode measures the load
+generator as much as the server:
+
+```
+./bench_echo server 9100 12                    # one terminal
+./bench_echo client 127.0.0.1 9100 256 2000 12 # another
+./bench_echo                                   # in-process, for a quick check
+```
+
+| 256 connections × 2000 requests | round trips/sec | avg latency |
+|---|---:|---:|
+| in-process, 24 workers shared | 497k | 515 µs |
+| split processes, 12 workers each | **596k** | 430 µs |
+
+The in-process number is a lower bound on the server: the load generator is
+competing for the same cores and the same runtime. The split-process run is the
+one to quote, and even that is loopback — put the client on another machine to
+measure anything about the network.
 
 For reference, Go on comparable hardware lands around 300–400 ns for goroutine
-spawn and 250–350 ns for an unbuffered channel round trip. These numbers are
-microbenchmarks on one machine and should be re-measured on yours.
+spawn and 250–350 ns for an unbuffered channel round trip.
 
 ## Testing
 
-Six test binaries (`ctest`) covering the scheduler, channels, `select`, timers,
-sync primitives and networking — including 32k tasks across 24 workers, 8×8 MPMC
-channel traffic, 32 concurrent `select`s racing setup against wakeup, 64
-concurrent TCP connections at 20 round trips each, deadline interruption, and
-close-wakes-a-parked-reader.
+Seven test binaries (`ctest`) covering the scheduler, channels, `select`, timers,
+sync primitives, networking, and a soak test — including 32k tasks across 24
+workers, 8×8 MPMC channel traffic, 32 concurrent `select`s racing setup against
+wakeup, 64 concurrent TCP connections at 20 round trips each, deadline
+interruption, and close-wakes-a-parked-reader.
 
-All six pass clean under ThreadSanitizer:
+All pass clean under ThreadSanitizer:
 
 ```
 cmake -S . -B build-tsan -DCIO_SANITIZE=tsan -DCMAKE_BUILD_TYPE=Debug
@@ -188,31 +240,63 @@ cmake --build build-tsan -j && (cd build-tsan && ctest)
 There is also an idle-CPU test: 24 workers idling for 300 ms must consume under
 0.5 CPU-seconds, which fails loudly if anyone starts spinning instead of parking.
 
+**Run the soak longer than ctest does.** `test_soak` defaults to 3 seconds so
+`ctest` stays fast, but the bug it was written to find took 60 seconds to
+surface. Run it directly, in an optimized build:
+
+```
+./build/test_soak 90
+```
+
+It churns 48 clients through connect/round-trip/close against an in-process echo
+server, with deadlines short enough to fire mid-read, while eight more tasks
+hammer channels, `select` and timers. Then it checks that descriptors came back
+and that RSS did not climb. Over 120 s: 17.6M round trips, 0 mismatches, fds
+settled back to 8. RSS growth is +2.5 MB at 5 s, +3.4 MB at 90 s, +3.6 MB at
+120 s — the shape of a pool warming up, not of a leak.
+
+Do not run long soaks under a sanitizer — see below.
+
 ## Known limits
 
 These are real, and worth knowing before you build on it:
 
-- **Only the epoll backend is built and tested.** `src/reactor_kqueue.cpp` is
-  written to the same contract but has never been compiled or run — it is the
-  seam with content in it, not a supported backend. IOCP is not written; the
-  awaiter shape (park an object living in the frame, hand its address to the
-  backend, get it handed back) fits a completion-based backend, but the net
-  layer's readiness loops would need a submit-based path.
+- **Symmetric transfer must be a tail call, and sanitizers break it.** A loop
+  like `for (;;) co_await subtask()` is constant-stack only if the compiler
+  tail-calls the coroutine resume. Clang emits a `musttail` and is always
+  correct. GCC needs `-foptimize-sibling-calls`, which `-O2`/`-O3`/`-Og` imply
+  but `-O0` and `-O1` do not — the CMake target adds it as a PUBLIC option so
+  consumers inherit it, but a hand-rolled build must pass it. Both ASan and TSan
+  force sibling calls off and cannot be overridden, so a sanitizer build will
+  overflow its stack on a long-running coroutine loop. Keep sanitizer runs short;
+  run soaks in a normal build.
+
+  Measured, 100k iterations of `co_await leaf()`: GCC `-O0` and `-O1` overflow,
+  `-O0 -foptimize-sibling-calls` and `-Og`/`-O2`/`-O3` all show 0 bytes of stack
+  growth.
+
+- **Linux and epoll only, by choice.** A portability layer that is never compiled
+  on the other platforms rots silently and invites misplaced trust. The reactor's
+  backend-independent half is separated out (`src/reactor_common.cpp`) so a
+  kqueue or IOCP backend has a clean place to go, but none is claimed. Note that
+  IOCP would also need the net layer's readiness loops reworked into submissions.
+
 - **No preemption.** A task that computes without ever suspending holds its
   worker until it finishes. This is why `cio::blocking()` exists; use it.
+
 - **Shutdown does not unwind parked tasks.** Like Go at process exit, tasks
   blocked on a channel or socket when the runtime stops are simply not resumed,
   and their frames leak. `block_on` returning means your root task finished, not
   that every detached task did — that is what `TaskGroup` is for.
+
 - **A socket must outlive every task using it.** `close()` is safe to call while
   another task is parked on it (they wake with `Errc::closed`), but destroying
   the object out from under a parked task is not.
+
 - **One task per direction per socket.** A second concurrent reader on the same
   socket gets `Errc::broken` rather than silently corrupting the wait slot. Go
   panics in the same situation.
-- **`read`/`write` return `Task<Result<n>>`**, so each call is a coroutine frame
-  unless the compiler elides it. `try_read`/`try_write` plus `readable()` /
-  `writable()` are exposed for hot paths that want the loop without the frame.
+
 - **Cancellation is cooperative.** A `CancelToken` closes a channel; a task that
   never selects on `token.done()` will not notice. There is no mechanism to
   interrupt a task that is not at a suspension point.

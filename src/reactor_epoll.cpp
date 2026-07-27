@@ -106,6 +106,7 @@ Result<IoDesc*> Reactor::attach(int fd) {
         desc->deadline_seq[i].store(1, std::memory_order_relaxed);
         desc->expired_seq[i].store(0, std::memory_order_relaxed);
         desc->deadline_timer[i].state.store(Timer::kIdle, std::memory_order_relaxed);
+        desc->deadline_timer[i].heap_index = ~0u;
     }
 
     // Register both directions once, edge-triggered, and never touch epoll_ctl
@@ -128,10 +129,10 @@ void Reactor::detach(IoDesc* desc) {
     desc->closing.store(true, std::memory_order_release);
 
     for (unsigned i = 0; i < kDirCount; ++i) {
-        IoTimer& timer = desc->deadline_timer[i];
-        if (timer.state.load(std::memory_order_acquire) == Timer::kArmed) {
-            sched_.timers().disarm(&timer);
-        }
+        // Unconditionally, and before free_desc() below: this is what
+        // guarantees no deadline callback is still running on this descriptor
+        // when it goes back on the free list to be handed to another socket.
+        sched_.timers().disarm(&desc->deadline_timer[i]);
         // Invalidate any in-flight firing of the deadline timer.
         desc->deadline_seq[i].fetch_add(1, std::memory_order_acq_rel);
     }

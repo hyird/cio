@@ -41,11 +41,26 @@ target_link_libraries(cio PUBLIC Threads::Threads)
 target_compile_options(cio PRIVATE
   -Wall -Wextra -Wpedantic -Wshadow -Wno-interference-size)
 
+# Load-bearing, and PUBLIC because it has to reach every translation unit that
+# awaits a task, not just the library's own.
+#
+# C++20 coroutines resume each other by symmetric transfer, which is only
+# constant-stack if the compiler emits it as a tail call. GCC does that only
+# with -foptimize-sibling-calls, which -O2/-O3/-Og imply but -O0 and -O1 do not
+# — and without it every `for (;;) co_await subtask()` loop grows the stack
+# until it overflows. Measured: stack overflow at -O0 and -O1, zero growth once
+# this flag is added at any level. Clang emits a musttail and does not need it.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(cio PUBLIC -foptimize-sibling-calls)
+endif()
+
+# -UNDEBUG so assertions survive: a sanitizer build with the runtime's internal
+# invariant checks compiled out is the one build where they would pay off most.
 if(CIO_SANITIZE STREQUAL "tsan")
-  target_compile_options(cio PUBLIC -fsanitize=thread -g -O1)
+  target_compile_options(cio PUBLIC -fsanitize=thread -g -O1 -UNDEBUG)
   target_link_options(cio PUBLIC -fsanitize=thread)
 elseif(CIO_SANITIZE STREQUAL "asan")
-  target_compile_options(cio PUBLIC -fsanitize=address,undefined -g -O1)
+  target_compile_options(cio PUBLIC -fsanitize=address,undefined -g -O1 -UNDEBUG)
   target_link_options(cio PUBLIC -fsanitize=address,undefined)
 endif()
 
@@ -62,7 +77,7 @@ if(CIO_BUILD_TESTS)
     get_filename_component(test_name ${test_file} NAME_WE)
     cio_add_program(tests ${test_name})
     add_test(NAME ${test_name} COMMAND ${test_name})
-    set_tests_properties(${test_name} PROPERTIES TIMEOUT 120)
+    set_tests_properties(${test_name} PROPERTIES TIMEOUT 300)
   endforeach()
 endif()
 

@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "cio/detail/frame_pool.hpp"
 #include "cio/detail/scheduler.hpp"
 #include "cio/task.hpp"
 
@@ -39,6 +40,13 @@ inline Scheduler& require_scheduler() {
 template <typename T>
 class JoinState {
 public:
+    // Same pool as the coroutine frames: spawn() allocates one of these per
+    // call, on the same threads and with the same lifetime pattern.
+    static void* operator new(std::size_t size) { return FramePool::allocate(size); }
+    static void operator delete(void* state, std::size_t size) noexcept {
+        FramePool::deallocate(state, size);
+    }
+
     void add_ref() noexcept { refs_.fetch_add(1, std::memory_order_relaxed); }
     void release() noexcept {
         if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) delete this;

@@ -45,6 +45,7 @@ CIO_MAIN_ARGS(argc, argv) {
         co_return 1;
     }
     std::printf("listening on %s\n", listener->local_addr().value().to_string().c_str());
+    std::fflush(stdout);
 
     for (;;) {
         auto conn = co_await listener->accept();

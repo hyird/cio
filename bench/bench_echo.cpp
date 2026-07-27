@@ -1,8 +1,16 @@
-// End-to-end TCP throughput: an echo server and its clients in one process,
-// all on the runtime. Measures request/response round trips per second over
-// loopback, which is what a "one task per connection" server actually costs.
+// End-to-end TCP throughput: request/response round trips per second, which is
+// what a "one task per connection" server actually costs.
 //
-//     ./bench_echo [connections] [requests_per_connection] [workers]
+// Three modes, because the convenient one is also the least honest:
+//
+//     ./bench_echo                                  in-process (default)
+//     ./bench_echo server <port> [workers]          server only
+//     ./bench_echo client <host> <port> <conns> <reqs> [workers]
+//
+// In-process is convenient but the client tasks and the server tasks compete
+// for the same 24 cores and the same runtime, so the number it prints is a
+// lower bound that says as much about the load generator as about the server.
+// Split the two across processes (or machines) to measure the server.
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -97,17 +105,94 @@ cio::Task<long> run_benchmark(int connections, long requests) {
     co_return total;
 }
 
+cio::Task<int> run_server(std::uint16_t port) {
+    auto listener = net::TcpListener::bind(net::SocketAddr::any_v4(port));
+    if (!listener) {
+        std::fprintf(stderr, "bind failed: %s\n", listener.error().message().c_str());
+        co_return 1;
+    }
+    std::printf("echo server on %s — ctrl-c to stop\n",
+                listener->local_addr().value().to_string().c_str());
+    // stdout is block-buffered when redirected, and a driver script waiting for
+    // this line to know the server is up would otherwise wait forever.
+    std::fflush(stdout);
+
+    for (;;) {
+        auto conn = co_await listener->accept();
+        if (!conn) co_return 1;
+        conn->set_nodelay(true);
+        cio::go(serve(std::move(*conn)));
+    }
+}
+
+cio::Task<int> run_client(std::string host, std::uint16_t port, int connections,
+                          long requests) {
+    auto target = net::SocketAddr::parse(host, port);
+    if (!target) {
+        auto resolved = co_await net::resolve(host, port);
+        if (!resolved || resolved->empty()) {
+            std::fprintf(stderr, "cannot resolve %s\n", host.c_str());
+            co_return 1;
+        }
+        target = resolved->front();
+    }
+
+    std::vector<cio::JoinHandle<long>> clients;
+    clients.reserve(static_cast<std::size_t>(connections));
+
+    const auto started = cio::Clock::now();
+    for (int i = 0; i < connections; ++i) {
+        clients.push_back(cio::spawn(client(*target, requests)));
+    }
+    long total = 0;
+    for (auto& handle : clients) total += co_await handle;
+    const double seconds = std::chrono::duration<double>(cio::Clock::now() - started).count();
+
+    std::printf("target           %s\n", target->to_string().c_str());
+    std::printf("connections      %d\n", connections);
+    std::printf("completed        %ld\n", total);
+    std::printf("elapsed          %.3f s\n", seconds);
+    std::printf("round trips/sec  %.0f\n", static_cast<double>(total) / seconds);
+    std::printf("latency (avg)    %.1f us\n",
+                seconds * 1e6 / (static_cast<double>(total) / connections));
+    co_return total > 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    const std::string mode = argc > 1 ? argv[1] : "inproc";
+
+    if (mode == "server") {
+        const auto port = static_cast<std::uint16_t>(argc > 2 ? std::atoi(argv[2]) : 9100);
+        cio::RuntimeOptions options;
+        if (argc > 3) options.worker_threads = static_cast<std::size_t>(std::atoi(argv[3]));
+        cio::Runtime runtime(options);
+        std::printf("cio echo server — %zu workers\n", runtime.worker_count());
+        return runtime.block_on(run_server(port));
+    }
+
+    if (mode == "client") {
+        const std::string host = argc > 2 ? argv[2] : "127.0.0.1";
+        const auto port = static_cast<std::uint16_t>(argc > 3 ? std::atoi(argv[3]) : 9100);
+        const int connections = argc > 4 ? std::atoi(argv[4]) : 256;
+        const long requests = argc > 5 ? std::atol(argv[5]) : 2000;
+        cio::RuntimeOptions options;
+        if (argc > 6) options.worker_threads = static_cast<std::size_t>(std::atoi(argv[6]));
+        cio::Runtime runtime(options);
+        std::printf("cio echo client — %zu workers\n\n", runtime.worker_count());
+        return runtime.block_on(run_client(host, port, connections, requests));
+    }
+
     const int connections = argc > 1 ? std::atoi(argv[1]) : 256;
     const long requests = argc > 2 ? std::atol(argv[2]) : 2000;
-
     cio::RuntimeOptions options;
     if (argc > 3) options.worker_threads = static_cast<std::size_t>(std::atoi(argv[3]));
 
     cio::Runtime runtime(options);
-    std::printf("cio echo benchmark — %zu workers\n\n", runtime.worker_count());
+    std::printf("cio echo benchmark, in-process — %zu workers\n"
+                "(client and server share these workers; see the header comment)\n\n",
+                runtime.worker_count());
     runtime.block_on(run_benchmark(connections, requests));
     return 0;
 }

@@ -305,14 +305,28 @@ These are real, and worth knowing before you build on it:
   tail-calls the coroutine resume. Clang emits a `musttail` and is always
   correct. GCC needs `-foptimize-sibling-calls`, which `-O2`/`-O3`/`-Og` imply
   but `-O0` and `-O1` do not — the CMake target adds it as a PUBLIC option so
-  consumers inherit it, but a hand-rolled build must pass it. Both ASan and TSan
-  force sibling calls off and cannot be overridden, so a sanitizer build will
-  overflow its stack on a long-running coroutine loop. Keep sanitizer runs short;
-  run soaks in a normal build.
+  consumers inherit it, but a hand-rolled build must pass it. A sanitizer build
+  will overflow its stack on a long-running coroutine loop either way, for two
+  different reasons — keep sanitizer runs short, and run soaks in a normal
+  build.
 
   Measured, 100k iterations of `co_await leaf()`: GCC `-O0` and `-O1` overflow,
   `-O0 -foptimize-sibling-calls` and `-Og`/`-O2`/`-O3` all show 0 bytes of stack
   growth.
+
+  The two reasons are worth separating, because only one of them is the flag.
+  TSan does force sibling calls off. ASan does not — compiling a plain tail call
+  at `-O1 -foptimize-sibling-calls`, ASan still emits the `jmp` and TSan emits a
+  `call`. What ASan defeats is the *coroutine* transfer specifically, because
+  its stack instrumentation has to run after the call returns. The outcome is
+  the same and the diagnosis is not, so a stack trace full of nested resumes
+  under ASan is not evidence that a flag went missing.
+
+  The practical consequence is that a burst drained without suspending — an
+  accept loop emptying a backlog, say — is nested resumes rather than a loop,
+  and its depth is the length of the burst. That is free in a release build and
+  fatal under ASan at a few hundred. `test_soak` yields every sixteenth accept
+  for exactly this reason.
 
 - **Linux and epoll only, by choice.** A portability layer that is never compiled
   on the other platforms rots silently and invites misplaced trust. The reactor's

@@ -150,11 +150,11 @@ void Reactor::detach(IoDesc* desc) {
     free_desc(desc);
 }
 
-void Reactor::poll(std::int64_t timeout_ns) {
+int Reactor::poll(std::int64_t timeout_ns) {
     epoll_event events[kMaxEvents];
 
     const int n = wait_for_events(backend_fd_, events, kMaxEvents, timeout_ns);
-    if (n <= 0) return;  // 0 = timeout, <0 = EINTR or error; either way, retry later
+    if (n <= 0) return 0;  // 0 = timeout, <0 = EINTR or error; either way, retry later
     CIO_METRIC(poll_events, static_cast<std::uint64_t>(n));
 
     // One syscall can make hundreds of tasks runnable. Queue them all, then
@@ -205,6 +205,7 @@ void Reactor::poll(std::int64_t timeout_ns) {
     // anything, so it still has to wake somebody for every task.
     const std::uint32_t taken_by_poller = current_worker() != nullptr ? 1u : 0u;
     sched_.notify_batch(made_runnable > taken_by_poller ? made_runnable - taken_by_poller : 0);
+    return n;
 }
 
 void Reactor::wake() noexcept {

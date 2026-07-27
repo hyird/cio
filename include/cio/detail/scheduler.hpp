@@ -163,6 +163,11 @@ private:
     std::atomic<bool> stop_{false};
     std::atomic<bool> started_{false};
     std::atomic<std::int64_t> last_poll_ns_{0};
+    // Set when an opportunistic drain comes back with nothing: until this
+    // deadline, searchers skip the drain and go straight to stealing. Only the
+    // non-blocking path consults it — the blocking poll a parking worker does
+    // is never throttled, so nothing waits longer for an event because of it.
+    std::atomic<std::int64_t> idle_poll_until_ns_{0};
     // Deadline the parked poller is currently blocked until, INT64_MAX when
     // nobody is polling or the poll is untimed.
     std::atomic<std::int64_t> poller_deadline_ns_{INT64_MAX};

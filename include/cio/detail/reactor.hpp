@@ -164,10 +164,12 @@ public:
     // called before the fd itself is closed.
     void detach(IoDesc* desc);
 
-    // Waits for events and schedules the tasks they unblock.
+    // Waits for events and schedules the tasks they unblock. Returns the number
+    // of events the kernel handed back, which is what lets a caller notice that
+    // a non-blocking drain came up empty and stop repeating it.
     //   timeout_ns < 0  block until an event or wake()
     //   timeout_ns == 0 non-blocking drain
-    void poll(std::int64_t timeout_ns);
+    int poll(std::int64_t timeout_ns);
 
     // Makes a blocked poll() return promptly. Safe from any thread.
     void wake() noexcept;

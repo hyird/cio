@@ -16,6 +16,16 @@ std::atomic<Scheduler*> g_default_scheduler{nullptr};
 // How stale the last reactor poll may get before the monitor thread steps in.
 constexpr std::int64_t kMonitorPollStaleNs = 200'000;  // 200us
 
+// How long searchers skip the opportunistic reactor drain after one comes back
+// empty. Well under kMonitorPollStaleNs, so the watchdog remains the bound on
+// how long an event can go unnoticed with every worker busy.
+//
+// 20us, not longer: at 100us the drain gets throttled while it is still
+// productive, and 64 connections lose 3.4% against this value while 8 gain only
+// 1.3%. The useful range is "long enough to stop a spin of empty syscalls,
+// short enough that a burst arriving mid-backoff is not held up".
+constexpr std::int64_t kEmptyPollBackoffNs = 20'000;  // 20us
+
 }  // namespace
 
 Worker* current_worker() noexcept { return t_worker; }
@@ -124,6 +134,23 @@ void* Worker::find_work() noexcept {
     // straight through to the steal scan, and the one that polls is the one
     // publishing the work they are about to steal.
     //
+    // But back off from the drain while it keeps coming up empty. With more
+    // workers than in-flight work — eight connections across eight workers —
+    // every worker runs dry constantly, and each trip through here spent a
+    // syscall to be told the reactor had nothing. Measured against a
+    // third-party load generator at 8 connections: 17 core-seconds of server
+    // CPU with the old ordering, 25 with this one, for slightly *less*
+    // throughput. The extra core was epoll_wait(0) returning zero.
+    //
+    // A short deadline published by whoever last drew a blank fixes that
+    // without giving up the win at load, where drains are productive and the
+    // deadline is never set. Nothing waits longer for an event because of it: a
+    // worker that skips the drain goes on to steal and then to park, and the
+    // blocking poll it parks in is not throttled. The watchdog's 200us
+    // staleness bound is the backstop for the one case that is left — every
+    // worker busy, so nobody parks — which is why the backoff stays well under
+    // it.
+    //
     // Claim the reactor, do not merely test for it. polling_ says "exactly one
     // thread is inside the reactor", and a load-then-store cannot enforce that:
     // the parked poller sets the flag under idle_mutex_ and this path reads it
@@ -132,14 +159,20 @@ void* Worker::find_work() noexcept {
     // the wakeup eventfd, and a non-blocking drain that swallows the token
     // meant for the blocking poller leaves it in epoll_wait forever — at
     // shutdown, that is a hung join().
+    const std::int64_t now = now_ns();
     bool unclaimed = false;
     if (sched.reactor_->registered() > 0 &&
+        now >= sched.idle_poll_until_ns_.load(std::memory_order_relaxed) &&
         sched.polling_.compare_exchange_strong(unclaimed, true, std::memory_order_acq_rel,
                                                std::memory_order_acquire)) {
-        sched.last_poll_ns_.store(now_ns(), std::memory_order_relaxed);
+        sched.last_poll_ns_.store(now, std::memory_order_relaxed);
         CIO_METRIC(polls_nonblocking, 1);
-        sched.reactor_->poll(0);
+        const int events = sched.reactor_->poll(0);
         sched.polling_.store(false, std::memory_order_release);
+        if (events == 0) {
+            sched.idle_poll_until_ns_.store(now + kEmptyPollBackoffNs,
+                                            std::memory_order_relaxed);
+        }
         if (void* item = next_local()) return item;
         if (void* item = sched.global_.pop()) return item;
     }

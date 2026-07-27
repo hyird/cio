@@ -195,7 +195,14 @@ cio::Task<int> run(std::string host, std::uint16_t port, int connections, int wa
     const double cpu_after = process_cpu_seconds();
 
     g_stop.store(true, std::memory_order_relaxed);
-    co_await clients.join();
+    // Deliberately not joining the clients here.
+    //
+    // With reconnect-churn enabled a client task can be inside connect() when
+    // the stop flag is set, and a connect to a server whose accept queue is
+    // full backs off through SYN retransmits for tens of seconds. Waiting for
+    // that would hang the harness on exactly the churn-heavy configurations it
+    // exists to measure. The measurement window has closed and the histograms
+    // are complete, so report and let process exit reclaim the rest.
 
     Histogram merged;
     for (const auto& h : histograms) merged.merge(*h);

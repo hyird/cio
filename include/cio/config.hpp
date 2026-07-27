@@ -52,4 +52,24 @@ inline constexpr std::uint32_t kLocalQueueCapacity = 256;
 // queue, so that globally-queued tasks cannot be starved by a hot local pair.
 inline constexpr std::uint32_t kGlobalQueueInterval = 61;
 
+// Go's stealWork makes four steal passes before parking (`stealTries`), and cio
+// makes one. That difference was tried here, on the theory that it explained
+// cio issuing 0.098 futex syscalls per request against Go's 0.023. Interleaved
+// A/B over three repeats at 64 and 512 connections: no benefit, slightly
+// negative. Reverted. The futex difference is real; that it costs anything is
+// not established.
+
 }  // namespace cio::detail
+
+namespace cio {
+
+// Hint to the core that this is a spin iteration.
+CIO_ALWAYS_INLINE void cpu_relax() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+}  // namespace cio

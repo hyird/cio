@@ -135,29 +135,39 @@ This is the load balancing that a flat echo benchmark never charges shared-
 nothing for, and it is worth about as much as shared-nothing's advantage is on
 the flat case.
 
-### Churn: cio's real weakness
+### Churn: not measurable here, and the earlier claim is withdrawn
 
-Reconnect every N requests, 256 connections:
+The first pass of this sweep produced cio 325,673 against Go's 428,109 and
+asio-callback's 506,403 at ten requests per connection, and it was written up as
+cio's one real weakness — one acceptor task against asio's per-thread
+`SO_REUSEPORT` acceptors.
 
-| requests per connection | cio | asio-callback | asio-coro | go |
-|---:|---:|---:|---:|---:|
-| never (held open) | 616,628 | 767,292 | 770,281 | 651,801 |
-| 100 | 605,686 | 735,642 | 720,847 | 625,868 |
-| 10 | 325,673 | 506,403 | 322,210 | 428,109 |
-| 1 | 33,020 | 32,977 | 32,769 | 64,615 |
+That was wrong, and the way it was wrong is the point. Re-measuring by
+alternating the servers inside a single run instead of running them in sequence:
 
-At 10 requests per connection cio is 24% behind Go and 36% behind
-asio-callback — and its server CPU is 28.2 core-seconds against asio's 34.7. It
-is leaving 30% of the machine idle, which means accept is the bottleneck, not
-throughput. cio has one acceptor task on one listening socket; asio has a
-`SO_REUSEPORT` acceptor per thread and the kernel spreads new connections across
-them. This is the one place in the matrix where a concrete, architecture-
-preserving fix is indicated: shard the acceptor, which costs cio nothing in load
-balancing.
+```
+churn=10 r1  cio 323,039   go 320,113
+churn=10 r2  cio 452,476   go 434,391
+churn=10 r3  cio 456,013   go 0
+churn=1  r1  cio 0         go 0
+```
 
-(At 1 request per connection everything collapses into kernel connection setup
-and the runtimes stop mattering — except Go, which is 2x everyone else there and
-worth a look on its own.)
+The throughput is bimodal and the later runs collapse to zero. `ss -tan state
+time-wait | wc -l` came back at 37,603: the load generator closes first, so
+every closed connection parks an ephemeral port in TIME_WAIT for 60 s, and at
+~30k connections/sec that exhausts the port space in seconds. The sweep was
+measuring how much of the port space the *previous* server had already consumed.
+Widening `ip_local_port_range` and enabling `tcp_tw_reuse` moved the cliff but
+did not remove it.
+
+So there is no result here, in either direction. Measuring connection churn
+properly needs the client to avoid TIME_WAIT (`SO_LINGER` with a zero timeout,
+so close sends RST) or a second machine. Until then the row is unmeasured, not
+lost.
+
+The observation that prompted it — cio has one acceptor task where asio has one
+per thread — is still true and still worth trying. It just has no measurement
+behind it.
 
 ### Summary
 
@@ -168,7 +178,7 @@ worth a look on its own.)
 | below CPU saturation (<= 4 of 8 cores) | tie | 2-4% |
 | CPU-heavy requests, evenly spread | tie | 2% |
 | uneven load, few connections | **cio / Go** | 19-108% |
-| connection churn | asio, then Go | cio 24-36% behind |
+| connection churn | unmeasured | see above |
 
 ### Where the gap actually is
 

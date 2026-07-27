@@ -242,7 +242,7 @@ tracks Go. But:
 | below CPU saturation (<= 4 of 8 cores) | tie | 2-4% |
 | CPU-heavy requests, evenly spread | tie | 2% |
 | **uneven load, few connections** | **cio / Go** | **19-108%** |
-| connection churn | asio, then Go | cio 24-36% behind |
+| connection churn | unmeasured on this host | — |
 
 asio's advantage is a fixed per-request cost — coherence traffic that cio pays
 for sharing run queues and that shared-nothing does not have — so it vanishes as
@@ -251,9 +251,10 @@ the thread that accepted it: with 32 connections and a quarter of them CPU-heavy
 asio uses 26.5 of its 40 core-seconds while cio uses 38.2, because seven idle
 threads cannot help the busy one. cio is 2.1x faster there.
 
-The churn row is a genuine cio weakness rather than a trade-off: it leaves 30% of
-the machine idle because it has one acceptor task where asio has one per thread.
-Sharding the acceptor would cost nothing in load balancing.
+The churn row was first written up as a cio weakness and then withdrawn: those
+numbers were measuring how much of the ephemeral port space the previous server
+in the sequence had left in TIME_WAIT, not the servers. Measuring it needs a
+client that avoids TIME_WAIT or a second machine.
 
 Two earlier explanations for the flat-echo gap — the wake path, then syscall
 count — were measured and rejected; see

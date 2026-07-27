@@ -97,8 +97,14 @@ public:
     Result<SocketAddr> peer_addr() const;
 
 protected:
-    // Takes ownership of an already non-blocking fd and registers it.
-    Result<void> adopt(int fd);
+    // Takes ownership of `fd` and registers it with the reactor.
+    //
+    // `already_nonblocking` is not an optimisation flag to be guessed at: every
+    // socket this library creates comes from socket()/accept4() with
+    // SOCK_NONBLOCK already set, and re-deriving that with F_GETFL + F_SETFL
+    // costs two syscalls on every single connection. Measured at 0.197 fcntl
+    // per request under connection churn, against zero for Go and asio.
+    Result<void> adopt(int fd, bool already_nonblocking = false);
 
     int fd_ = -1;
     detail::IoDesc* desc_ = nullptr;

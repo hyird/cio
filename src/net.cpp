@@ -167,10 +167,12 @@ Task<Result<std::vector<SocketAddr>>> resolve(std::string host, std::uint16_t po
 
 // ---------------------------------------------------------------- Socket ---
 
-Result<void> Socket::adopt(int fd) {
-    if (auto r = make_nonblocking(fd); !r) {
-        ::close(fd);
-        return r;
+Result<void> Socket::adopt(int fd, bool already_nonblocking) {
+    if (!already_nonblocking) {
+        if (auto r = make_nonblocking(fd); !r) {
+            ::close(fd);
+            return r;
+        }
     }
     detail::Scheduler* sched = detail::current_scheduler();
     if (sched == nullptr) {
@@ -316,7 +318,9 @@ Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr) {
     if (fd < 0) co_return Error::from_errno();
 
     TcpStream stream;
-    if (auto adopted = stream.adopt(fd); !adopted) co_return adopted.error();
+    if (auto adopted = stream.adopt(fd, /*already_nonblocking=*/true); !adopted) {
+                co_return adopted.error();
+            }
 
     if (::connect(stream.fd_, addr.raw(), addr.length()) == 0) co_return std::move(stream);
     if (errno != EINPROGRESS) co_return Error::from_errno();
@@ -418,7 +422,9 @@ Result<TcpListener> TcpListener::bind(SocketAddr addr, int backlog) {
     }
 
     TcpListener listener;
-    if (auto adopted = listener.adopt(fd); !adopted) return adopted.error();
+    if (auto adopted = listener.adopt(fd, /*already_nonblocking=*/true); !adopted) {
+        return adopted.error();
+    }
     return listener;
 }
 
@@ -436,7 +442,9 @@ Task<Result<TcpStream>> TcpListener::accept() {
                 // A success says nothing about whether more are queued, so the
                 // hint stays set and the next accept tries again.
                 TcpStream stream;
-                if (auto adopted = stream.adopt(fd); !adopted) co_return adopted.error();
+                if (auto adopted = stream.adopt(fd, /*already_nonblocking=*/true); !adopted) {
+                co_return adopted.error();
+            }
                 co_return std::move(stream);
             }
             if (errno == EINTR || errno == ECONNABORTED) continue;
@@ -476,7 +484,9 @@ Result<UdpSocket> UdpSocket::bind(SocketAddr addr) {
     }
 
     UdpSocket socket;
-    if (auto adopted = socket.adopt(fd); !adopted) return adopted.error();
+    if (auto adopted = socket.adopt(fd, /*already_nonblocking=*/true); !adopted) {
+        return adopted.error();
+    }
     return socket;
 }
 

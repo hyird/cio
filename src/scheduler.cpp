@@ -108,10 +108,22 @@ void* Worker::find_work() noexcept {
         }
     }
 
-    if (void* stolen = steal_from_peers()) return stolen;
-
-    // Non-blocking reactor drain. Skipped when another worker is already parked
-    // inside the reactor — it will deliver these events.
+    // Non-blocking reactor drain, and it comes *before* stealing.
+    //
+    // In an I/O-bound server essentially every runnable task originates in the
+    // reactor, so a searcher that steals first pays a full scan of every peer —
+    // two cache lines each, on lines those peers are concurrently writing — to
+    // discover what one epoll_wait was about to hand it in bulk. Measured on
+    // the 8-thread echo workload at 256 connections: 3.33M steal attempts
+    // against 701k hits, a 21% hit rate, with one epoll event per request.
+    // Go's findRunnable polls the network before it resorts to stealing for
+    // exactly this reason.
+    //
+    // The claim below is what keeps this from being a syscall per searcher: at
+    // most one worker is inside the reactor at a time, so the others fall
+    // straight through to the steal scan, and the one that polls is the one
+    // publishing the work they are about to steal.
+    //
     // Claim the reactor, do not merely test for it. polling_ says "exactly one
     // thread is inside the reactor", and a load-then-store cannot enforce that:
     // the parked poller sets the flag under idle_mutex_ and this path reads it
@@ -131,6 +143,8 @@ void* Worker::find_work() noexcept {
         if (void* item = next_local()) return item;
         if (void* item = sched.global_.pop()) return item;
     }
+
+    if (void* stolen = steal_from_peers()) return stolen;
 
     if (sched.timers_->next_deadline_ns() <= now_ns() && sched.timers_->run_expired() > 0) {
         if (void* item = next_local()) return item;

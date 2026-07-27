@@ -86,9 +86,15 @@ void TimerService::republish(Shard& shard) noexcept {
 
 void TimerService::arm(Timer* timer) {
     Worker* worker = current_worker();
+    // A timer armed by one of this scheduler's workers maps directly to that
+    // worker's shard; the scheduler constructs exactly one shard per worker.
+    // Avoid a hardware divide on every arm. A socket can exceptionally be
+    // manipulated from a different runtime, so retain shard zero as the safe
+    // foreign-thread fallback.
     const std::uint32_t shard_index =
-        worker != nullptr ? static_cast<std::uint32_t>(worker->index() % shards_.size()) : 0u;
+        worker != nullptr && &worker->scheduler() == &sched_ ? worker->index() : 0u;
     Shard& shard = *shards_[shard_index];
+    timer->preferred_worker = shard_index;
 
     // Arming a node that is already linked into a heap corrupts it: heap_index
     // gets overwritten and the old slot keeps pointing here. Callers must
@@ -106,7 +112,15 @@ void TimerService::arm(Timer* timer) {
     bool now_earliest = false;
     {
         std::lock_guard<std::mutex> lock(shard.mutex);
-        shard.heap.push_back(timer);
+        try {
+            shard.heap.push_back(timer);
+        } catch (...) {
+            // state was published before taking the shard lock so a concurrent
+            // disarm waits for us. Restore an unlinked state before propagating
+            // allocation failure; heap_index is still the sentinel.
+            timer->state.store(Timer::kIdle, std::memory_order_release);
+            throw;
+        }
         timer->heap_index = static_cast<std::uint32_t>(shard.heap.size() - 1);
         sift_up(shard.heap, timer->heap_index);
         now_earliest = shard.heap[0] == timer;
@@ -115,7 +129,7 @@ void TimerService::arm(Timer* timer) {
 
     // Only disturb the parked poller if this timer would fire before it plans
     // to wake up anyway.
-    if (now_earliest) sched_.nudge_poller(deadline_ns);
+    if (now_earliest) sched_.nudge_poller(shard_index, deadline_ns);
 }
 
 bool TimerService::disarm(Timer* timer) {
@@ -186,6 +200,18 @@ std::int64_t TimerService::next_timeout_ns() const noexcept {
     return delta > 0 ? delta : 0;
 }
 
+std::int64_t TimerService::next_deadline_ns(WorkerId worker) const noexcept {
+    if (worker >= shards_.size()) return INT64_MAX;
+    return shards_[worker]->earliest.load(std::memory_order_acquire);
+}
+
+std::int64_t TimerService::next_timeout_ns(WorkerId worker) const noexcept {
+    const std::int64_t deadline = next_deadline_ns(worker);
+    if (deadline == INT64_MAX) return -1;
+    const std::int64_t delta = deadline - now_ns();
+    return delta > 0 ? delta : 0;
+}
+
 bool TimerService::empty() const noexcept { return next_deadline_ns() == INT64_MAX; }
 
 std::size_t TimerService::run_expired_shard(Shard& shard, std::int64_t now) {
@@ -199,6 +225,7 @@ std::size_t TimerService::run_expired_shard(Shard& shard, std::int64_t now) {
         Timer* timer;
         std::coroutine_handle<> waiter;
         Timer::FireFn on_fire;
+        WorkerId preferred_worker;
     };
     Fired ready[kBatch];
     std::size_t total = 0;
@@ -218,7 +245,8 @@ std::size_t TimerService::run_expired_shard(Shard& shard, std::int64_t now) {
                 if (timer->state.compare_exchange_strong(expected, next,
                                                          std::memory_order_acq_rel,
                                                          std::memory_order_relaxed)) {
-                    ready[n++] = Fired{timer, timer->waiter, on_fire};
+                    ready[n++] = Fired{timer, timer->waiter, on_fire,
+                                       timer->preferred_worker};
                 }
                 // Otherwise it was disarmed concurrently and its owner has
                 // already taken responsibility for the waiter.
@@ -230,6 +258,9 @@ std::size_t TimerService::run_expired_shard(Shard& shard, std::int64_t now) {
 
         // Fire outside the lock. A fired timer resumes a task, and that task
         // may arm another timer on this very shard the moment it runs.
+        void* resumable[kBatch];
+        std::uint32_t resumable_count = 0;
+        WorkerId target = kInvalidWorkerId;
         for (std::size_t i = 0; i < n; ++i) {
             const Fired& fired = ready[i];
             std::coroutine_handle<> resume = fired.waiter;
@@ -239,7 +270,13 @@ std::size_t TimerService::run_expired_shard(Shard& shard, std::int64_t now) {
                 // task can possibly resume and destroy the frame holding it.
                 fired.timer->state.store(Timer::kFired, std::memory_order_release);
             }
-            if (resume) sched_.schedule(resume);
+            if (resume) {
+                resumable[resumable_count++] = resume.address();
+                target = fired.preferred_worker;
+            }
+        }
+        if (resumable_count > 0) {
+            sched_.schedule_batch_to(resumable, resumable_count, target);
         }
         total += n;
         if (n < kBatch) break;
@@ -257,6 +294,14 @@ std::size_t TimerService::run_expired() {
         fired += run_expired_shard(*shard, now);
     }
     return fired;
+}
+
+std::size_t TimerService::run_expired(WorkerId worker) {
+    if (worker >= shards_.size()) return 0;
+    const std::int64_t now = now_ns();
+    Shard& shard = *shards_[worker];
+    if (shard.earliest.load(std::memory_order_acquire) > now) return 0;
+    return run_expired_shard(shard, now);
 }
 
 void TimerService::drain_all() {

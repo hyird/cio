@@ -1,16 +1,19 @@
 // Core scheduler and channel microbenchmarks.
 //
-//     ./bench_core [workers]
+//     ./bench_core [workers] [name-filter] [scale]
 //
 // Numbers to compare against, on the same machine, for Go 1.2x:
 //   goroutine spawn+join   ~300-400 ns
 //   unbuffered chan hop    ~250-350 ns
 //   buffered chan op       ~60-90 ns
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "cio/cio.hpp"
@@ -26,9 +29,20 @@ struct Timing {
 };
 
 std::vector<Timing> results;
+std::string_view benchmark_filter;
+double benchmark_scale = 1.0;
+
+long scaled(long count) {
+    return std::max(1L, static_cast<long>(std::llround(
+                            static_cast<double>(count) * benchmark_scale)));
+}
 
 template <typename F>
 void measure(const char* name, long operations, F&& body) {
+    if (!benchmark_filter.empty() &&
+        std::string_view{name}.find(benchmark_filter) == std::string_view::npos) {
+        return;
+    }
     const auto start = cio::Clock::now();
     body();
     const auto elapsed = cio::Clock::now() - start;
@@ -135,6 +149,38 @@ cio::Task<> concurrent_timers(long count) {
     co_await group.wait();
 }
 
+// --- mutex ------------------------------------------------------------------
+
+cio::Task<> mutex_uncontended(long count) {
+    cio::Mutex mutex;
+    for (long i = 0; i < count; ++i) {
+        auto guard = co_await mutex.lock();
+    }
+}
+
+// Force ownership to move between tasks. The yield happens while the guard is
+// held, giving peers a chance to queue before unlock hands the mutex directly
+// to the oldest waiter.
+cio::Task<> mutex_contended(long per_task, int tasks) {
+    cio::Mutex mutex;
+    cio::WaitGroup group;
+    group.add(tasks);
+    long total = 0;
+
+    for (int i = 0; i < tasks; ++i) {
+        cio::go([](cio::Mutex& m, cio::WaitGroup& wg, long& value,
+                   long count) -> cio::Task<> {
+            for (long k = 0; k < count; ++k) {
+                auto guard = co_await m.lock();
+                ++value;
+                co_await cio::yield();
+            }
+            wg.done();
+        }(mutex, group, total, per_task));
+    }
+    co_await group.wait();
+}
+
 // --- select -----------------------------------------------------------------
 
 cio::Task<> select_loop(long rounds) {
@@ -180,16 +226,26 @@ cio::Task<long> await_children(long count) {
 int main(int argc, char** argv) {
     cio::RuntimeOptions options;
     if (argc > 1) options.worker_threads = static_cast<std::size_t>(std::atoi(argv[1]));
+    if (argc > 2) benchmark_filter = argv[2];
+    if (argc > 3) {
+        benchmark_scale = std::strtod(argv[3], nullptr);
+        if (!std::isfinite(benchmark_scale) || benchmark_scale <= 0.0) {
+            std::fprintf(stderr, "scale must be a finite number greater than zero\n");
+            return 2;
+        }
+    }
 
     cio::Runtime runtime(options);
-    std::printf("cio benchmarks — %zu workers\n\n", runtime.worker_count());
+    std::printf("cio benchmarks — %zu workers, scale %.3g\n\n",
+                runtime.worker_count(), benchmark_scale);
 
-    constexpr long kSpawns = 1'000'000;
-    constexpr long kHops = 200'000;
-    constexpr long kYields = 2'000'000;
-    constexpr long kTimers = 200'000;
-    constexpr long kAwaits = 5'000'000;
-    constexpr long kThroughput = 500'000;
+    const long kSpawns = scaled(1'000'000);
+    const long kHops = scaled(200'000);
+    const long kYields = scaled(2'000'000);
+    const long kTimers = scaled(200'000);
+    const long kAwaits = scaled(5'000'000);
+    const long kThroughput = ((scaled(500'000) + 7) / 8) * 8;
+    const long kMutexOps = scaled(1'000'000);
 
     {
         cio::WaitGroup group;
@@ -207,6 +263,10 @@ int main(int argc, char** argv) {
             [&] { runtime.block_on(expired_sleep_loop(kYields / 4)); });
     measure("timer arm+fire (concurrent)", kTimers,
             [&] { runtime.block_on(concurrent_timers(kTimers)); });
+    measure("mutex uncontended", kMutexOps,
+            [&] { runtime.block_on(mutex_uncontended(kMutexOps)); });
+    measure("mutex contended, 8 tasks", kMutexOps / 5,
+            [&] { runtime.block_on(mutex_contended(kMutexOps / 40, 8)); });
 
     measure("select, a case ready", kHops,
             [&] { runtime.block_on(select_loop(kHops)); });
@@ -221,6 +281,10 @@ int main(int argc, char** argv) {
 
     measure("chan 1p1c throughput", kThroughput,
             [&] { runtime.block_on(chan_throughput(kThroughput, 1, 1)); });
+    measure("chan 8p1c throughput", kThroughput,
+            [&] { runtime.block_on(chan_throughput(kThroughput / 8, 8, 1)); });
+    measure("chan 1p8c throughput", kThroughput,
+            [&] { runtime.block_on(chan_throughput(kThroughput, 1, 8)); });
     measure("chan 8p8c throughput", kThroughput,
             [&] { runtime.block_on(chan_throughput(kThroughput / 8, 8, 8)); });
 
@@ -229,6 +293,17 @@ int main(int argc, char** argv) {
                 "----------------");
     for (const auto& r : results) {
         std::printf("%-30s %14.1f %16.0f\n", r.name, r.ns_per_op, r.ops_per_sec);
+    }
+    const auto metrics = cio::runtime_metrics();
+    if (metrics.tasks_run != 0) {
+        std::printf("\nmetrics: tasks=%llu parks=%llu cv_waits=%llu wake_single=%llu "
+                    "steals=%llu/%llu\n",
+                    static_cast<unsigned long long>(metrics.tasks_run),
+                    static_cast<unsigned long long>(metrics.parks),
+                    static_cast<unsigned long long>(metrics.park_cv_waits),
+                    static_cast<unsigned long long>(metrics.wake_single),
+                    static_cast<unsigned long long>(metrics.steal_hits),
+                    static_cast<unsigned long long>(metrics.steal_attempts));
     }
     return 0;
 }

@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 
@@ -31,6 +32,154 @@ Result<void> make_nonblocking(int fd) {
 
 detail::Reactor& reactor_for(detail::IoDesc* desc) {
     return *desc->owner;
+}
+
+class SwitchWorker {
+public:
+    SwitchWorker(detail::Scheduler& sched, detail::WorkerId target) noexcept
+        : sched_(sched), target_(target) {}
+
+    bool await_ready() const noexcept {
+        return sched_.current_worker_id() == target_;
+    }
+    void await_suspend(std::coroutine_handle<> handle) const noexcept {
+        sched_.schedule_to(handle, target_);
+    }
+    void await_resume() const noexcept {}
+
+private:
+    detail::Scheduler& sched_;
+    detail::WorkerId target_;
+};
+
+class AcceptedFd {
+public:
+    explicit AcceptedFd(int fd) noexcept : fd_(fd) {}
+    ~AcceptedFd() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+    AcceptedFd(const AcceptedFd&) = delete;
+    AcceptedFd& operator=(const AcceptedFd&) = delete;
+
+    int get() const noexcept { return fd_; }
+    int release() noexcept { return std::exchange(fd_, -1); }
+
+private:
+    int fd_;
+};
+
+struct IoOperation {
+    detail::IoDesc* desc = nullptr;
+    std::uint32_t generation = 0;
+    Error error{EBADF};
+
+    explicit operator bool() const noexcept { return !error; }
+};
+
+// Capture one Socket incarnation without changing its public layout. close()
+// updates the two fields atomically while holding this descriptor's lifecycle
+// lock, so a task either gets the old incarnation token or observes closure;
+// it can never assemble a token from a recycled IoDesc.
+IoOperation capture_operation(int& socket_fd,
+                              detail::IoDesc*& socket_desc) noexcept {
+    std::atomic_ref<detail::IoDesc*> desc_field(socket_desc);
+    detail::IoDesc* const desc =
+        desc_field.load(std::memory_order_acquire);
+    if (desc == nullptr) return {};
+
+    std::atomic_ref<int> fd_field(socket_fd);
+    IoOperation operation;
+    operation.desc = desc;
+
+    desc->lock_lifecycle();
+    if (desc_field.load(std::memory_order_relaxed) != desc ||
+        fd_field.load(std::memory_order_relaxed) != desc->fd ||
+        desc->closing.load(std::memory_order_acquire)) {
+        operation.error = Error{Errc::closed};
+    } else if (desc->runtime_stopping()) {
+        operation.error = Error{Errc::shutdown};
+    } else {
+        operation.generation =
+            desc->generation.load(std::memory_order_relaxed);
+        operation.error = Error{};
+    }
+    desc->unlock_lifecycle();
+    return operation;
+}
+
+Task<Result<std::size_t>> tcp_read_some(
+    detail::IoDesc* desc, std::uint32_t generation,
+    std::span<std::byte> buffer) {
+    for (;;) {
+        // Skip the syscall when the last one proved the queue empty and no edge
+        // has arrived since. This is what removes the EAGAIN read that
+        // edge-triggered polling would otherwise cost on every message.
+        if (desc->may_be_ready(detail::Dir::kRead)) {
+            detail::FdUseGuard fd_use{
+                desc, detail::Dir::kRead, generation};
+            if (!fd_use) co_return fd_use.error();
+
+            const ssize_t n =
+                ::recv(fd_use.fd(), buffer.data(), buffer.size(), 0);
+            const int syscall_error = n < 0 ? errno : 0;
+            if (n >= 0) {
+                // Short read: the receive queue is empty, so the next recv
+                // would EAGAIN until a new edge arrives.
+                if (static_cast<std::size_t>(n) < buffer.size()) {
+                    desc->note_would_block(detail::Dir::kRead);
+                }
+                co_return static_cast<std::size_t>(n);
+            }
+            if (syscall_error == EINTR) continue;
+            if (syscall_error != EAGAIN &&
+                syscall_error != EWOULDBLOCK) {
+                co_return Error{syscall_error};
+            }
+            desc->note_would_block(detail::Dir::kRead);
+        }
+
+        if (auto ready = co_await detail::IoAwaiter{
+                desc, detail::Dir::kRead, generation};
+            !ready) {
+            co_return ready.error();
+        }
+    }
+}
+
+Task<Result<std::size_t>> tcp_write_some(
+    detail::IoDesc* desc, std::uint32_t generation,
+    std::span<const std::byte> buffer) {
+    for (;;) {
+        if (desc->may_be_ready(detail::Dir::kWrite)) {
+            detail::FdUseGuard fd_use{
+                desc, detail::Dir::kWrite, generation};
+            if (!fd_use) co_return fd_use.error();
+
+            const ssize_t n =
+                ::send(fd_use.fd(), buffer.data(), buffer.size(),
+                       MSG_NOSIGNAL);
+            const int syscall_error = n < 0 ? errno : 0;
+            if (n >= 0) {
+                // A partial write means the send buffer filled up.
+                if (static_cast<std::size_t>(n) < buffer.size()) {
+                    desc->note_would_block(detail::Dir::kWrite);
+                }
+                co_return static_cast<std::size_t>(n);
+            }
+            if (syscall_error == EINTR) continue;
+            if (syscall_error != EAGAIN &&
+                syscall_error != EWOULDBLOCK) {
+                co_return Error{syscall_error};
+            }
+            desc->note_would_block(detail::Dir::kWrite);
+        }
+
+        if (auto ready = co_await detail::IoAwaiter{
+                desc, detail::Dir::kWrite, generation};
+            !ready) {
+            co_return ready.error();
+        }
+    }
 }
 
 }  // namespace
@@ -184,22 +333,49 @@ Result<void> Socket::adopt(int fd, bool already_nonblocking) {
         ::close(fd);
         return desc.error();
     }
+    // Publish the lifetime before the raw descriptor becomes observable.
+    // Runtime-managed schedulers always have a shared handle; a detail-level
+    // stack Scheduler remains supported for white-box tests whose own scope
+    // already bounds every descriptor.
+    scheduler_lifetime_ = sched->shared_handle();
     fd_ = fd;
     desc_ = *desc;
     return ok();
 }
 
 void Socket::close() {
-    if (desc_ != nullptr) {
-        // Order matters: detach unregisters and wakes parked tasks with
-        // Errc::closed *before* the fd number can be reused by another socket.
-        reactor_for(desc_).detach(desc_);
-        desc_ = nullptr;
+    std::atomic_ref<detail::IoDesc*> desc_field(desc_);
+    detail::IoDesc* const desc =
+        desc_field.load(std::memory_order_acquire);
+
+    if (desc == nullptr) {
+        // The normal invalid/moved-from case. A descriptor-owning close clears
+        // fd_ before desc_, so a concurrent second close also sees -1 here.
+        std::atomic_ref<int> fd_field(fd_);
+        const int fd =
+            fd_field.exchange(-1, std::memory_order_acq_rel);
+        if (fd >= 0) ::close(fd);
+        return;
     }
-    if (fd_ >= 0) {
-        ::close(fd_);
-        fd_ = -1;
+
+    int fd = -1;
+    bool owns_close = false;
+    desc->lock_lifecycle();
+    if (desc_field.load(std::memory_order_relaxed) == desc) {
+        std::atomic_ref<int> fd_field(fd_);
+        fd = fd_field.exchange(-1, std::memory_order_acq_rel);
+        desc_field.store(nullptr, std::memory_order_release);
+        desc->closing.store(true, std::memory_order_release);
+        owns_close = true;
     }
+    desc->unlock_lifecycle();
+
+    if (!owns_close) return;
+
+    // Order matters: detach unregisters, wakes parked tasks, and waits for all
+    // active syscall leases before this fd number can be reused.
+    reactor_for(desc).detach(desc);
+    if (fd >= 0) ::close(fd);
 }
 
 Result<SocketAddr> Socket::local_addr() const {
@@ -228,86 +404,77 @@ Result<SocketAddr> Socket::peer_addr() const {
 // an attempt — but they keep the readiness hint coherent so that mixing them
 // with the awaiting forms does not confuse it.
 Result<std::size_t> TcpStream::try_read(std::span<std::byte> buffer) {
-    if (fd_ < 0 || desc_ == nullptr) return Error{EBADF};
-    const ssize_t n = ::recv(fd_, buffer.data(), buffer.size(), 0);
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return operation.error;
+
+    detail::FdUseGuard fd_use{
+        operation.desc, detail::Dir::kRead, operation.generation};
+    if (!fd_use) return fd_use.error();
+
+    const ssize_t n =
+        ::recv(fd_use.fd(), buffer.data(), buffer.size(), 0);
+    const int syscall_error = n < 0 ? errno : 0;
     if (n >= 0) {
         if (static_cast<std::size_t>(n) < buffer.size()) {
-            desc_->note_would_block(detail::Dir::kRead);
+            operation.desc->note_would_block(detail::Dir::kRead);
         }
         return static_cast<std::size_t>(n);
     }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) desc_->note_would_block(detail::Dir::kRead);
-    return Error::from_errno();
+    if (syscall_error == EAGAIN || syscall_error == EWOULDBLOCK) {
+        operation.desc->note_would_block(detail::Dir::kRead);
+    }
+    return Error{syscall_error};
 }
 
 Result<std::size_t> TcpStream::try_write(std::span<const std::byte> buffer) {
-    if (fd_ < 0 || desc_ == nullptr) return Error{EBADF};
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return operation.error;
+
+    detail::FdUseGuard fd_use{
+        operation.desc, detail::Dir::kWrite, operation.generation};
+    if (!fd_use) return fd_use.error();
+
     // MSG_NOSIGNAL: a write to a closed peer must be an EPIPE return, not a
     // process-wide SIGPIPE.
-    const ssize_t n = ::send(fd_, buffer.data(), buffer.size(), MSG_NOSIGNAL);
+    const ssize_t n =
+        ::send(fd_use.fd(), buffer.data(), buffer.size(), MSG_NOSIGNAL);
+    const int syscall_error = n < 0 ? errno : 0;
     if (n >= 0) {
         if (static_cast<std::size_t>(n) < buffer.size()) {
-            desc_->note_would_block(detail::Dir::kWrite);
+            operation.desc->note_would_block(detail::Dir::kWrite);
         }
         return static_cast<std::size_t>(n);
     }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) desc_->note_would_block(detail::Dir::kWrite);
-    return Error::from_errno();
+    if (syscall_error == EAGAIN || syscall_error == EWOULDBLOCK) {
+        operation.desc->note_would_block(detail::Dir::kWrite);
+    }
+    return Error{syscall_error};
 }
 
 Task<Result<std::size_t>> TcpStream::read(std::span<std::byte> buffer) {
-    if (fd_ < 0 || desc_ == nullptr) co_return Error{EBADF};
-    for (;;) {
-        // Skip the syscall when the last one proved the queue empty and no edge
-        // has arrived since. This is what removes the EAGAIN read that
-        // edge-triggered polling would otherwise cost on every message.
-        if (desc_->may_be_ready(detail::Dir::kRead)) {
-            const ssize_t n = ::recv(fd_, buffer.data(), buffer.size(), 0);
-            if (n >= 0) {
-                // Short read: the receive queue is empty, so the next recv
-                // would EAGAIN until a new edge arrives.
-                if (static_cast<std::size_t>(n) < buffer.size()) {
-                    desc_->note_would_block(detail::Dir::kRead);
-                }
-                co_return static_cast<std::size_t>(n);
-            }
-            if (errno == EINTR) continue;
-            if (errno != EAGAIN && errno != EWOULDBLOCK) co_return Error::from_errno();
-            desc_->note_would_block(detail::Dir::kRead);
-        }
-
-        if (auto ready = co_await detail::IoAwaiter{desc_, detail::Dir::kRead}; !ready) {
-            co_return ready.error();
-        }
-    }
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) co_return operation.error;
+    co_return co_await tcp_read_some(
+        operation.desc, operation.generation, buffer);
 }
 
 Task<Result<std::size_t>> TcpStream::write(std::span<const std::byte> buffer) {
-    if (fd_ < 0 || desc_ == nullptr) co_return Error{EBADF};
-    for (;;) {
-        if (desc_->may_be_ready(detail::Dir::kWrite)) {
-            const ssize_t n = ::send(fd_, buffer.data(), buffer.size(), MSG_NOSIGNAL);
-            if (n >= 0) {
-                // A partial write means the send buffer filled up.
-                if (static_cast<std::size_t>(n) < buffer.size()) {
-                    desc_->note_would_block(detail::Dir::kWrite);
-                }
-                co_return static_cast<std::size_t>(n);
-            }
-            if (errno == EINTR) continue;
-            if (errno != EAGAIN && errno != EWOULDBLOCK) co_return Error::from_errno();
-            desc_->note_would_block(detail::Dir::kWrite);
-        }
-
-        if (auto ready = co_await detail::IoAwaiter{desc_, detail::Dir::kWrite}; !ready) {
-            co_return ready.error();
-        }
-    }
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) co_return operation.error;
+    co_return co_await tcp_write_some(
+        operation.desc, operation.generation, buffer);
 }
 
 Task<Result<void>> TcpStream::write_all(std::span<const std::byte> buffer) {
+    // One immutable descriptor incarnation for the whole logical operation:
+    // close() may update the Socket fields while this coroutine is parked, so
+    // a partial write must not re-read them on its next chunk.
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) co_return operation.error;
+
     while (!buffer.empty()) {
-        auto written = co_await write(buffer);
+        auto written = co_await tcp_write_some(
+            operation.desc, operation.generation, buffer);
         if (!written) co_return written.error();
         if (*written == 0) co_return Error{Errc::closed};
         buffer = buffer.subspan(*written);
@@ -321,28 +488,65 @@ Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr) {
     const int fd = ::socket(addr.family(), SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) co_return Error::from_errno();
 
+    // Start the state machine before registering EPOLLOUT. A never-connected
+    // TCP fd is itself reported writable by epoll; registering it first can
+    // leave a stale kIoReady that makes an ensuing EINPROGRESS look complete
+    // while SO_ERROR is still zero.
+    AcceptedFd pending(fd);
+    const int connect_result =
+        ::connect(pending.get(), addr.raw(), addr.length());
+    const int connect_error = connect_result == 0 ? 0 : errno;
+    if (connect_result != 0 && connect_error != EINPROGRESS) {
+        co_return Error{connect_error};
+    }
+
     TcpStream stream;
-    if (auto adopted = stream.adopt(fd, /*already_nonblocking=*/true); !adopted) {
+    if (auto adopted =
+            stream.adopt(pending.release(), /*already_nonblocking=*/true);
+        !adopted) {
         co_return adopted.error();
     }
 
-    if (::connect(stream.fd_, addr.raw(), addr.length()) == 0) co_return std::move(stream);
-    if (errno != EINPROGRESS) co_return Error::from_errno();
+    if (connect_result == 0) co_return std::move(stream);
+
+    const std::uint32_t generation =
+        stream.desc_->generation.load(std::memory_order_acquire);
 
     // A non-blocking connect reports completion as writability; the actual
-    // outcome then has to be read back out of SO_ERROR.
-    if (auto ready = co_await detail::IoAwaiter{stream.desc_, detail::Dir::kWrite}; !ready) {
-        co_return ready.error();
-    }
+    // outcome has to be read back out of SO_ERROR. Readiness is only a hint:
+    // SO_ERROR may transiently be zero while the connection is still
+    // EINPROGRESS, so getpeername confirms that a peer was actually installed.
+    for (;;) {
+        if (auto ready = co_await detail::IoAwaiter{
+                stream.desc_, detail::Dir::kWrite, generation};
+            !ready) {
+            co_return ready.error();
+        }
 
-    int error = 0;
-    socklen_t length = sizeof(error);
-    if (::getsockopt(stream.fd_, SOL_SOCKET, SO_ERROR, &error, &length) != 0) {
-        co_return Error::from_errno();
-    }
-    if (error != 0) co_return Error{error};
+        int error = 0;
+        socklen_t error_length = sizeof(error);
+        if (::getsockopt(stream.fd_, SOL_SOCKET, SO_ERROR, &error,
+                         &error_length) != 0) {
+            co_return Error::from_errno();
+        }
+        if (error != 0) co_return Error{error};
 
-    co_return std::move(stream);
+        sockaddr_storage peer{};
+        socklen_t peer_length = sizeof(peer);
+        if (::getpeername(stream.fd_,
+                          reinterpret_cast<sockaddr*>(&peer),
+                          &peer_length) == 0) {
+            co_return std::move(stream);
+        }
+
+        const int peer_error = errno;
+        if (peer_error != ENOTCONN) co_return Error{peer_error};
+
+        // The edge was spurious or predated actual completion. The slot was
+        // consumed by the awaiter above; park again for the transition that
+        // installs either a peer or a concrete SO_ERROR.
+        stream.desc_->note_would_block(detail::Dir::kWrite);
+    }
 }
 
 Task<Result<TcpStream>> TcpStream::connect(std::string host, std::uint16_t port) {
@@ -361,39 +565,51 @@ Task<Result<TcpStream>> TcpStream::connect(std::string host, std::uint16_t port)
 }
 
 void TcpStream::set_read_deadline(TimePoint deadline) {
-    if (desc_ == nullptr) return;
-    reactor_for(desc_).set_deadline(
-        desc_, detail::Dir::kRead,
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return;
+    reactor_for(operation.desc).set_deadline(
+        operation.desc, detail::Dir::kRead, operation.generation,
         std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
             .count());
 }
 
 void TcpStream::set_write_deadline(TimePoint deadline) {
-    if (desc_ == nullptr) return;
-    reactor_for(desc_).set_deadline(
-        desc_, detail::Dir::kWrite,
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return;
+    reactor_for(operation.desc).set_deadline(
+        operation.desc, detail::Dir::kWrite, operation.generation,
         std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
             .count());
 }
 
 void TcpStream::set_read_timeout(Duration timeout) {
-    if (desc_ == nullptr) return;
-    reactor_for(desc_).set_deadline(desc_, detail::Dir::kRead, deadline_from_now(timeout));
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return;
+    reactor_for(operation.desc).set_deadline(
+        operation.desc, detail::Dir::kRead, operation.generation,
+        deadline_from_now(timeout));
 }
 
 void TcpStream::set_write_timeout(Duration timeout) {
-    if (desc_ == nullptr) return;
-    reactor_for(desc_).set_deadline(desc_, detail::Dir::kWrite, deadline_from_now(timeout));
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return;
+    reactor_for(operation.desc).set_deadline(
+        operation.desc, detail::Dir::kWrite, operation.generation,
+        deadline_from_now(timeout));
 }
 
 void TcpStream::clear_read_deadline() {
-    if (desc_ == nullptr) return;
-    reactor_for(desc_).set_deadline(desc_, detail::Dir::kRead, 0);
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return;
+    reactor_for(operation.desc).set_deadline(
+        operation.desc, detail::Dir::kRead, operation.generation, 0);
 }
 
 void TcpStream::clear_write_deadline() {
-    if (desc_ == nullptr) return;
-    reactor_for(desc_).set_deadline(desc_, detail::Dir::kWrite, 0);
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return;
+    reactor_for(operation.desc).set_deadline(
+        operation.desc, detail::Dir::kWrite, operation.generation, 0);
 }
 
 Result<void> TcpStream::set_nodelay(bool on) {
@@ -445,41 +661,86 @@ Result<TcpListener> TcpListener::bind(std::string_view host, std::uint16_t port,
 }
 
 Task<Result<TcpStream>> TcpListener::accept() {
-    if (fd_ < 0 || desc_ == nullptr) co_return Error{EBADF};
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) co_return operation.error;
+
     for (;;) {
-        if (desc_->may_be_ready(detail::Dir::kRead)) {
-            const int fd = ::accept4(fd_, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
-            if (fd >= 0) {
+        if (operation.desc->may_be_ready(detail::Dir::kRead)) {
+            int accepted_fd = -1;
+            {
+                detail::FdUseGuard fd_use{
+                    operation.desc, detail::Dir::kRead,
+                    operation.generation};
+                if (!fd_use) co_return fd_use.error();
+
+                accepted_fd =
+                    ::accept4(fd_use.fd(), nullptr, nullptr,
+                              SOCK_CLOEXEC | SOCK_NONBLOCK);
+                const int syscall_error =
+                    accepted_fd < 0 ? errno : 0;
+                if (accepted_fd < 0) {
+                    if (syscall_error == EINTR ||
+                        syscall_error == ECONNABORTED) {
+                        continue;
+                    }
+                    if (syscall_error != EAGAIN &&
+                        syscall_error != EWOULDBLOCK) {
+                        co_return Error{syscall_error};
+                    }
+                    operation.desc->note_would_block(
+                        detail::Dir::kRead);
+                }
+            }
+
+            if (accepted_fd >= 0) {
                 // A success says nothing about whether more are queued, so the
                 // hint stays set and the next accept tries again.
+                //
+                // Route the accepted fd before registering it. Symmetric
+                // transfer at this Task's final suspend means the caller of
+                // accept() also continues on the selected worker, so the
+                // conventional immediate go(serve(stream)) remains local.
+                AcceptedFd accepted(accepted_fd);
+                detail::Scheduler* const sched = detail::current_scheduler();
+                if (sched == nullptr) co_return Error{Errc::shutdown};
+                const detail::WorkerId target = sched->choose_worker();
+                co_await SwitchWorker{*sched, target};
+
                 TcpStream stream;
-                if (auto adopted = stream.adopt(fd, /*already_nonblocking=*/true); !adopted) {
+                if (auto adopted =
+                        stream.adopt(accepted.release(),
+                                     /*already_nonblocking=*/true);
+                    !adopted) {
                     co_return adopted.error();
                 }
                 co_return std::move(stream);
             }
-            if (errno == EINTR || errno == ECONNABORTED) continue;
-            if (errno != EAGAIN && errno != EWOULDBLOCK) co_return Error::from_errno();
-            desc_->note_would_block(detail::Dir::kRead);
         }
 
-        if (auto ready = co_await detail::IoAwaiter{desc_, detail::Dir::kRead}; !ready) {
+        if (auto ready =
+                co_await detail::IoAwaiter{
+                    operation.desc, detail::Dir::kRead,
+                    operation.generation};
+            !ready) {
             co_return ready.error();
         }
     }
 }
 
 void TcpListener::set_deadline(TimePoint deadline) {
-    if (desc_ == nullptr) return;
-    reactor_for(desc_).set_deadline(
-        desc_, detail::Dir::kRead,
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return;
+    reactor_for(operation.desc).set_deadline(
+        operation.desc, detail::Dir::kRead, operation.generation,
         std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
             .count());
 }
 
 void TcpListener::clear_deadline() {
-    if (desc_ == nullptr) return;
-    reactor_for(desc_).set_deadline(desc_, detail::Dir::kRead, 0);
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return;
+    reactor_for(operation.desc).set_deadline(
+        operation.desc, detail::Dir::kRead, operation.generation, 0);
 }
 
 // ------------------------------------------------------------- UdpSocket ---
@@ -504,23 +765,41 @@ Result<UdpSocket> UdpSocket::bind(SocketAddr addr) {
 }
 
 Task<Result<std::size_t>> UdpSocket::recv_from(std::span<std::byte> buffer, SocketAddr& from) {
-    if (fd_ < 0 || desc_ == nullptr) co_return Error{EBADF};
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) co_return operation.error;
+
     for (;;) {
         sockaddr_storage storage{};
         socklen_t length = sizeof(storage);
-        const ssize_t n = ::recvfrom(fd_, buffer.data(), buffer.size(), 0,
-                                     reinterpret_cast<sockaddr*>(&storage), &length);
-        if (n >= 0) {
-            from = SocketAddr::from_raw(&storage, length);
-            co_return static_cast<std::size_t>(n);
-        }
-        if (errno == EINTR) continue;
-        if (errno != EAGAIN && errno != EWOULDBLOCK) co_return Error::from_errno();
-        // Unlike a stream, a short datagram says nothing about whether more are
-        // queued, so only EAGAIN can clear the hint here.
-        desc_->note_would_block(detail::Dir::kRead);
+        {
+            detail::FdUseGuard fd_use{
+                operation.desc, detail::Dir::kRead,
+                operation.generation};
+            if (!fd_use) co_return fd_use.error();
 
-        if (auto ready = co_await detail::IoAwaiter{desc_, detail::Dir::kRead}; !ready) {
+            const ssize_t n =
+                ::recvfrom(fd_use.fd(), buffer.data(), buffer.size(), 0,
+                           reinterpret_cast<sockaddr*>(&storage), &length);
+            const int syscall_error = n < 0 ? errno : 0;
+            if (n >= 0) {
+                from = SocketAddr::from_raw(&storage, length);
+                co_return static_cast<std::size_t>(n);
+            }
+            if (syscall_error == EINTR) continue;
+            if (syscall_error != EAGAIN &&
+                syscall_error != EWOULDBLOCK) {
+                co_return Error{syscall_error};
+            }
+            // Unlike a stream, a short datagram says nothing about whether
+            // more are queued, so only EAGAIN can clear the hint here.
+            operation.desc->note_would_block(detail::Dir::kRead);
+        }
+
+        if (auto ready =
+                co_await detail::IoAwaiter{
+                    operation.desc, detail::Dir::kRead,
+                    operation.generation};
+            !ready) {
             co_return ready.error();
         }
     }
@@ -528,33 +807,53 @@ Task<Result<std::size_t>> UdpSocket::recv_from(std::span<std::byte> buffer, Sock
 
 Task<Result<std::size_t>> UdpSocket::send_to(std::span<const std::byte> buffer,
                                              const SocketAddr& to) {
-    if (fd_ < 0 || desc_ == nullptr) co_return Error{EBADF};
-    for (;;) {
-        const ssize_t n = ::sendto(fd_, buffer.data(), buffer.size(), MSG_NOSIGNAL, to.raw(),
-                                   to.length());
-        if (n >= 0) co_return static_cast<std::size_t>(n);
-        if (errno == EINTR) continue;
-        if (errno != EAGAIN && errno != EWOULDBLOCK) co_return Error::from_errno();
-        desc_->note_would_block(detail::Dir::kWrite);
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) co_return operation.error;
 
-        if (auto ready = co_await detail::IoAwaiter{desc_, detail::Dir::kWrite}; !ready) {
+    for (;;) {
+        {
+            detail::FdUseGuard fd_use{
+                operation.desc, detail::Dir::kWrite,
+                operation.generation};
+            if (!fd_use) co_return fd_use.error();
+
+            const ssize_t n =
+                ::sendto(fd_use.fd(), buffer.data(), buffer.size(),
+                         MSG_NOSIGNAL, to.raw(), to.length());
+            const int syscall_error = n < 0 ? errno : 0;
+            if (n >= 0) co_return static_cast<std::size_t>(n);
+            if (syscall_error == EINTR) continue;
+            if (syscall_error != EAGAIN &&
+                syscall_error != EWOULDBLOCK) {
+                co_return Error{syscall_error};
+            }
+            operation.desc->note_would_block(detail::Dir::kWrite);
+        }
+
+        if (auto ready =
+                co_await detail::IoAwaiter{
+                    operation.desc, detail::Dir::kWrite,
+                    operation.generation};
+            !ready) {
             co_return ready.error();
         }
     }
 }
 
 void UdpSocket::set_read_deadline(TimePoint deadline) {
-    if (desc_ == nullptr) return;
-    reactor_for(desc_).set_deadline(
-        desc_, detail::Dir::kRead,
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return;
+    reactor_for(operation.desc).set_deadline(
+        operation.desc, detail::Dir::kRead, operation.generation,
         std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
             .count());
 }
 
 void UdpSocket::set_write_deadline(TimePoint deadline) {
-    if (desc_ == nullptr) return;
-    reactor_for(desc_).set_deadline(
-        desc_, detail::Dir::kWrite,
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return;
+    reactor_for(operation.desc).set_deadline(
+        operation.desc, detail::Dir::kWrite, operation.generation,
         std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
             .count());
 }

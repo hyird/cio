@@ -1,9 +1,8 @@
 // cio echo server — one task per connection.
 //
-// Unlike the asio server next to it, this is not shared-nothing: cio is a
-// work-stealing M:N scheduler with one shared reactor, the same architecture Go
-// uses. There is a single acceptor and connections land on whichever worker has
-// capacity. That is the design being measured.
+// cio uses a work-stealing M:N scheduler with one epoll/eventfd shard per
+// worker. There is one public acceptor; accepted descriptors are distributed
+// across private worker shards and published FIFO backlog remains stealable.
 //
 //     ./cio_echo <port> <workers>
 #include <chrono>

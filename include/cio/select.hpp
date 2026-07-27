@@ -178,7 +178,11 @@ template <typename Case>
 void init_waiter(Case& c, SelectShared& shared, std::uint32_t index,
                  std::coroutine_handle<> h) {
     c.waiter.handle = h;
-    c.waiter.sched = current_scheduler();
+    Scheduler* const scheduler = current_scheduler();
+    c.waiter.sched =
+        scheduler == nullptr
+            ? SchedulerTarget{}
+            : scheduler->completion_target();
     c.waiter.select_winner = &shared.winner;
     c.waiter.select_phase = &shared.phase;
     c.waiter.case_index = index;
@@ -206,7 +210,10 @@ inline void case_enqueue(DefaultCase&, SelectShared&, std::uint32_t,
                          std::coroutine_handle<>) noexcept {}
 
 template <typename T>
-void case_retract(RecvCase<T>& c) {
+void case_retract(RecvCase<T>& c, bool won) {
+    // The winning waiter was already popped while the channel lock was held.
+    // Re-locking that channel can only discover queued == false.
+    if (won) return;
     ChannelBase* channel = c.chan.native();
     if (channel == nullptr) return;
     // Taking the lock is what makes this safe: any waker that popped our node
@@ -215,20 +222,21 @@ void case_retract(RecvCase<T>& c) {
     channel->receivers.remove(&c.waiter);
 }
 template <typename T>
-void case_retract(SendCase<T>& c) {
+void case_retract(SendCase<T>& c, bool won) {
+    if (won) return;
     ChannelBase* channel = c.chan.native();
     if (channel == nullptr) return;
     std::lock_guard<std::mutex> lock(channel->mutex);
     channel->senders.remove(&c.waiter);
 }
-inline void case_retract(TimeoutCase& c) {
+inline void case_retract(TimeoutCase& c, bool /*won*/) {
     if (!c.armed) return;
     c.armed = false;
     // disarm() does not return until a firing callback has stopped touching the
     // node, so it is safe to destroy this frame afterwards.
     current_scheduler()->timers().disarm(&c.timer);
 }
-inline void case_retract(DefaultCase&) noexcept {}
+inline void case_retract(DefaultCase&, bool /*won*/) noexcept {}
 
 inline std::coroutine_handle<> select_timeout_fired(Timer* timer) noexcept {
     auto* self = static_cast<SelectTimer*>(timer);
@@ -397,7 +405,11 @@ private:
 
     std::size_t finish() {
         if (enqueued_) {
-            for_each_case([](auto& c, std::size_t) { detail::case_retract(c); });
+            const std::size_t winner =
+                shared_.winner.load(std::memory_order_acquire);
+            for_each_case([winner](auto& c, std::size_t i) {
+                detail::case_retract(c, i == winner);
+            });
             enqueued_ = false;
         }
         return shared_.winner.load(std::memory_order_acquire);

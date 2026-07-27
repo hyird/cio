@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -74,12 +75,16 @@ public:
     ~Socket() { close(); }
 
     Socket(Socket&& other) noexcept
-        : fd_(std::exchange(other.fd_, -1)), desc_(std::exchange(other.desc_, nullptr)) {}
+        : fd_(std::exchange(other.fd_, -1)),
+          desc_(std::exchange(other.desc_, nullptr)),
+          scheduler_lifetime_(std::move(other.scheduler_lifetime_)) {}
     Socket& operator=(Socket&& other) noexcept {
         if (this != &other) {
             close();
             fd_ = std::exchange(other.fd_, -1);
             desc_ = std::exchange(other.desc_, nullptr);
+            scheduler_lifetime_ =
+                std::move(other.scheduler_lifetime_);
         }
         return *this;
     }
@@ -108,6 +113,12 @@ protected:
 
     int fd_ = -1;
     detail::IoDesc* desc_ = nullptr;
+    // A Socket may escape cio::run(). Keep its stopped scheduler/reactor slab
+    // alive through close() and until this handle is destroyed or replaced.
+    // An outstanding IoAwaiter independently retains the same lifetime. This
+    // is deliberately not stored in IoDesc, which would create Scheduler ->
+    // Reactor -> IoDesc -> Scheduler ownership cycles.
+    std::shared_ptr<detail::Scheduler> scheduler_lifetime_;
 };
 
 class TcpStream : public Socket {

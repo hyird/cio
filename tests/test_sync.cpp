@@ -56,6 +56,23 @@ void test_async_mutex_is_exclusive() {
     CIO_CHECK_EQ(cio::run(body()), static_cast<long>(kTasks) * kIncrements);
 }
 
+void test_async_mutex_try_lock_and_guard_release() {
+    auto body = []() -> cio::Task<bool> {
+        cio::Mutex mutex;
+        CIO_CHECK(mutex.try_lock());
+        CIO_CHECK(!mutex.try_lock());
+        mutex.unlock();
+
+        auto guard = co_await mutex.lock();
+        CIO_CHECK(!mutex.try_lock());
+        guard.release();
+        CIO_CHECK(mutex.try_lock());
+        mutex.unlock();
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 void test_taskgroup_joins_every_child() {
     static std::atomic<int> finished{0};
     finished.store(0);
@@ -148,6 +165,7 @@ void test_cancel_token_is_observable_both_ways() {
 int main() {
     RUN_TEST(test_waitgroup);
     RUN_TEST(test_async_mutex_is_exclusive);
+    RUN_TEST(test_async_mutex_try_lock_and_guard_release);
     RUN_TEST(test_taskgroup_joins_every_child);
     RUN_TEST(test_taskgroup_propagates_first_failure);
     RUN_TEST(test_taskgroup_failure_cancels_siblings);

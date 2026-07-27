@@ -13,6 +13,8 @@
 #pragma once
 
 #include <atomic>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -24,6 +26,101 @@ namespace cio::detail {
 inline constexpr std::uint32_t kLocalQueueMask = kLocalQueueCapacity - 1;
 static_assert((kLocalQueueCapacity & kLocalQueueMask) == 0,
               "local queue capacity must be a power of two");
+
+// Any-producer, owning-worker-only-consumer bounded inbox.
+//
+// Each slot carries a monotonically increasing sequence. Producers reserve a
+// position with CAS, write the frame, then publish the slot with release. The
+// owner consumes in position order and advances that slot's sequence by one
+// capacity before it can be reused. A failed full check does not reserve a
+// position, so overflow can safely fall back to GlobalRunQueue without leaving
+// a permanent hole.
+//
+// This is intentionally not MPMC. Remote producers must not write a worker's
+// owner-optimized local FIFO, and thieves must not consume its inbox; the owner
+// promotes inbox items into the stealable local FIFO in bounded batches.
+template <std::size_t Capacity>
+class BoundedMpscQueue {
+    static_assert(Capacity >= 2, "MPSC queue needs at least two slots");
+    static_assert((Capacity & (Capacity - 1)) == 0,
+                  "MPSC queue capacity must be a power of two");
+
+    struct Slot {
+        std::atomic<std::uint64_t> sequence{0};
+        void* frame = nullptr;
+    };
+
+public:
+    BoundedMpscQueue() noexcept {
+        for (std::uint64_t i = 0; i < Capacity; ++i) {
+            slots_[i].sequence.store(i, std::memory_order_relaxed);
+        }
+    }
+
+    BoundedMpscQueue(const BoundedMpscQueue&) = delete;
+    BoundedMpscQueue& operator=(const BoundedMpscQueue&) = delete;
+
+    // Any producer. Returns false immediately when the bounded ring is full.
+    bool try_push(void* frame) noexcept {
+        std::uint64_t pos = producer_pos_.load(std::memory_order_relaxed);
+        for (;;) {
+            Slot& slot = slots_[pos & kMask];
+            const std::uint64_t sequence =
+                slot.sequence.load(std::memory_order_acquire);
+            const auto difference =
+                static_cast<std::int64_t>(sequence - pos);
+
+            if (difference == 0) {
+                if (producer_pos_.compare_exchange_weak(
+                        pos, pos + 1, std::memory_order_relaxed,
+                        std::memory_order_relaxed)) {
+                    slot.frame = frame;
+                    slot.sequence.store(pos + 1, std::memory_order_release);
+                    return true;
+                }
+                continue;
+            }
+            if (difference < 0) return false;
+            pos = producer_pos_.load(std::memory_order_relaxed);
+        }
+    }
+
+    // Owning worker only.
+    void* pop() noexcept {
+        const std::uint64_t pos = consumer_pos_;
+        Slot& slot = slots_[pos & kMask];
+        const std::uint64_t sequence =
+            slot.sequence.load(std::memory_order_acquire);
+        const auto difference =
+            static_cast<std::int64_t>(sequence - (pos + 1));
+        if (difference != 0) return nullptr;
+
+        void* const frame = slot.frame;
+        slot.sequence.store(pos + Capacity, std::memory_order_release);
+        consumer_pos_ = pos + 1;
+        return frame;
+    }
+
+    // Owning worker only. A reserved-but-not-yet-published producer slot is
+    // conservatively reported empty for this instant; the producer's directed
+    // wake/final parking recheck is what makes that transient safe.
+    bool empty() noexcept {
+        const std::uint64_t pos = consumer_pos_;
+        const std::uint64_t sequence =
+            slots_[pos & kMask].sequence.load(std::memory_order_acquire);
+        return static_cast<std::int64_t>(sequence - (pos + 1)) != 0;
+    }
+
+private:
+    static constexpr std::uint64_t kMask = Capacity - 1;
+
+    CIO_CACHE_ALIGNED std::atomic<std::uint64_t> producer_pos_{0};
+    CIO_CACHE_ALIGNED std::uint64_t consumer_pos_ = 0;
+    CIO_CACHE_ALIGNED std::array<Slot, Capacity> slots_{};
+};
+
+inline constexpr std::size_t kRemoteInboxCapacity = 256;
+using RemoteInbox = BoundedMpscQueue<kRemoteInboxCapacity>;
 
 // Single-producer (the owning worker) multi-consumer (thieves) bounded ring.
 //
@@ -113,6 +210,18 @@ public:
 
     bool empty() const noexcept { return size() == 0; }
 
+    // Conservative predicate for published-stealable-bit repair. A torn
+    // snapshot is reported as non-empty: a stale set bit costs one failed
+    // steal, while a false clear can strand runnable work.
+    bool maybe_nonempty() const noexcept {
+        const std::uint32_t first_head = head_.load(std::memory_order_acquire);
+        const std::uint32_t tail = tail_.load(std::memory_order_acquire);
+        const std::uint32_t second_head = head_.load(std::memory_order_acquire);
+        if (first_head != second_head) return true;
+        const std::uint32_t n = tail - second_head;
+        return n != 0 || n > kLocalQueueCapacity;
+    }
+
 private:
     CIO_CACHE_ALIGNED std::atomic<std::uint32_t> head_{0};
     CIO_CACHE_ALIGNED std::atomic<std::uint32_t> tail_{0};
@@ -133,7 +242,11 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             queue_.push_back(item);
         }
-        size_.fetch_add(1, std::memory_order_release);
+        // SC pairs with the worker's final park observation. If a producer's
+        // subsequent idle-bitmap scan misses the worker, that worker's earlier
+        // SC idle publication forces its size load to observe this update (or
+        // a later consume).
+        size_.fetch_add(1, std::memory_order_seq_cst);
     }
 
     void push_batch(void* const* items, std::uint32_t n) {
@@ -142,7 +255,7 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             queue_.insert(queue_.end(), items, items + n);
         }
-        size_.fetch_add(n, std::memory_order_release);
+        size_.fetch_add(n, std::memory_order_seq_cst);
     }
 
     void* pop() {
@@ -151,7 +264,7 @@ public:
         if (queue_.empty()) return nullptr;
         void* item = queue_.front();
         queue_.pop_front();
-        size_.fetch_sub(1, std::memory_order_release);
+        size_.fetch_sub(1, std::memory_order_seq_cst);
         return item;
     }
 
@@ -170,11 +283,13 @@ public:
             out[i] = queue_.front();
             queue_.pop_front();
         }
-        size_.fetch_sub(n, std::memory_order_release);
+        size_.fetch_sub(n, std::memory_order_seq_cst);
         return n;
     }
 
-    std::uint32_t size() const noexcept { return size_.load(std::memory_order_acquire); }
+    std::uint32_t size() const noexcept {
+        return size_.load(std::memory_order_seq_cst);
+    }
     bool empty() const noexcept { return size() == 0; }
 
 private:

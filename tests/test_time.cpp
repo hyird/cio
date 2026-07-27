@@ -23,6 +23,34 @@ void test_sleep_waits_at_least_the_duration() {
     CIO_CHECK(elapsed < 500);
 }
 
+void test_relative_sleep_captures_its_deadline_when_constructed() {
+    auto body = []() -> cio::Task<long> {
+        // Preserve the established behaviour: sleep(Duration) turns the
+        // duration into a deadline when the awaiter is constructed.
+        auto delayed = cio::sleep(20ms);
+        co_await cio::sleep(30ms);
+        const auto started = cio::Clock::now();
+        co_await delayed;
+        co_return std::chrono::duration_cast<std::chrono::microseconds>(
+                      cio::Clock::now() - started)
+            .count();
+    };
+    const long elapsed_us = cio::run(body());
+    CIO_CHECK(elapsed_us < 5'000);
+}
+
+void test_nonpositive_sleep_completes_immediately() {
+    auto body = []() -> cio::Task<int> {
+        int completed = 0;
+        co_await cio::sleep(0ns);
+        ++completed;
+        co_await cio::sleep(-1ns);
+        ++completed;
+        co_return completed;
+    };
+    CIO_CHECK_EQ(cio::run(body()), 2);
+}
+
 // Sub-millisecond sleeps: the reactor waits with nanosecond resolution
 // (epoll_pwait2), so 200us must not round up to a full millisecond.
 void test_sub_millisecond_sleep_is_not_rounded_up() {
@@ -112,6 +140,8 @@ void test_idle_runtime_does_not_spin() {
 
 int main() {
     RUN_TEST(test_sleep_waits_at_least_the_duration);
+    RUN_TEST(test_relative_sleep_captures_its_deadline_when_constructed);
+    RUN_TEST(test_nonpositive_sleep_completes_immediately);
     RUN_TEST(test_sub_millisecond_sleep_is_not_rounded_up);
     RUN_TEST(test_timers_fire_in_order);
     RUN_TEST(test_many_concurrent_timers);

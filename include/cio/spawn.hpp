@@ -5,15 +5,17 @@
 //   go(t)     fire and forget, exactly like `go f()`. The task's own frame is
 //             the only allocation; it destroys itself on completion.
 //   spawn(t)  returns a JoinHandle you can co_await for the result. This one
-//             needs a shared completion slot, so it costs a refcounted state
-//             plus a small wrapper frame. You only pay for it if you join.
+//             needs a shared completion slot. The task's final suspend writes
+//             that slot directly, so joining does not add a wrapper frame.
 #pragma once
 
 #include <atomic>
 #include <coroutine>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #include "cio/detail/frame_pool.hpp"
@@ -23,6 +25,12 @@
 namespace cio {
 
 namespace detail {
+
+struct JoinWait {
+    std::coroutine_handle<> handle{};
+    SchedulerTarget sched;
+    WorkerId preferred_worker = kInvalidWorkerId;
+};
 
 inline Scheduler& require_scheduler() {
     Scheduler* sched = current_scheduler();
@@ -38,8 +46,12 @@ inline Scheduler& require_scheduler() {
 // parked joiner's frame address, or kDone. The CAS is what makes "join before
 // completion" and "join after completion" the same code path.
 template <typename T>
-class JoinState {
+class JoinState : public DetachedTaskCompletion {
 public:
+    explicit JoinState(std::uint32_t initial_refs) noexcept
+        : DetachedTaskCompletion{&complete_task},
+          refs_(initial_refs) {}
+
     // Same pool as the coroutine frames: spawn() allocates one of these per
     // call, on the same threads and with the same lifetime pattern.
     static void* operator new(std::size_t size) { return FramePool::allocate(size); }
@@ -47,9 +59,17 @@ public:
         FramePool::deallocate(state, size);
     }
 
-    void add_ref() noexcept { refs_.fetch_add(1, std::memory_order_relaxed); }
+    void add_ref() noexcept {
+        const std::uint32_t previous =
+            refs_.fetch_add(1, std::memory_order_relaxed);
+        if (previous == std::numeric_limits<std::uint32_t>::max()) {
+            std::terminate();
+        }
+    }
     void release() noexcept {
-        if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) delete this;
+        const std::uint32_t previous =
+            refs_.fetch_sub(1, std::memory_order_acq_rel);
+        if (previous == 1) delete this;
     }
 
     template <typename... U>
@@ -67,12 +87,31 @@ public:
         return waiter_.load(std::memory_order_acquire) == done_sentinel();
     }
 
-    // Returns true if the joiner parked; false if the task already finished.
-    bool try_park(std::coroutine_handle<> joiner) noexcept {
+    bool completed_successfully() const noexcept {
+        // set_value()/set_exception() publishes all result state before
+        // complete() release-publishes kDone. The acquire in completed()
+        // therefore makes this non-atomic exception read race-free.
+        return completed() && !exception_;
+    }
+
+    enum class ParkResult { kParked, kCompleted, kAlreadyWaiting };
+
+    ParkResult try_park(JoinWait* wait, std::coroutine_handle<> joiner) noexcept {
+        wait->handle = joiner;
+        Scheduler* const scheduler = current_scheduler();
+        wait->sched =
+            scheduler == nullptr
+                ? SchedulerTarget{}
+                : scheduler->completion_target();
+        wait->preferred_worker = current_worker_id(scheduler);
         void* expected = nullptr;
-        return waiter_.compare_exchange_strong(expected, joiner.address(),
-                                               std::memory_order_acq_rel,
-                                               std::memory_order_acquire);
+        if (waiter_.compare_exchange_strong(expected, wait,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_acquire)) {
+            return ParkResult::kParked;
+        }
+        return expected == done_sentinel() ? ParkResult::kCompleted
+                                           : ParkResult::kAlreadyWaiting;
     }
 
     T take() {
@@ -81,6 +120,32 @@ public:
     }
 
 private:
+    static void complete_task(
+        TaskPromiseBase& base,
+        DetachedTaskCompletion& completion) noexcept {
+        auto& self = static_cast<JoinState&>(completion);
+        auto& promise = static_cast<TaskPromise<T>&>(base);
+
+        try {
+            if (promise.exception) {
+                self.set_exception(promise.exception);
+            } else if constexpr (std::is_void_v<T>) {
+                self.set_value();
+            } else {
+                self.set_value(std::move(*promise.value));
+            }
+        } catch (...) {
+            // Moving the completed result into shared state is part of the
+            // spawned task's result path, just as it was in the former wrapper
+            // coroutine. Preserve that exception for the JoinHandle.
+            self.set_exception(std::current_exception());
+        }
+
+        // The scheduled task owns one of the two seeded references. Its frame
+        // is destroyed immediately after this callback returns.
+        self.release();
+    }
+
     static void* done_sentinel() noexcept {
         return reinterpret_cast<void*>(static_cast<std::uintptr_t>(1));
     }
@@ -88,10 +153,16 @@ private:
     void complete() noexcept {
         void* previous = waiter_.exchange(done_sentinel(), std::memory_order_acq_rel);
         if (previous != nullptr && previous != done_sentinel()) {
-            Scheduler* sched = current_scheduler();
-            if (sched != nullptr) {
-                sched->schedule(std::coroutine_handle<>::from_address(previous));
-            }
+            auto* const wait = static_cast<JoinWait*>(previous);
+            const SchedulerTarget sched = wait->sched;
+            const WorkerId worker = wait->preferred_worker;
+            const std::coroutine_handle<> handle = wait->handle;
+            // Same-runtime completion stays local and publishes normally so
+            // peers may steal. Cross-runtime completion targets the
+            // Scheduler captured by the waiter and treats its old worker only
+            // as an affinity hint.
+            SchedulerTarget::dispatch(
+                sched, handle, worker);
         }
     }
 
@@ -104,10 +175,16 @@ private:
 template <typename T>
 class StateRef {
 public:
+    struct AdoptTag {
+        explicit AdoptTag() = default;
+    };
+    static constexpr AdoptTag adopt{};
+
     StateRef() noexcept = default;
     explicit StateRef(JoinState<T>* state) noexcept : state_(state) {
         if (state_) state_->add_ref();
     }
+    StateRef(JoinState<T>* state, AdoptTag) noexcept : state_(state) {}
     StateRef(const StateRef& other) noexcept : state_(other.state_) {
         if (state_) state_->add_ref();
     }
@@ -157,23 +234,61 @@ public:
 
     auto operator co_await() noexcept {
         struct Awaiter {
-            detail::JoinState<T>* state;
+            detail::StateRef<T> state;
+            detail::JoinWait wait{};
+            bool rejected = false;
+            bool snapshot_success = false;
 
             bool await_ready() const noexcept {
-                return state == nullptr || state->completed();
+                return snapshot_success || rejected || !state ||
+                       state->completed();
             }
             bool await_suspend(std::coroutine_handle<> joiner) noexcept {
-                return state != nullptr && state->try_park(joiner);
+                if (snapshot_success) return false;
+                if (!state) return false;
+                switch (state->try_park(&wait, joiner)) {
+                    case detail::JoinState<T>::ParkResult::kParked:
+                        return true;
+                    case detail::JoinState<T>::ParkResult::kCompleted:
+                        return false;
+                    case detail::JoinState<T>::ParkResult::kAlreadyWaiting:
+                        rejected = true;
+                        return false;
+                }
+                return false;
             }
             T await_resume() {
+                if constexpr (std::is_void_v<T>) {
+                    if (snapshot_success) return;
+                }
+                if (rejected) {
+                    throw std::logic_error("cio: JoinHandle already has a waiter");
+                }
                 // A default-constructed or detached JoinHandle has no state.
-                if (state == nullptr) {
+                if (!state) {
                     throw std::logic_error("cio: awaited an invalid JoinHandle");
                 }
                 return state->take();
             }
         };
-        return Awaiter{state_.get()};
+        detail::JoinState<T>* const state = state_.get();
+        if (state == nullptr) return Awaiter{{}, {}, false, false};
+        if constexpr (std::is_void_v<T>) {
+            // No result object needs to stay alive after a successful void
+            // completion. Snapshotting that fact makes a saved awaiter
+            // independent of the handle without paying two refcount RMWs.
+            // Exceptional and incomplete states retain the owning path.
+            if (state->completed_successfully()) {
+                return Awaiter{{}, {}, false, true};
+            }
+        }
+        // The awaiter owns a reference independently of the handle, so a saved
+        // awaiter remains valid if the originating handle is detached. A
+        // completed handle may still be awaited again, preserving the original
+        // observable behaviour; only two simultaneously parked joiners are
+        // rejected by try_park().
+        return Awaiter{
+            detail::StateRef<T>{state}, {}, false, false};
     }
 
 private:
@@ -188,6 +303,10 @@ void go(Task<T> task) {
     detail::Scheduler& sched = detail::require_scheduler();
     auto handle = task.release();
     if (!handle) throw std::invalid_argument("cio: cannot schedule an invalid Task");
+    // A scheduler-detached task has no awaiting continuation. Clearing the
+    // shared slot also makes accidental prior awaiter misuse fail closed
+    // instead of being interpreted as a detached completion callback.
+    handle.promise().continuation_or_completion = nullptr;
     handle.promise().detached = true;
     sched.schedule(handle);
 }
@@ -198,12 +317,17 @@ template <typename T>
 inline void go_on(Scheduler& sched, Task<T> task) {
     auto handle = task.release();
     if (!handle) throw std::invalid_argument("cio: cannot schedule an invalid Task");
+    handle.promise().continuation_or_completion = nullptr;
     handle.promise().detached = true;
     sched.schedule(handle);
 }
 
+// Cold compatibility path for an invalid Task or one that has already reached
+// final_suspend. A done coroutine must never be resumed directly; composing it
+// through this wrapper preserves spawn()'s established asynchronous completion
+// and exception behaviour without taxing the ordinary lazy-task path.
 template <typename T>
-Task<void> root_runner(Task<T> task, StateRef<T> state) {
+Task<void> completed_spawn_runner(Task<T> task, StateRef<T> state) {
     try {
         if constexpr (std::is_void_v<T>) {
             co_await std::move(task);
@@ -218,11 +342,30 @@ Task<void> root_runner(Task<T> task, StateRef<T> state) {
 
 template <typename T>
 JoinHandle<T> spawn_on(Scheduler& sched, Task<T> task) {
-    detail::StateRef<T> state{new detail::JoinState<T>()};
-    JoinHandle<T> handle{state};
-    // `state` is copied into the runner's frame, which is what keeps the shared
-    // state alive for exactly as long as either side still needs it.
-    go_on(sched, root_runner<T>(std::move(task), state));
+    // Exactly two owners exist: the returned handle and the scheduled task.
+    // Seed both references in the allocation, then let each StateRef adopt one.
+    auto* raw = new detail::JoinState<T>(2);
+    detail::StateRef<T> handle_state{raw, detail::StateRef<T>::adopt};
+    JoinHandle<T> handle{std::move(handle_state)};
+
+    if (!task.valid() || task.done()) {
+        detail::StateRef<T> runner_state{
+            raw, detail::StateRef<T>::adopt};
+        go_on(
+            sched,
+            completed_spawn_runner(
+                std::move(task), std::move(runner_state)));
+        return handle;
+    }
+
+    // A spawned task is scheduler-detached, but unlike go() its exception and
+    // result complete JoinState instead of taking the process down. The raw
+    // completion pointer owns the second seeded reference until final suspend.
+    auto child = task.release();
+    child.promise().continuation_or_completion =
+        static_cast<DetachedTaskCompletion*>(raw);
+    child.promise().detached = true;
+    sched.schedule(child);
     return handle;
 }
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Interleaved A/B of two HTTP server binaries under wrk.
 #
-# Same contract as echo-comparison/run_ab.sh, but with a third-party generator,
-# so a before/after here is the server and only the server.
+# Like echo-comparison/run_ab.sh, this holds the load generator fixed while
+# interleaving the two server binaries. Here the fixed generator is third-party
+# wrk; echo uses a frozen cio-based load-generator binary.
 #
 #   ./ab_wrk.sh <binA> <binB> [connections] [duration_s] [repeats] [threads]
 set -uo pipefail
@@ -51,8 +52,8 @@ one_run() {   # $1 = binary, $2 = tag; echoes "rps cpu"
 
     local rps p50 p99
     rps="$(awk '/^Requests\/sec:/ {print $2}' "$log")"
-    p50="$(awk '/50%/ {print $2}' "$log")"
-    p99="$(awk '/99%/ {print $2}' "$log")"
+    p50="$(awk '/^[[:space:]]*50%[[:space:]]/ {print $2; exit}' "$log")"
+    p99="$(awk '/^[[:space:]]*99%[[:space:]]/ {print $2; exit}' "$log")"
     [ -z "$rps" ] && { echo "FAILED"; return; }
     echo "$rps $p50 $p99 $(echo "$c1 - $c0" | bc)"
 }

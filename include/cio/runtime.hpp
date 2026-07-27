@@ -50,12 +50,15 @@ public:
 
     std::size_t worker_count() const noexcept { return sched_->worker_count(); }
 
+    // Blocks until every worker has stopped. Calling this from a task running
+    // on this same Runtime would have to join its own worker and is rejected
+    // with std::logic_error.
     void shutdown();
 
     detail::Scheduler& scheduler() noexcept { return *sched_; }
 
 private:
-    std::unique_ptr<detail::Scheduler> sched_;
+    std::shared_ptr<detail::Scheduler> sched_;
 };
 
 namespace detail {

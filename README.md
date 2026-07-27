@@ -55,6 +55,21 @@ cd build && ctest
 Linux only, C++20. Tested with GCC 13.3 and Clang 19 on Linux 6.12. No external
 dependencies.
 
+## Runtime refactor
+
+The [runtime v2 design](docs/scheduler-v2.md) changes implementation only:
+worker-local epoll shards and remote inboxes provide a shared-nothing balanced
+hot path, while conditional work stealing preserves load redistribution under
+skew.
+Public names, explicit signatures, options and supported observable semantics
+are frozen for this work; private types and public-header implementation details
+may change when applications are recompiled.
+
+Resolver, dialer and file additions in the
+[I/O infrastructure design](docs/io-infrastructure.md) are a later milestone,
+after the runtime refactor is stable. The refactor adds no feature, backend,
+executor/completion-token API or io_uring support.
+
 ## The public surface
 
 | | |
@@ -63,7 +78,7 @@ dependencies.
 | `cio::go(task)` | fire and forget — `go f()` |
 | `cio::spawn(task)` | spawn and keep a `JoinHandle<T>` you can `co_await` |
 | `cio::yield()` | `runtime.Gosched()` |
-| `cio::Chan<T>` | a channel; a cheap refcounted handle, passed by value like `chan int` |
+| `cio::Chan<T>` | a mutex-protected MPMC channel; its cheap refcounted handle is passed by value like `chan int` |
 | `cio::make_chan<T>(n)` | `n == 0` gives an unbuffered rendezvous channel |
 | `cio::select(...)` | with `recv` / `send` / `after` / `otherwise` cases |
 | `cio::sleep(d)` | |
@@ -90,58 +105,64 @@ ordinary code in the enclosing coroutine and can `co_await` freely.
 ```
    cio::go / chan / select / net          <- no threads here
   ─────────────────────────────────────
-   Scheduler        M:N workers, runnext + bounded ring + global queue,
-                    steal-half, Go-style spinning/parking protocol
-   Reactor          epoll, edge-triggered
-   TimerService     per-worker 4-ary heaps, atomic earliest-deadline
+   Scheduler        M:N workers, each with runnext + local FIFO + hard-directed
+                    MPSC inbox;
+                    published-victim stealing and a cold shared fallback
+   Reactor          one edge-triggered epoll + eventfd shard per worker
+   TimerService     one 4-ary heap per worker, owner-local deadline reads
    FramePool        size-classed thread caches + central list
    BlockingPool     lazily grown, retires on idle
 ```
 
 **Scheduler.** One OS thread per worker, each with a single-slot LIFO `runnext`,
-a 256-entry lock-free FIFO ring stealable in halves, and a shared mutex-guarded
-global queue checked every 61 iterations for fairness. `runnext` is deliberately
-*not* stealable — it exists so a producer/consumer pair stays pinned to one core,
-and letting peers take it destroys exactly the locality it was added for. This is
-safe because only the owning worker ever writes it, so it can never strand a task
-under a parked worker.
+a 256-entry owner-produced FIFO ring stealable in halves, and a 256-entry
+bounded `RemoteInbox` consumed only by that worker. The inbox is MPSC and is
+used only by a hard-directed internal submission with a concrete ownership
+target. Ordinary foreign submissions, non-local soft-affinity completions and
+queue overflow use the shared fallback. It is unrelated to public
+`cio::Chan<T>`, whose buffered/rendezvous state and waiter lists remain
+mutex-protected MPMC. `runnext` remains owner-only so a direct
+producer/consumer handoff keeps same-worker cache locality, while bounded
+fairness publishes work that it would otherwise hide. An initial local enqueue
+is only a placement choice: FIFO work may be published and stolen immediately,
+so it does not guarantee that a task stays on that worker.
 
-**Finding work.** A searcher checks its own queues, then the global queue, then
-*drains the reactor*, and only then steals from peers. That order matters more
-than it looks: in an I/O-bound server essentially every runnable task originates
-in the reactor, so stealing first means scanning every peer — two cache lines
-each, on lines those peers are writing — to discover what one `epoll_wait` was
-about to hand over in bulk. Measured at 256 connections before the reorder: 3.33M
-steal attempts against 701k hits, a 21% hit rate, with one epoll event per
-request. Go's `findRunnable` polls the network before it resorts to stealing for
-the same reason. Afterwards, steal attempts fell 47% and parks 55%.
+**Finding work.** A worker services its local handoff and FIFO first, checks its
+inbox, reactor, timer shard and shared fallback with bounded fairness, then
+steals only from workers advertised in the scalable `stealable` bitmap. A
+per-worker publish/clear epoch handshake closes the set/clear race while
+letting a burst skip repeated reads of the shared `stealable` bitmap. This
+avoids scanning every peer when balanced while still exposing FIFO backlog
+whenever an idle worker can use it.
 
-The drain backs off for 20 µs whenever it comes back empty, because the ordering
-is a loss without load: with more workers than in-flight work, every worker runs
-dry constantly and each trip spent a syscall to be told the reactor had nothing.
-Only the non-blocking drain is throttled — the blocking poll a parking worker
-does is not, so nothing waits longer for an event.
+**Wakeups.** Every worker publishes its idle state in a bitmap and parks in its
+own epoll shard. A hard-directed internal producer publishes to the destination
+inbox, claims that worker's idle bit and writes only its eventfd; a
+`wake_pending` bit coalesces redundant writes. Shared fallback work may wake any
+idle worker. After publishing idle, the worker rechecks `runnext`, its local
+FIFO and inbox, the shared fallback, due timers and published victims. This
+closes the enqueue/park lost-wakeup window.
 
-**Wakeups.** Idle workers follow Go's spinning protocol, and `notify()` is gated
-by a CAS that claims the right to create *the* searcher; a worker woken that way
-inherits the searcher credit instead of re-entering the notify path. Without that
-gate, a hot channel wakes and re-parks a thread on every message and the futex
-round trip dwarfs the work being scheduled — measured at 23 µs per channel round
-trip before the gate, 140 ns after.
+A FIFO-victim wake additionally pre-arms a sticky searcher credit before
+claiming an idle worker. Exactly once, on the first scheduler iteration after
+`Scheduler::park()` returns, the worker checks and consumes that credit before
+executing any runnable from `runnext`, local FIFO, inbox or shared fallback,
+including continuations made ready by timer or I/O service. Ordinary
+task-to-task resumptions do not read the credit atomic. Every return from
+`Scheduler::park()`—both its pre-poll final recheck and a reactor return—clears
+idle and then rechecks published victims, so an unrelated I/O edge cannot
+intercept the only searcher. After any successful steal, a still-published
+original-victim tail receives another searcher; items retained on the thief and
+the original victim tail are separate published sources.
 
-A reactor poll that makes N tasks runnable wakes N−1 peers, not N: the poller
-returns to its own run loop and takes one itself, and waking somebody for that
-one buys a futex round trip to a worker that finds the queue already emptied.
-When the grant leaves a token for every waiter, one broadcast delivers them all
-in a single syscall instead of N sequential ones — the worker told last would
-otherwise start that whole sequence late, on the critical path of its request.
-
-**Reactor.** One edge-triggered epoll registration per fd for the life of the fd,
-never rearmed. Per-direction readiness is a single atomic word with three states
-(`idle` / `ready` / `waiter*`), following Go's netpoll: the race between "syscall
-returned EAGAIN, about to park" and "readiness arrived" is resolved by a CAS,
-never a lock. Descriptors come from a slab that never frees, with a generation
-tag, so a stale event dequeued by another thread is always safe to dereference.
+**Reactor.** Each worker owns an edge-triggered epoll instance and eventfd.
+An accepted descriptor receives a stable home shard; established readiness is
+normally polled and resumed by that shard's worker. Per-direction readiness is
+a single atomic word with three states (`idle` / `ready` / `waiter*`), so the
+race between "syscall returned EAGAIN, about to park" and "readiness arrived"
+is resolved by CAS. Descriptor slots retain stable addresses until reactor
+destruction and carry generations, lifecycle pins and syscall leases, making a
+stale event safe while `close()` and deadlines race with an operation.
 
 **Deadlines** live on the descriptor, not on the awaiter — Go's `SetReadDeadline`
 model. That is not API mimicry: a timer that can fire concurrently with the
@@ -149,10 +170,11 @@ operation it is timing out must outlive the coroutine frame, and a descriptor in
 the reactor's slab does while an awaiter in a frame does not.
 
 **Timers.** Per-worker 4-ary min-heaps, so arming a deadline never touches a
-shared lock. Each shard publishes its earliest deadline in an atomic, so the
-worker parked in the reactor computes its timeout by reading N atomics rather
-than locking N heaps. Waits use `epoll_pwait2`, so a 200 µs sleep is not rounded
-up to a millisecond.
+shared lock. Each worker reads only its own shard's earliest deadline when
+computing the timeout for its epoll wait. Foreign or monitor-fired timer batches
+use the shared completion fallback so a busy preferred worker cannot strand
+them. Waits use `epoll_pwait2`, so a 200 µs sleep is not rounded up to a
+millisecond.
 
 **Frame pool.** Coroutine frames are the runtime's most frequent allocation — one
 per spawned task, one per socket read or write — so they go through a
@@ -163,9 +185,10 @@ and 24 workers free them, which a purely thread-local cache cannot recycle at
 all. Measured: 1.008 → 0.000 allocations per socket read, and 1.000 → 0.008 per
 cross-thread spawn.
 
-**Watchdog.** A sysmon-style monitor thread polls the reactor and fires timers
-when every worker is busy with CPU-bound work, so I/O latency does not degrade
-under load.
+**Watchdog.** A sysmon-style monitor is a stale-shard backstop: it can poll a
+worker reactor and fire its timers when that owner is occupied by CPU-bound
+work. Completions produced there go through the shared fallback and wake the
+target runtime.
 
 ### The lifetime rule everything depends on
 
@@ -175,11 +198,11 @@ lock that waiter is queued under, must not touch it after releasing that lock
 unless it won, and must schedule it last.**
 
 That single rule is what lets `select` retract its unfired cases with nothing but
-the channel lock — no refcounting on the wakeup path. The two places without a
-shared lock get explicit handshakes instead: `select`'s timeout publishes through
-a phase word so a case that fires mid-registration defers the resume back to the
-setup code, and `TimerService::disarm()` does not return until a firing callback
-has stopped touching the node.
+the channel lock — no waiter or frame refcounting on the channel wakeup path.
+The two places without a shared lock get explicit handshakes instead: `select`'s
+timeout publishes through a phase word so a case that fires mid-registration
+defers the resume back to the setup code, and `TimerService::disarm()` does not
+return until a firing callback has stopped touching the node.
 
 The corollary is that `disarm()` must be called *unconditionally*. Guarding it
 with `if (state == kArmed)` skips the wait for an in-flight callback, which lets
@@ -189,6 +212,13 @@ linked into a heap twice with a stale `heap_index`. That was a real crash, found
 by the soak test at ~60 seconds and not by any unit test.
 
 ## Measurements
+
+The measurements in this section are the **pre-v2 baseline** retained to explain
+why the runtime was refactored. They describe the former shared-reactor,
+global-scan scheduler at the commit recorded by the benchmark documentation;
+they are not claims about the current worker-sharded implementation. Runtime v2
+release measurements use frozen A/B binaries and the gate in
+[the design](docs/scheduler-v2.md).
 
 AMD EPYC 7402, 24 cores, Linux 6.12, GCC 13.3, `-O3`. `./build/bench_core [workers]`.
 These are microbenchmarks on one machine; the multi-worker numbers vary ±20% run
@@ -269,18 +299,20 @@ less CPU than Go at all of them. Shared-nothing asio leads by 5.7-11.9% above 64
 connections and by much more below, for the reason the skew sweep below charges
 it for.
 
-**Why wrk.** The echo comparison's load generator is written in cio, which it
-says and mitigates but cannot fix: an improvement to cio makes the generator
-faster too. That is not a hypothetical. The reactor-ordering change measured
-+7.9% against the generator as it stood and +50% after the generator was rebuilt
-on the improved runtime, and neither number is the server on its own. Worse, at
-8 connections the same harness reported +4.1% for a change that costs 4.6%
-there — a real regression, hidden by the client speeding up in step with the
-server. wrk is not built on any runtime under test and does not change when they
-do.
+**Why wrk.** Echo A/B runs the server and load generator as independent pinned
+processes and freezes one prebuilt cio load-generator binary across both sides.
+That makes an interleaved A/B a server-only comparison, but the generator is
+still project code rather than a third-party implementation. Historically,
+rebuilding it with the runtime under test changed the answer: the
+reactor-ordering change measured +7.9% against the generator as it stood and
++50% after the generator was rebuilt on the improved runtime. Worse, at 8
+connections the same harness reported +4.1% for a change that costs 4.6% there
+— a real regression hidden by the client speeding up in step with the server.
+`wrk` is the third-party generator: it is not built on any runtime under test
+and does not change when they do.
 
-Against wrk, the same server source with only the runtime swapped, from the
-first commit of this series to the last:
+Against wrk, the same server source with only the pre-v2 runtime swapped, from
+the first commit of that historical series to its last:
 
 | connections | before | after | |
 |---:|---:|---:|---:|
@@ -290,16 +322,17 @@ first commit of this series to the last:
 | 256 | 544,376 | 758,177 | **+39.3%** |
 | 1024 | 596,095 | 766,982 | **+28.7%** |
 
-The 8-connection column is not a rounding error and is not fixed. With more
-workers than in-flight work every worker runs dry constantly, and draining the
-reactor before stealing costs a syscall each time it finds nothing; a 20 µs
-backoff recovers about half of it. It is the same regime where asio is 39%
-ahead, and for the same reason — one shared reactor against eight private ones.
+The 8-connection column was not a rounding error and remained unfixed in that
+pre-v2 series. With more workers than in-flight work every worker ran dry
+constantly, and draining the shared reactor before stealing cost a syscall each
+time it found nothing; a 20 µs backoff recovered about half of it. Runtime v2
+replaces that mechanism with per-worker reactor shards and directed wakeups.
 
 **`bench/echo-comparison/`** runs an 8-thread echo workload against cio, Boost.Asio
 (shared-nothing: one `io_context` and one `SO_REUSEPORT` acceptor per thread, in
 both callback and coroutine form) and Go, with the server pinned to CPUs 0-7 and
-the load generator to 8-23. `run_matrix.sh` sweeps payload, thread count,
+the load generator in a separate process pinned to 8-23. Before/after runs keep
+that load-generator binary frozen. `run_matrix.sh` sweeps payload, thread count,
 connection count, load skew and connection churn; `results.csv` has all 112
 cells.
 
@@ -339,7 +372,8 @@ A sampling profiler answers "which symbol has the most cycles", which is not the
 question worth asking about a scheduler. How many futex wakes a request costs,
 how many events an `epoll_wait` returns, how often a searcher finds nothing —
 those are the numbers that decide what to change, and the 21% steal hit rate
-that produced the reordering above was the first thing they showed.
+that motivated the historical pre-v2 reactor-before-steal reordering was the
+first thing they showed.
 
 ```
 cmake -S . -B build-metrics -DCIO_METRICS=ON -DCMAKE_BUILD_TYPE=Release
@@ -352,11 +386,12 @@ production build should not differ.
 
 ## Testing
 
-Seven test binaries (`ctest`) covering the scheduler, channels, `select`, timers,
-sync primitives, networking, and a soak test — including 32k tasks across 24
-workers, 8×8 MPMC channel traffic, 32 concurrent `select`s racing setup against
-wakeup, 64 concurrent TCP connections at 20 round trips each, deadline
-interruption, and close-wakes-a-parked-reader.
+Ten test binaries (`ctest`) cover the scheduler, worker bitmaps and MPSC inbox,
+channels, `select`, timers, sync primitives, networking, public API surface, and
+a soak test — including 32k tasks across 24 workers, 8×8 MPMC channel traffic,
+32 concurrent `select`s racing setup against wakeup, 64 concurrent TCP
+connections at 20 round trips each, deadline interruption, and
+close-wakes-a-parked-reader.
 
 All pass clean under ThreadSanitizer:
 
@@ -430,6 +465,20 @@ These are real, and worth knowing before you build on it:
   blocked on a channel or socket when the runtime stops are simply not resumed,
   and their frames leak. `block_on` returning means your root task finished, not
   that every detached task did — that is what `TaskGroup` is for.
+  `Runtime::shutdown()` is a blocking external-thread operation; calling it
+  from one of that Runtime's own worker tasks throws `std::logic_error` before
+  stop or join begins.
+
+  Delayed completions carry a process-lifetime-unique endpoint.
+  Foreign/cross-runtime wakes acquire a short counted lease. Shutdown closes
+  the endpoint to new leases, waits for active leases to drain, and then clears
+  its Scheduler pointer; later foreign wakes are dropped safely. Same-runtime
+  handoffs compare the cached endpoint without an endpoint RMW. Endpoint
+  identities are never recycled—the small tombstone metadata remains reachable
+  until process exit, avoiding both ABA and static-destruction UAF. A Socket
+  and every parked I/O awaiter retain the stopped home reactor long enough to
+  detach and release descriptor state; attempting new async I/O on a Socket
+  returned from `cio::run()` reports `Errc::shutdown`.
 
 - **A socket must outlive every task using it.** `close()` is safe to call while
   another task is parked on it (they wake with `Errc::closed`), but destroying

@@ -55,25 +55,49 @@ inline constexpr std::uint32_t kSelectSetup = 0;
 inline constexpr std::uint32_t kSelectParked = 1;
 inline constexpr std::uint32_t kSelectResumed = 2;
 
+struct UninitializedWaiterTag {
+    explicit UninitializedWaiterTag() = default;
+};
+inline constexpr UninitializedWaiterTag kUninitializedWaiter{};
+
 // A parked sender or receiver. Lives in the coroutine frame.
 struct ChanWaiter {
-    ChanWaiter* next = nullptr;
-    ChanWaiter* prev = nullptr;
-    std::coroutine_handle<> handle{};
-    Scheduler* sched = nullptr;
+    ChanWaiter() noexcept
+        : next(nullptr),
+          prev(nullptr),
+          handle{},
+          sched(),
+          slot(nullptr),
+          select_winner(nullptr),
+          select_phase(nullptr),
+          case_index(0),
+          success(false),
+          queued(false) {}
 
-    // Sender: points at the T being sent. Receiver: points at the
-    // std::optional<T> to fill.
-    void* slot = nullptr;
-    bool success = false;
-    bool queued = false;
+    // Ordinary send/recv operations overwhelmingly complete from the channel
+    // buffer and never publish a waiter. Avoid clearing the whole intrusive
+    // node on that fast path; await_suspend initializes it only after the
+    // operation has actually found that it must block.
+    explicit ChanWaiter(UninitializedWaiterTag) noexcept {}
+
+    ChanWaiter* next;
+    ChanWaiter* prev;
+    std::coroutine_handle<> handle;
+    SchedulerTarget sched;
+    void* slot;
 
     // Non-null when this waiter belongs to a select. Waking it then requires
     // winning the select's single claim; losers must move on to the next
     // waiter in the queue.
-    std::atomic<std::uint32_t>* select_winner = nullptr;
-    std::atomic<std::uint32_t>* select_phase = nullptr;
-    std::uint32_t case_index = 0;
+    std::atomic<std::uint32_t>* select_winner;
+    std::atomic<std::uint32_t>* select_phase;
+    std::uint32_t case_index;
+
+    // Sender: slot points at the T being sent. Receiver: it points at the
+    // std::optional<T> to fill. Keep the compact scalar tail after the pointer
+    // fields so an ordinary waiter remains one cache line.
+    bool success;
+    bool queued;
 
     // Must be called with the owning channel's lock held.
     bool try_acquire() noexcept {
@@ -94,7 +118,8 @@ struct ChanWaiter {
 
     void wake() noexcept {
         if (!take_resume_ownership()) return;
-        if (sched != nullptr) sched->schedule(handle);
+        SchedulerTarget::dispatch_completion(
+            sched, handle, kInvalidWorkerId);
     }
 
     // Used for a direct hand-off, where the waker has just produced exactly the
@@ -102,7 +127,7 @@ struct ChanWaiter {
     // is still in L1 when it does.
     void wake_handoff() noexcept {
         if (!take_resume_ownership()) return;
-        if (sched != nullptr) sched->schedule_next(handle);
+        SchedulerTarget::dispatch_next(sched, handle);
     }
 };
 
@@ -340,8 +365,15 @@ public:
             const OpStatus status = channel_->try_send_locked(&value_, to_wake);
             if (status == OpStatus::kBlocked) {
                 waiter_.handle = h;
-                waiter_.sched = current_scheduler();
+                Scheduler* const scheduler = current_scheduler();
+                waiter_.sched =
+                    scheduler == nullptr
+                        ? SchedulerTarget{}
+                        : scheduler->completion_target();
                 waiter_.slot = &value_;
+                waiter_.success = false;
+                waiter_.select_winner = nullptr;
+                waiter_.select_phase = nullptr;
                 channel_->senders.push_back(&waiter_);
                 // The lock is released by the unique_lock destructor, which
                 // lives on the stack, not in the frame — safe even though the
@@ -359,7 +391,7 @@ public:
 private:
     Channel<T>* channel_;
     T value_;
-    ChanWaiter waiter_{};
+    ChanWaiter waiter_{kUninitializedWaiter};
 };
 
 template <typename T>
@@ -379,8 +411,15 @@ public:
             const OpStatus status = channel_->try_recv_locked(&value_, to_wake);
             if (status == OpStatus::kBlocked) {
                 waiter_.handle = h;
-                waiter_.sched = current_scheduler();
+                Scheduler* const scheduler = current_scheduler();
+                waiter_.sched =
+                    scheduler == nullptr
+                        ? SchedulerTarget{}
+                        : scheduler->completion_target();
                 waiter_.slot = &value_;
+                waiter_.success = false;
+                waiter_.select_winner = nullptr;
+                waiter_.select_phase = nullptr;
                 channel_->receivers.push_back(&waiter_);
                 return true;
             }
@@ -394,7 +433,7 @@ public:
 private:
     Channel<T>* channel_;
     std::optional<T> value_{};
-    ChanWaiter waiter_{};
+    ChanWaiter waiter_{kUninitializedWaiter};
 };
 
 }  // namespace detail

@@ -194,5 +194,20 @@ int main(int argc, char** argv) {
                 "(client and server share these workers; see the header comment)\n\n",
                 runtime.worker_count());
     runtime.block_on(run_benchmark(connections, requests));
+    const auto metrics = cio::runtime_metrics();
+    if (metrics.tasks_run != 0) {
+        std::printf(
+            "metrics          tasks=%llu parks=%llu poll=%llu/%llu "
+            "events=%llu io_wakeups=%llu eventfd=%llu steals=%llu/%llu\n",
+            static_cast<unsigned long long>(metrics.tasks_run),
+            static_cast<unsigned long long>(metrics.parks),
+            static_cast<unsigned long long>(metrics.polls_blocking),
+            static_cast<unsigned long long>(metrics.polls_nonblocking),
+            static_cast<unsigned long long>(metrics.poll_events),
+            static_cast<unsigned long long>(metrics.poll_wakeups),
+            static_cast<unsigned long long>(metrics.reactor_wakes),
+            static_cast<unsigned long long>(metrics.steal_hits),
+            static_cast<unsigned long long>(metrics.steal_attempts));
+    }
     return 0;
 }

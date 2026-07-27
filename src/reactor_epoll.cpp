@@ -68,7 +68,8 @@ int wait_for_events(int epoll_fd, epoll_event* events, int max_events,
 
 }  // namespace
 
-Reactor::Reactor(Scheduler& sched) : sched_(sched) {
+Reactor::Reactor(Scheduler& sched, WorkerId shard_id)
+    : sched_(sched), shard_id_(shard_id) {
     backend_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
     if (backend_fd_ < 0) fatal("epoll_create1");
 
@@ -83,6 +84,7 @@ Reactor::Reactor(Scheduler& sched) : sched_(sched) {
     ev.events = EPOLLIN;
     ev.data.u64 = kWakeToken;
     if (::epoll_ctl(backend_fd_, EPOLL_CTL_ADD, wake_fd_, &ev) != 0) fatal("epoll_ctl(wakefd)");
+    last_poll_ns_.store(now_ns(), std::memory_order_relaxed);
 }
 
 Reactor::~Reactor() {
@@ -95,23 +97,34 @@ Reactor::~Reactor() {
 }
 
 Result<IoDesc*> Reactor::attach(int fd) {
+    if (sched_.stopping()) return Error{Errc::shutdown};
+
     IoDesc* desc = alloc_desc();
     if (desc == nullptr) return Error{ENOMEM};
 
+    desc->lock_lifecycle();
     desc->fd = fd;
-    desc->owner = this;
+    if (desc->owner == nullptr) {
+        desc->owner = this;
+        desc->home_worker = shard_id_;
+        desc->runtime_stop = &sched_.stop_;
+    }
     desc->closing.store(false, std::memory_order_relaxed);
+    desc->refs.store(1, std::memory_order_relaxed);
     desc->slot[0].store(nullptr, std::memory_order_relaxed);
     desc->slot[1].store(nullptr, std::memory_order_relaxed);
     for (unsigned i = 0; i < kDirCount; ++i) {
+        desc->syscall_active[i].store(false, std::memory_order_relaxed);
         desc->deadline_seq[i].store(1, std::memory_order_relaxed);
         desc->expired_seq[i].store(0, std::memory_order_relaxed);
+        desc->absolute_deadline_ns[i].store(0, std::memory_order_relaxed);
         desc->deadline_timer[i].state.store(Timer::kIdle, std::memory_order_relaxed);
         desc->deadline_timer[i].heap_index = ~0u;
         // Nothing is known about a fresh descriptor, so let the first operation
         // try the syscall.
         desc->ready_hint[i].store(true, std::memory_order_relaxed);
     }
+    desc->unlock_lifecycle();
 
     // Register both directions once, edge-triggered, and never touch epoll_ctl
     // again for the life of the fd. Rearming per operation (the one-shot model)
@@ -121,7 +134,8 @@ Result<IoDesc*> Reactor::attach(int fd) {
     ev.data.u64 = make_token(*desc);
     if (::epoll_ctl(backend_fd_, EPOLL_CTL_ADD, fd, &ev) != 0) {
         const Error err = Error::from_errno();
-        free_desc(desc);
+        desc->closing.store(true, std::memory_order_release);
+        release_desc(desc);
         return err;
     }
 
@@ -130,7 +144,9 @@ Result<IoDesc*> Reactor::attach(int fd) {
 }
 
 void Reactor::detach(IoDesc* desc) {
+    desc->lock_lifecycle();
     desc->closing.store(true, std::memory_order_release);
+    desc->unlock_lifecycle();
 
     for (unsigned i = 0; i < kDirCount; ++i) {
         // Unconditionally, and before free_desc() below: this is what
@@ -147,30 +163,80 @@ void Reactor::detach(IoDesc* desc) {
     unblock(desc, Dir::kRead, Error{Errc::closed});
     unblock(desc, Dir::kWrite, Error{Errc::closed});
 
-    free_desc(desc);
+    // Never wait while holding lifecycle_lock: the syscall that won the
+    // closing race must be able to drop its direction lease. Because closing
+    // was published under that same lock, no new lease can start now. Once
+    // both flags are clear, Socket::close() may physically close the fd
+    // without any operation reaching a reused fd number.
+    desc->wait_for_syscalls();
+    release_desc(desc);
 }
 
 int Reactor::poll(std::int64_t timeout_ns) {
+    bool expected = false;
+    if (!polling_.compare_exchange_strong(expected, true,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+        return -1;
+    }
+    // The monitor may opportunistically drain this shard's I/O, but a wake
+    // token belongs to the worker that owns the shard. In particular, that
+    // worker can have published itself idle and completed its final work check
+    // while the monitor owns polling_. A producer then publishes into the
+    // worker's inbox and writes this token. If the monitor consumed it, the
+    // worker could acquire polling_ afterwards and sleep with runnable work
+    // already queued.
+    const bool shard_owner =
+        sched_.current_worker_id() == shard_id_;
+    if (timeout_ns == 0) {
+        CIO_METRIC(polls_nonblocking, 1);
+    } else {
+        CIO_METRIC(polls_blocking, 1);
+    }
+
+    const std::int64_t started = now_ns();
+    last_poll_ns_.store(started, std::memory_order_relaxed);
+    poller_deadline_ns_.store(
+        timeout_ns < 0 ? INT64_MAX : started + timeout_ns,
+        std::memory_order_release);
+
     epoll_event events[kMaxEvents];
 
     const int n = wait_for_events(backend_fd_, events, kMaxEvents, timeout_ns);
-    if (n <= 0) return 0;  // 0 = timeout, <0 = EINTR or error; either way, retry later
+    // A shard-owning worker published itself idle before entering a blocking
+    // poll. It is active again as soon as epoll_wait returns, not after this
+    // entire readiness batch has been dispatched. Clear that publication now
+    // so batch wakeups cannot claim the poller itself. For a monitor poll there
+    // is no current owning worker, and poller_returned() deliberately does
+    // nothing.
+    sched_.poller_returned(shard_id_);
+    poller_deadline_ns_.store(INT64_MAX, std::memory_order_release);
+    if (n <= 0) {
+        polling_.store(false, std::memory_order_release);
+        return 0;  // timeout/EINTR/error: the worker retries its state checks
+    }
     CIO_METRIC(poll_events, static_cast<std::uint64_t>(n));
 
-    // One syscall can make hundreds of tasks runnable. Queue them all, then
-    // issue a single wake sized to the burst — see Scheduler::notify_batch.
-    std::uint32_t made_runnable = 0;
+    ReadyBatch batch;
 
     for (int i = 0; i < n; ++i) {
         const std::uint64_t token = events[i].data.u64;
 
         if (token == kWakeToken) {
+            // Keep the level-triggered token latched for the shard owner. A
+            // monitor poll still returns and releases polling_, but it must
+            // not steal the directed wake that makes the owner's next poll
+            // return.
+            if (!shard_owner) continue;
+
             std::uint64_t value = 0;
             while (::read(wake_fd_, &value, sizeof(value)) == sizeof(value)) {
             }
-            // Clear *after* draining. A wake() that lands in between re-arms the
-            // eventfd, so the next poll returns immediately — a spurious extra
-            // search, never a missed wakeup.
+            // Only the owner clears this publication. A producer that races
+            // the drain and observes true has published work to the owner that
+            // is already awake; the owner's run loop rechecks every queue and
+            // timer before it can park again. Foreign pollers leave both the
+            // flag and the kernel token untouched.
             wake_pending_.store(false, std::memory_order_release);
             continue;
         }
@@ -181,44 +247,21 @@ int Reactor::poll(std::int64_t timeout_ns) {
         // writer, not just a reader.
         if (mask & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) dirs |= 1u;
         if (mask & (EPOLLOUT | EPOLLHUP | EPOLLERR)) dirs |= 2u;
-        if (dirs != 0) dispatch(token, dirs, &made_runnable);
+        if (dirs != 0) dispatch(token, dirs, &batch);
     }
 
-    CIO_METRIC(poll_wakeups, made_runnable);
-
-    // One of these is the poller's own next task, so wake one fewer peer than
-    // tasks made runnable.
-    //
-    // Every caller of poll() that is a worker returns straight to its run loop
-    // and takes an item — park() falls through to Worker::run's next_local(),
-    // find_work() calls next_local() itself. Counting that one as somebody
-    // else's work means a poll that wakes a single task issues a futex to a
-    // parked worker which arrives, finds the queue already emptied by the
-    // poller, and parks again. Go's findRunnable does the same thing: it pops
-    // one goroutine off the netpoll list to run on the current P and injects
-    // only the remainder.
-    //
-    // The trade is real and worth stating, because it is not free at every
-    // concurrency. Measured against wrk, which is not built on this runtime:
-    //
-    //     1 connection    +14.1%
-    //     8 connections    -2.7%
-    //     64              ~0
-    //     256              +0.8%
-    //     1024            ~0
-    //
-    // The loss at 8 is the flip side of the win at 1. A woken peer is not
-    // wasted when other connections are in flight: it becomes the *next* poller
-    // while this one is busy running its task, which is worth more than the
-    // futex costs. One connection is the only case where there can never be a
-    // next event for it to catch — and also the case where the futex is pure
-    // latency on the critical path of every request.
-    //
-    // The monitor thread also polls, and it is not a worker and will not run
-    // anything, so it still has to wake somebody for every task.
-    const std::uint32_t taken_by_poller = current_worker() != nullptr ? 1u : 0u;
-    sched_.notify_batch(made_runnable > taken_by_poller ? made_runnable - taken_by_poller : 0);
+    CIO_METRIC(poll_wakeups, batch.total);
+    if (batch.unpublished_local_fifo != 0) {
+        sched_.finish_io_batch(batch.unpublished_local_fifo);
+    }
+    polling_.store(false, std::memory_order_release);
     return n;
+}
+
+void Reactor::nudge(std::int64_t deadline_ns) noexcept {
+    if (!polling_.load(std::memory_order_acquire)) return;
+    if (poller_deadline_ns_.load(std::memory_order_acquire) <= deadline_ns) return;
+    wake();
 }
 
 void Reactor::wake() noexcept {

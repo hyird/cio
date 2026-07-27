@@ -21,14 +21,24 @@ namespace detail {
 struct WaitNode {
     WaitNode* next = nullptr;
     std::coroutine_handle<> handle{};
-    Scheduler* sched = nullptr;
+    SchedulerTarget sched;
+    WorkerId preferred_worker = kInvalidWorkerId;
 
     void arm(std::coroutine_handle<> h) noexcept {
         handle = h;
-        sched = current_scheduler();
+        Scheduler* const scheduler = current_scheduler();
+        sched =
+            scheduler == nullptr
+                ? SchedulerTarget{}
+                : scheduler->completion_target();
+        preferred_worker = current_worker_id(scheduler);
     }
     void wake() noexcept {
-        if (sched != nullptr) sched->schedule(handle);
+        SchedulerTarget::dispatch_completion(
+            sched, handle, preferred_worker);
+    }
+    void wake_handoff() noexcept {
+        SchedulerTarget::dispatch_next(sched, handle);
     }
 };
 
@@ -144,12 +154,7 @@ public:
         Mutex* mutex_ = nullptr;
     };
 
-    bool try_lock() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (held_) return false;
-        held_ = true;
-        return true;
-    }
+    bool try_lock() { return try_acquire(); }
 
     // co_await m.lock() -> Guard
     [[nodiscard]] auto lock() noexcept {
@@ -157,11 +162,20 @@ public:
             Mutex* owner;
             detail::WaitNode node{};
 
-            bool await_ready() const noexcept { return false; }
+            bool await_ready() const noexcept {
+                // Once a queue exists, ownership is handed directly between
+                // waiters. Avoid hammering the held_ cache line with a CAS that
+                // cannot succeed until the queue drains.
+                return !owner->has_waiters_.load(std::memory_order_relaxed) &&
+                       owner->try_acquire();
+            }
             bool await_suspend(std::coroutine_handle<> h) {
                 std::lock_guard<std::mutex> lock(owner->mutex_);
-                if (!owner->held_) {
-                    owner->held_ = true;
+                // unlock() clears held_ while holding this same queue lock.
+                // Retrying after taking it closes the race between losing the
+                // lock-free attempt and publishing our waiter.
+                if (!owner->has_waiters_.load(std::memory_order_relaxed) &&
+                    owner->try_acquire()) {
                     return false;
                 }
                 node.arm(h);
@@ -172,6 +186,7 @@ public:
                     owner->head_ = &node;
                 }
                 owner->tail_ = &node;
+                owner->has_waiters_.store(true, std::memory_order_relaxed);
                 return true;
             }
             Guard await_resume() const noexcept { return Guard{owner}; }
@@ -186,18 +201,28 @@ public:
             next = head_;
             if (next != nullptr) {
                 head_ = next->next;
-                if (head_ == nullptr) tail_ = nullptr;
+                if (head_ == nullptr) {
+                    tail_ = nullptr;
+                    has_waiters_.store(false, std::memory_order_relaxed);
+                }
                 // held_ stays true: ownership transfers directly to `next`.
             } else {
-                held_ = false;
+                held_.store(false, std::memory_order_release);
             }
         }
-        if (next != nullptr) next->wake();
+        if (next != nullptr) next->wake_handoff();
     }
 
 private:
+    bool try_acquire() noexcept {
+        bool expected = false;
+        return held_.compare_exchange_strong(expected, true, std::memory_order_acquire,
+                                             std::memory_order_relaxed);
+    }
+
     std::mutex mutex_;
-    bool held_ = false;
+    std::atomic<bool> held_{false};
+    std::atomic<bool> has_waiters_{false};
     detail::WaitNode* head_ = nullptr;
     detail::WaitNode* tail_ = nullptr;
 };

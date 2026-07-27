@@ -37,6 +37,19 @@ namespace detail {
 // silently swallowing it is worse than crashing.
 [[noreturn]] void abort_on_unhandled_exception(std::exception_ptr e) noexcept;
 
+struct TaskPromiseBase;
+
+// Type-erased completion hook used only by spawn(). The pointer to this object
+// shares TaskPromiseBase's continuation slot: a lazy task can have an awaiting
+// continuation or be scheduler-detached with a join completion, never both.
+// Keeping the hook in JoinState avoids enlarging every coroutine frame.
+struct DetachedTaskCompletion {
+    using Callback =
+        void (*)(TaskPromiseBase&, DetachedTaskCompletion&) noexcept;
+
+    Callback callback;
+};
+
 struct TaskPromiseBase {
     // Route every task frame through the per-thread pool. Only the sized delete
     // is declared: the coroutine machinery always knows the frame size, and
@@ -52,7 +65,14 @@ struct TaskPromiseBase {
 
         bool await_ready() noexcept {
             if (promise->detached) {
-                if (promise->exception) abort_on_unhandled_exception(promise->exception);
+                auto* const completion =
+                    static_cast<DetachedTaskCompletion*>(
+                        promise->continuation_or_completion);
+                if (completion != nullptr) {
+                    // The callback may release and destroy its JoinState. Do
+                    // not inspect `completion` again after this call.
+                    completion->callback(*promise, *completion);
+                }
                 // Not suspending here completes the coroutine, which destroys
                 // its own frame. That is exactly what a detached task wants,
                 // and it means go() costs no extra bookkeeping object.
@@ -62,7 +82,10 @@ struct TaskPromiseBase {
         }
 
         std::coroutine_handle<> await_suspend(std::coroutine_handle<>) noexcept {
-            return promise->continuation ? promise->continuation : std::noop_coroutine();
+            return promise->continuation_or_completion
+                       ? std::coroutine_handle<>::from_address(
+                             promise->continuation_or_completion)
+                       : std::noop_coroutine();
         }
 
         void await_resume() noexcept {}
@@ -70,15 +93,37 @@ struct TaskPromiseBase {
 
     std::suspend_always initial_suspend() noexcept { return {}; }
     FinalAwaiter final_suspend() noexcept { return FinalAwaiter{this}; }
-    void unhandled_exception() noexcept { exception = std::current_exception(); }
+    void unhandled_exception() noexcept {
+        exception = std::current_exception();
+        // A spawned task already carries its JoinState completion. A plain
+        // go() task has a null slot on success; install the abort handler only
+        // on its exceptional path so successful detached tasks keep one
+        // final-suspend branch, matching the original fast path.
+        if (detached && continuation_or_completion == nullptr) {
+            continuation_or_completion = &abort_completion;
+        }
+    }
 
     void rethrow_if_failed() {
         if (exception) std::rethrow_exception(exception);
     }
 
-    std::coroutine_handle<> continuation{};
+    // Address of an awaiting coroutine while composed normally, or a
+    // DetachedTaskCompletion while owned by spawn(). See the type comment
+    // above; storing the raw address avoids an inactive-union-member read.
+    void* continuation_or_completion = nullptr;
     std::exception_ptr exception{};
     bool detached = false;
+
+private:
+    static void abort_detached(
+        TaskPromiseBase& promise,
+        DetachedTaskCompletion&) noexcept {
+        abort_on_unhandled_exception(promise.exception);
+    }
+
+    static inline DetachedTaskCompletion abort_completion{
+        &abort_detached};
 };
 
 template <typename T>
@@ -148,7 +193,7 @@ private:
         bool await_ready() const noexcept { return !coro || coro.done(); }
 
         std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting) noexcept {
-            coro.promise().continuation = awaiting;
+            coro.promise().continuation_or_completion = awaiting.address();
             return coro;  // tail-call into the child
         }
 

@@ -18,6 +18,7 @@
 
 #include "cio/clock.hpp"
 #include "cio/config.hpp"
+#include "cio/detail/worker_id.hpp"
 
 namespace cio::detail {
 
@@ -45,6 +46,23 @@ struct Timer {
     // stopped being touched.
     using FireFn = std::coroutine_handle<> (*)(Timer*) noexcept;
 
+    Timer() noexcept = default;
+
+    struct ArmTag {
+        explicit ArmTag() = default;
+    };
+
+    // Lazy sleep awaiters construct the node only when they actually suspend.
+    // arm() overwrites state and shard, so initialize just the fields it reads
+    // plus heap_index, whose sentinel is asserted before insertion.
+    Timer(ArmTag, std::int64_t deadline, std::coroutine_handle<> coroutine,
+          FireFn fire) noexcept
+        : deadline_ns(deadline),
+          waiter(coroutine),
+          on_fire(fire),
+          state(kIdle),
+          heap_index(~0u) {}
+
     std::int64_t deadline_ns = 0;
     std::coroutine_handle<> waiter{};
     FireFn on_fire = nullptr;
@@ -54,6 +72,7 @@ struct Timer {
 
     // Filled in by TimerService::arm().
     std::uint32_t shard = 0;
+    WorkerId preferred_worker = kInvalidWorkerId;
     std::uint32_t heap_index = ~0u;  // position in the shard heap, for O(log n) removal
 };
 
@@ -83,13 +102,16 @@ public:
     // resolution (epoll_pwait2), and rounding every sleep up to a millisecond
     // is a large relative error for short timeouts.
     std::int64_t next_timeout_ns() const noexcept;
+    std::int64_t next_timeout_ns(WorkerId worker) const noexcept;
 
     // Nanoseconds until the earliest deadline, or INT64_MAX if none.
     std::int64_t next_deadline_ns() const noexcept;
+    std::int64_t next_deadline_ns(WorkerId worker) const noexcept;
 
     // Fires every timer whose deadline has passed, scheduling its waiter.
     // Returns the number fired. Safe to call from any thread.
     std::size_t run_expired();
+    std::size_t run_expired(WorkerId worker);
 
     // Fires every armed timer with kCancelled, used during shutdown so parked
     // tasks unwind instead of leaking.

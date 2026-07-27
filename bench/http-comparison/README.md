@@ -3,24 +3,50 @@
 A minimal HTTP/1.1 server on each of the three runtimes, under a load generator
 that none of them is built on.
 
+> Except for the frozen A/B section immediately below, the recorded results and
+> architecture discussion are the pre-runtime-v2 baseline. Current cio uses
+> worker-local reactor shards and directed inboxes; see
+> [the runtime-v2 design](../../docs/scheduler-v2.md).
+
+## Runtime v2 frozen A/B
+
+Seven warmed, alternating A/B pairs pinned the server to CPUs 0-7 and `wrk` to
+8-23. One connection used one `wrk` thread; 64 connections used eight:
+
+| connections | pre-v2 A req/s | retained v2 B req/s | paired geometric B/A | median p50 A/B | median p99 A/B |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 14,209 | 13,870 | -2.39%, neutral | 68/68 us | 112/105 us |
+| 64 | 634,737 | 783,776 | **+23.48%** | 78/63 us | 716/750 us |
+
+The one-connection log-ratio interval was approximately -7.6% to +3.2%, so its
+negative centre is not a confirmed regression. At 64 connections the
+throughput interval was approximately +22.0% to +25.0%; server CPU rose from
+58.41 to 62.78 core-seconds per 8-second window (+7.47%).
+
+Server hashes were
+`1970c98716225a93d66a9b662ece04d0d93629ecd71c5b1c6356c9c7b97bf3e5`
+(A) and
+`c9c978fb4b4c2aae98eecd886825fcf4206b7343f0cdae0a5f09c925189c1adf`
+(B).
+
 ```
 ./run_wrk.sh [connections] [duration_s] [repeats] [threads]
 ```
 
 ## Why this exists
 
-The echo comparison next door has a flaw it names but cannot fix from the
-inside: its load generator is written in cio. That was mitigated by giving the
-generator twice the cores and checking it never saturated, and by using the same
-generator for every server so the bias is common-mode. Both are true and neither
-is sufficient, because a change to cio changes the *generator* too.
+The echo comparison next door uses a load generator written in cio. Its current
+frozen A/B procedure builds that generator once and uses the identical binary
+for both runtime sides in an independently pinned process, so changing the
+server runtime does not change the client during that comparison. The generator
+is still project code rather than a third-party implementation.
 
-That is not hypothetical. The same scheduler change measured **+7.9%** against
-the generator as it was built, and **+50%** after the generator was rebuilt on
-the improved runtime — because the old generator was closer to being the binding
-constraint, and part of the second number is the client getting faster. Neither
-figure is the server on its own, and no amount of care inside that harness can
-separate them.
+The freeze matters. Before that procedure was adopted, the same scheduler
+change measured **+7.9%** against the generator as it was built, and **+50%**
+after the generator was rebuilt on the improved runtime — because the old
+generator was closer to being the binding constraint, and part of the second
+number was the client getting faster. Those two figures were not comparable
+server-only measurements.
 
 `wrk` is a third party. It is not built on any runtime under test, it does not
 change when they do, and it is the same binary for all three. That is the whole
@@ -30,7 +56,7 @@ point of it being here.
 
 | | architecture |
 |---|---|
-| **cio** | work-stealing M:N, one shared reactor, one task per connection |
+| **cio (measured snapshot)** | work-stealing M:N, one shared reactor, one task per connection |
 | **asio** | shared-nothing: one `io_context` + one `SO_REUSEPORT` acceptor per thread, callbacks |
 | **go** | goroutine per connection, `GOMAXPROCS` set to the thread count |
 

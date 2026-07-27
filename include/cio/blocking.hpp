@@ -10,6 +10,7 @@
 
 #include <coroutine>
 #include <exception>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -35,10 +36,17 @@ public:
 
     void await_suspend(std::coroutine_handle<> h) {
         handle_ = h;
-        sched_ = current_scheduler();
+        Scheduler* const scheduler = current_scheduler();
+        if (scheduler == nullptr) {
+            throw std::logic_error(
+                "cio: no runtime is active on this thread");
+        }
+        sched_ =
+            scheduler->completion_target();
+        preferred_worker_ = current_worker_id(scheduler);
         job_.self = this;
         job_.run = &BlockingAwaiter::run_job;
-        sched_->blocking().submit(&job_);
+        scheduler->blocking().submit(&job_);
     }
 
     Result await_resume() {
@@ -64,9 +72,11 @@ private:
         }
         // Read everything we need before scheduling: resuming the task lets it
         // destroy the frame this awaiter lives in.
-        Scheduler* sched = self->sched_;
+        const SchedulerTarget sched = self->sched_;
         const std::coroutine_handle<> handle = self->handle_;
-        if (sched != nullptr) sched->schedule(handle);
+        const WorkerId preferred_worker = self->preferred_worker_;
+        SchedulerTarget::dispatch_completion(
+            sched, handle, preferred_worker);
     }
 
     F fn_;
@@ -74,7 +84,8 @@ private:
     ValueSlot<Result> result_{};
     std::exception_ptr exception_;
     std::coroutine_handle<> handle_{};
-    Scheduler* sched_ = nullptr;
+    SchedulerTarget sched_;
+    WorkerId preferred_worker_ = kInvalidWorkerId;
 };
 
 }  // namespace detail

@@ -23,6 +23,10 @@ struct RuntimeOptions {
     // Ceiling on threads used for blocking work. These are not schedulers; they
     // exist so a blocking call cannot take a worker out of circulation.
     std::size_t max_blocking_threads = 512;
+    // Maximum blocking jobs waiting to start. A full queue rejects new work
+    // with Errc::overloaded instead of retaining coroutine frames without
+    // bound. 0 selects the default limit of 1024.
+    std::size_t max_blocking_queue = 1024;
 };
 
 class Runtime {

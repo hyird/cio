@@ -28,16 +28,29 @@ struct BlockingJob {
     BlockingJob* next = nullptr;
 };
 
+class BlockingPool;
+using BlockingThreadLauncher =
+    bool (*)(BlockingPool*) noexcept;
+
+enum class BlockingSubmitResult {
+    accepted,
+    overloaded,
+    shutdown,
+};
+
 class BlockingPool {
 public:
-    explicit BlockingPool(std::size_t max_threads);
+    explicit BlockingPool(std::size_t max_threads,
+                          std::size_t max_queue = 1024,
+                          BlockingThreadLauncher thread_launcher = nullptr);
     ~BlockingPool();
 
     BlockingPool(const BlockingPool&) = delete;
     BlockingPool& operator=(const BlockingPool&) = delete;
 
-    // Enqueues a job, growing the pool if every thread is busy.
-    void submit(BlockingJob* job);
+    // Enqueues a job, growing the pool when queued demand exceeds idle
+    // capacity. Rejected jobs remain owned by the caller and are never run.
+    BlockingSubmitResult submit(BlockingJob* job);
 
     void shutdown();
 
@@ -46,16 +59,22 @@ public:
     }
 
 private:
+    static bool launch_thread(BlockingPool* pool) noexcept;
+    // mutex_ is held. A successful launcher must start exactly one detached
+    // call to worker_main(); a failed launcher must start none.
+    bool try_spawn_thread_locked() noexcept;
     void worker_main();
-    void spawn_thread();
 
     std::size_t max_threads_;
+    std::size_t max_queue_;
+    BlockingThreadLauncher thread_launcher_;
 
     std::mutex mutex_;
     std::condition_variable cv_;       // work available / stopping
     std::condition_variable exit_cv_;  // a thread retired
     BlockingJob* head_ = nullptr;
     BlockingJob* tail_ = nullptr;
+    std::size_t queued_ = 0;
     std::size_t idle_ = 0;
     bool stopping_ = false;
 

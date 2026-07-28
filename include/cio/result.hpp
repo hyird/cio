@@ -25,6 +25,7 @@ enum class Errc : int {
     shutdown = -4,        // the runtime is shutting down
     would_block = -5,     // only surfaced by try_* APIs
     broken = -6,          // invariant violation in a resource (poisoned mutex, etc.)
+    overloaded = -7,      // a bounded runtime queue has reached its limit
 };
 
 class Error {
@@ -53,6 +54,7 @@ public:
             case Errc::shutdown: return "runtime shutting down";
             case Errc::would_block: return "would block";
             case Errc::broken: return "broken";
+            case Errc::overloaded: return "runtime overloaded";
         }
         return "unknown error";
     }

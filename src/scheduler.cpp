@@ -629,7 +629,8 @@ void Worker::run() {
 // ------------------------------------------------------------- Scheduler ---
 
 Scheduler::Scheduler(std::size_t worker_count,
-                     std::size_t max_blocking_threads) {
+                     std::size_t max_blocking_threads,
+                     std::size_t max_blocking_queue) {
     if (worker_count == 0) {
         worker_count =
             std::max<std::size_t>(1, std::thread::hardware_concurrency());
@@ -653,7 +654,8 @@ Scheduler::Scheduler(std::size_t worker_count,
         std::make_unique<AtomicWorkerBitmap>(worker_count);
 
     timers_ = std::make_unique<TimerService>(*this, worker_count);
-    blocking_ = std::make_unique<BlockingPool>(max_blocking_threads);
+    blocking_ = std::make_unique<BlockingPool>(
+        max_blocking_threads, max_blocking_queue);
     for (auto& worker : workers_) {
         worker->reactor_ =
             std::make_unique<Reactor>(*this, worker->index_);

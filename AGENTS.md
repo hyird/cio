@@ -157,6 +157,8 @@ Timer disarm is unconditional. Even when a node no longer appears armed,
 Performance claims require reproducible evidence:
 
 - Build Release binaries from frozen source states.
+- Map each binary to one explicit clean source revision; a byte-reproducible
+  hybrid of intermediate source states is still only diagnostic evidence.
 - Record and verify SHA-256 for both server/runtime binaries and the load
   generator before and after the run.
 - Pin server and client to disjoint CPU sets.
@@ -165,6 +167,8 @@ Performance claims require reproducible evidence:
 - Report raw samples, paired geometric deltas, latency, server CPU and errors.
 - Reject a pair if either side has socket errors, non-2xx responses, an early
   server exit or a changed input hash.
+- Treat a client-saturation warning as a capacity screen, not publishable
+  evidence; add `wrk` threads or client CPUs and rerun the complete matrix.
 - Treat order-dependent screens as noise until a longer confirmation reproduces
   them.
 
@@ -173,7 +177,7 @@ HTTP comparisons use third-party `wrk`:
 ```sh
 python3 bench/http-comparison/matrix_wrk.py \
   path/to/baseline path/to/candidate \
-  --cells 1:1,8:2,64:8,256:8,1024:8 \
+  --cells 1:1,8:4,64:16,256:16,1024:16 \
   --pairs 10 --warmup 5 --duration 15
 ```
 

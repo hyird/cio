@@ -703,31 +703,55 @@ Positive ns/op deltas below mean B is slower:
   mutex screens were likewise direction-dependent rather than confirmed
   regressions.
 
-The balanced final network confirmation used separately pinned server and
-load-generator processes and seven alternating pairs. Echo kept the same
+The final network evidence used separately pinned server and load-generator
+processes. Echo retained its seven alternating pairs and kept the same
 cio-based load-generator binary
 (`3752a0f3cb67ef7da0fc7fc4ac62fb730c818ceebd43b16c814ca770310b9ba7`)
-frozen across both sides; HTTP used third-party `wrk`:
+frozen across both sides. HTTP used third-party `wrk`, ten pairs per cell,
+five AB and five BA, with a 5-second warm-up and 15-second measured window:
 
-| workload | A mean req/s | B mean req/s | paired geometric B/A | median p50 A/B | median p99 A/B |
+| workload | A mean req/s | B mean req/s | paired geometric B/A (95% CI) | median p50 A/B | median p99 A/B |
 |---|---:|---:|---:|---:|---:|
-| echo, 1024 connections, 128 B | 725,717 | 779,580 | **+7.43%** | 1351/1121 us | 3072/3968 us |
-| HTTP, 1 connection | 14,209 | 13,870 | -2.39%, neutral | 68/68 us | 112/105 us |
-| HTTP, 64 connections | 634,737 | 783,776 | **+23.48%** | 78/63 us | 716/750 us |
+| echo, 1024 connections, 128 B | 725,717 | 779,580 | **+7.43%** (about +5.1% to +9.9%) | 1351/1121 us | 3072/3968 us |
+| HTTP, 1 connection, `wrk -t1` | 14,242 | 14,339 | +0.67% (-3.88% to +5.42%), neutral | 67/68 us | 109.5/110 us |
+| HTTP, 8 connections, `wrk -t4` | 80,645 | 125,598 | **+56.00%** (+49.52% to +62.77%) | 92/52 us | 147/644 us |
+| HTTP, 64 connections, `wrk -t16` | 729,546 | 789,141 | **+8.16%** (+6.84% to +9.50%) | 76/70 us | 518/501 us |
+| HTTP, 256 connections, `wrk -t16` | 773,023 | 771,416 | -0.22% (-1.63% to +1.21%), neutral | 303.5/306 us | 915/2765 us |
+| HTTP, 1024 connections, `wrk -t16` | 714,915 | 781,518 | **+9.34%** (+7.22% to +11.49%) | 1355/1125 us | 3900/4635 us |
 
-The one-connection HTTP log-ratio interval was approximately -7.6% to +3.2%,
-so its small negative centre is not a confirmed regression. Echo's interval
-was approximately +5.1% to +9.9%, and HTTP c64's +22.0% to +25.0%.
+The HTTP intervals are per-cell unadjusted paired log-ratio Student-t
+intervals. All 100 measured HTTP sides had zero socket and HTTP errors, the
+servers stayed live, and the A, B and `wrk` hashes were unchanged at the end.
+The AB/BA splits agreed in direction for c8, c64 and c1024.
 
-Saturation still has an efficiency/tail trade-off. Echo server CPU rose from
-61.57 to 63.10 core-seconds per measured window (+2.48%) and its median p99
-rose by 896 us. HTTP c64 server CPU rose from 58.41 to 62.78 core-seconds
-(+7.47%) and median p99 rose by 34 us, while median p50 improved by 19%.
+The first complete HTTP matrix used `wrk -t2` at c8 and `-t8` at c64/c256/c1024.
+It passed correctness gates but reached at least 95% of configured client-thread
+capacity. That screen is not release evidence, and none of its numbers is
+combined with the clean-source confirmation above.
+
+The warning-free matrix still shows workload-specific efficiency/tail
+trade-offs. HTTP c64 server use was 7.89/7.97 cores and both p50 and p99
+improved. At c8, server use was only 2.64/2.75 cores but B's median p99 was
+4.38 times A. C256 was throughput-neutral with nearly identical server CPU,
+while B's median p99 was 3.02 times A. C1024 improved throughput and p50 but
+raised p99 by about 19%. Echo server CPU rose from 61.57 to 63.10
+core-seconds per measured window (+2.48%) and its median p99 rose by 896 us.
 Results therefore include latency and CPU rather than treating throughput
-alone as the gate. The exact retained network binaries were:
+alone as the gate.
 
-- echo: `3916905609c9807dead082bb83fddb109e034c8056304be0007fec1496405d7e`;
-- HTTP: `c9c978fb4b4c2aae98eecd886825fcf4206b7343f0cdae0a5f09c925189c1adf`.
+The exact HTTP hashes were
+`5650865ce18c6d029fbd0546b0ee9a6d7758da5087038f8f8db15664f78750e8`
+(A),
+`c9c978fb4b4c2aae98eecd886825fcf4206b7343f0cdae0a5f09c925189c1adf`
+(B), and
+`3722bf8b31651d8b029b4856af9239dfb491ca93e92447368a4e183e8863b588`
+(`wrk`). A was built from clean commit `899ccad`; independent clean builds
+reproduced its static-library hash. B rebuilds byte-for-byte from clean retained
+commit `5e0208b`. A previous byte-reproducible hybrid A combined a dirty 09:45
+library with 09:57 headers and was rejected because it did not map to one clean
+source revision. None of that historical matrix's values is used here. The
+exact retained echo B binary was
+`3916905609c9807dead082bb83fddb109e034c8056304be0007fec1496405d7e`.
 
 The final source passes all ten Release tests, all ten ASan/UBSan tests, and all
 ten TSan tests. The TSan build retains the benchmark-only mismatched-allocation

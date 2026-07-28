@@ -8,26 +8,68 @@ that none of them is built on.
 > worker-local reactor shards and directed inboxes; see
 > [the runtime-v2 design](../../docs/scheduler-v2.md).
 
-## Runtime v2 frozen A/B
+## Runtime v2 frozen A/B matrix
 
-Seven warmed, alternating A/B pairs pinned the server to CPUs 0-7 and `wrk` to
-8-23. One connection used one `wrk` thread; 64 connections used eight:
+The publishable confirmation compared a clean build of pre-v2 commit `899ccad`
+with a clean build of retained-v2 commit `5e0208b`. It used ten warmed, paired
+runs per cell, five in AB order and five in BA order. The server used eight
+workers pinned to CPUs 0-7; the same third-party `wrk` binary was pinned to
+CPUs 8-23. Each side had a 5-second warm-up and a separate 15-second measured
+window.
 
-| connections | pre-v2 A req/s | retained v2 B req/s | paired geometric B/A | median p50 A/B | median p99 A/B |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 14,209 | 13,870 | -2.39%, neutral | 68/68 us | 112/105 us |
-| 64 | 634,737 | 783,776 | **+23.48%** | 78/63 us | 716/750 us |
+| connections | wrk threads | pre-v2 A req/s | retained v2 B req/s | paired geometric B/A (95% CI) | median p50 A/B | median p99 A/B | server cores A/B |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 14,242 | 14,339 | +0.67% (-3.88% to +5.42%), neutral | 67/68 us | 109.5/110 us | 0.37/0.37 |
+| 8 | 4 | 80,645 | 125,598 | **+56.00%** (+49.52% to +62.77%) | 92/52 us | 147/644 us | 2.64/2.75 |
+| 64 | 16 | 729,546 | 789,141 | **+8.16%** (+6.84% to +9.50%) | 76/70 us | 518/501 us | 7.89/7.97 |
+| 256 | 16 | 773,023 | 771,416 | -0.22% (-1.63% to +1.21%), neutral | 303.5/306 us | 915/2765 us | 7.91/7.92 |
+| 1024 | 16 | 714,915 | 781,518 | **+9.34%** (+7.22% to +11.49%) | 1355/1125 us | 3900/4635 us | 7.64/7.90 |
 
-The one-connection log-ratio interval was approximately -7.6% to +3.2%, so its
-negative centre is not a confirmed regression. At 64 connections the
-throughput interval was approximately +22.0% to +25.0%; server CPU rose from
-58.41 to 62.78 core-seconds per 8-second window (+7.47%).
+Positive B/A throughput means B is faster. The intervals are per-cell paired
+log-ratio Student-t intervals and are not adjusted for cross-cell claims.
+Every one of the 100 measured sides had zero socket errors, zero non-2xx
+responses, a successful `wrk` exit and a live server. Input hashes were
+unchanged at the end.
 
-Server hashes were
-`1970c98716225a93d66a9b662ece04d0d93629ecd71c5b1c6356c9c7b97bf3e5`
-(A) and
+The result is not a single throughput headline. At eight connections B gains
+throughput and median latency, but its median p99 is 4.38 times A. At 64
+connections throughput and both reported latency percentiles improve. At 256
+connections throughput is neutral while median p99 is 3.02 times A. At 1024
+connections B gains 9.34% and lowers p50, but median p99 rises by about 19%.
+
+This is a gate for the complete retained runtime-v2 build, not an estimate of
+the MPSC inbox's isolated causal effect: A and B differ in more than that one
+component. An MPSC-only claim requires the same matrix over two otherwise
+identical frozen builds.
+
+An earlier complete screen used two `wrk` threads at c8 and eight at the three
+larger cells. It passed correctness gates but reached at least 95% of the
+configured client-thread capacity, so it is not the published result.
+No number from that screen is combined with the clean-source confirmation.
+A load-generator saturation warning makes a run a capacity screen, not release
+evidence.
+
+The exact executable hashes were
+`5650865ce18c6d029fbd0546b0ee9a6d7758da5087038f8f8db15664f78750e8`
+(A),
 `c9c978fb4b4c2aae98eecd886825fcf4206b7343f0cdae0a5f09c925189c1adf`
-(B).
+(B), and
+`3722bf8b31651d8b029b4856af9239dfb491ca93e92447368a4e183e8863b588`
+(`wrk`).
+
+A's static library hash is
+`d58b29801a3691af204652208c6a1397edefa2ec81eb4c3aff0693d8923e5570`;
+B's is
+`6a27bb4da89479c1718b220d5df954d8dbef3fc952926e7d51eafdf33a2ae8f9`.
+Independent clean builds reproduced the A library, and a clean B rebuild
+reproduced both retained B hashes.
+
+An earlier matrix used A executable
+`1970c98716225a93d66a9b662ece04d0d93629ecd71c5b1c6356c9c7b97bf3e5`,
+which was itself byte-reproducible but combined a dirty 09:45 UTC library with
+the 09:57 header state. The provenance audit rejected it because it did not
+correspond to one clean frozen source revision. It is retained only as a
+historical diagnostic; none of its values appears in the table above.
 
 ## Frozen A/B matrix runner
 
@@ -39,7 +81,7 @@ cell order, and pins the server and client to disjoint CPU sets.
 ```sh
 python3 matrix_wrk.py \
   path/to/pre-v2-server path/to/candidate-server \
-  --cells 1:1,8:2,64:8,256:8,1024:8 \
+  --cells 1:1,8:4,64:16,256:16,1024:16 \
   --pairs 10 --warmup 5 --duration 15 \
   --expected-a-sha256 <sha256> \
   --expected-b-sha256 <sha256> \
@@ -52,6 +94,17 @@ CSV, summaries and per-side logs. An interrupted or incomplete pair makes the
 matrix invalid rather than silently reducing the sample count. Default outputs
 go under `results/`, which is intentionally ignored; publish only a reviewed
 result set with its manifest and exact source revisions.
+
+The manifest's `publication_ready` field is the measurement-quality gate:
+correctness, completeness, stable hashes and sufficient client capacity. It
+cannot prove how an input binary was built, so release evidence additionally
+requires the clean source revisions and build-artifact hashes recorded above.
+
+Do not publish a cell carrying the client-saturation warning. Increase its
+`wrk` thread count or client CPU capacity and rerun the complete paired matrix;
+the warning-free confirmation, not the saturated screen, is the result. The
+runner records `publication_ready: false` and exits nonzero when this capacity
+gate fails, even if all correctness pairs are otherwise valid.
 
 For a quick three-runtime comparison using locally built `cio`, Asio and Go
 servers:

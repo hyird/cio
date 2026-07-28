@@ -9,53 +9,67 @@ namespace {
 constexpr auto kIdleKeepAlive = std::chrono::seconds(10);
 }
 
-BlockingPool::BlockingPool(std::size_t max_threads)
-    : max_threads_(max_threads == 0 ? 512 : max_threads) {}
+BlockingPool::BlockingPool(std::size_t max_threads,
+                           std::size_t max_queue,
+                           BlockingThreadLauncher thread_launcher)
+    : max_threads_(max_threads == 0 ? 512 : max_threads),
+      max_queue_(max_queue == 0 ? 1024 : max_queue),
+      thread_launcher_(thread_launcher == nullptr
+                           ? &BlockingPool::launch_thread
+                           : thread_launcher) {}
 
 BlockingPool::~BlockingPool() { shutdown(); }
 
-void BlockingPool::submit(BlockingJob* job) {
-    bool need_thread = false;
-    bool run_inline = false;
+BlockingSubmitResult BlockingPool::submit(BlockingJob* job) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (stopping_) {
-            // The runtime is going away. Running inline costs the caller
-            // latency; leaving the job unrun would hang whatever awaits it.
-            run_inline = true;
-        } else {
-            job->next = nullptr;
-            if (tail_ != nullptr) {
-                tail_->next = job;
-                tail_ = job;
-            } else {
-                head_ = tail_ = job;
-            }
-            // Grow only when there is genuinely nobody to pick this up.
-            need_thread = idle_ == 0 && threads_.load(std::memory_order_relaxed) < max_threads_;
+        if (stopping_) return BlockingSubmitResult::shutdown;
+        if (queued_ >= max_queue_) {
+            return BlockingSubmitResult::overloaded;
         }
+
+        // Provision before publishing the intrusive node. The new worker
+        // cannot enter worker_main() until this lock is released. If no
+        // existing worker can eventually service the queue and creation
+        // fails, rejection leaves the caller's coroutine frame unretained.
+        const bool need_thread =
+            queued_ + 1 > idle_ &&
+            threads_.load(std::memory_order_relaxed) < max_threads_;
+        if (need_thread &&
+            !try_spawn_thread_locked() &&
+            threads_.load(std::memory_order_relaxed) == 0) {
+            return BlockingSubmitResult::overloaded;
+        }
+
+        job->next = nullptr;
+        if (tail_ != nullptr) {
+            tail_->next = job;
+            tail_ = job;
+        } else {
+            head_ = tail_ = job;
+        }
+        ++queued_;
     }
-    if (run_inline) {
-        job->run(job);
-        return;
-    }
-    if (need_thread) spawn_thread();
     cv_.notify_one();
+    return BlockingSubmitResult::accepted;
 }
 
-void BlockingPool::spawn_thread() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (stopping_ || threads_.load(std::memory_order_relaxed) >= max_threads_) return;
-        threads_.fetch_add(1, std::memory_order_relaxed);
-    }
+bool BlockingPool::launch_thread(BlockingPool* pool) noexcept {
     try {
-        std::thread([this] { worker_main(); }).detach();
+        std::thread([pool] { pool->worker_main(); }).detach();
+        return true;
     } catch (...) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        threads_.fetch_sub(1, std::memory_order_relaxed);
-        exit_cv_.notify_all();
+        return false;
     }
+}
+
+bool BlockingPool::try_spawn_thread_locked() noexcept {
+    threads_.fetch_add(1, std::memory_order_relaxed);
+    if (thread_launcher_(this)) return true;
+
+    threads_.fetch_sub(1, std::memory_order_relaxed);
+    exit_cv_.notify_all();
+    return false;
 }
 
 void BlockingPool::worker_main() {
@@ -81,6 +95,7 @@ void BlockingPool::worker_main() {
         BlockingJob* job = head_;
         head_ = job->next;
         if (head_ == nullptr) tail_ = nullptr;
+        --queued_;
 
         lock.unlock();
         // run() executes the user callable, stores the result into the awaiter,

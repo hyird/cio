@@ -10,7 +10,8 @@ namespace cio {
 
 Runtime::Runtime(RuntimeOptions options)
     : sched_(std::make_shared<detail::Scheduler>(
-          options.worker_threads, options.max_blocking_threads)) {
+          options.worker_threads, options.max_blocking_threads,
+          options.max_blocking_queue)) {
     detail::set_default_scheduler(sched_.get());
     sched_->start();
 }

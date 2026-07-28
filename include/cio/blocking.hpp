@@ -16,6 +16,7 @@
 
 #include "cio/detail/blocking_pool.hpp"
 #include "cio/detail/scheduler.hpp"
+#include "cio/result.hpp"
 #include "cio/task.hpp"
 
 namespace cio {
@@ -46,7 +47,15 @@ public:
         preferred_worker_ = current_worker_id(scheduler);
         job_.self = this;
         job_.run = &BlockingAwaiter::run_job;
-        scheduler->blocking().submit(&job_);
+        switch (scheduler->blocking().submit(&job_)) {
+            case BlockingSubmitResult::accepted:
+                return;
+            case BlockingSubmitResult::overloaded:
+                throw SystemError{Error{Errc::overloaded}};
+            case BlockingSubmitResult::shutdown:
+                throw SystemError{Error{Errc::shutdown}};
+        }
+        throw std::logic_error("cio: invalid blocking submission result");
     }
 
     Result await_resume() {

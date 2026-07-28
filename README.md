@@ -114,6 +114,13 @@ Receiving from a closed and drained channel returns `std::nullopt`. Sending to a
 closed channel returns `false`. `select` returns the winning case index and case
 values remain available through `selected.get<I>()`.
 
+`cio::blocking(fn)` uses a lazily grown thread pool. `RuntimeOptions` bounds
+both its worker count (`max_blocking_threads`, default 512) and its FIFO wait
+queue (`max_blocking_queue`, default 1024). A submission to a full queue throws
+`cio::SystemError` carrying `Errc::overloaded`. The same error is returned if
+the pool has no service thread and the operating system refuses to create its
+first one; a rejected callable is never run.
+
 ## Runtime architecture
 
 Each runtime worker owns:
@@ -186,7 +193,7 @@ input SHA-256 checks, error rejection and retained raw logs:
 ```sh
 python3 bench/http-comparison/matrix_wrk.py \
   path/to/baseline-server path/to/candidate-server \
-  --cells 1:1,8:2,64:8,256:8,1024:8 \
+  --cells 1:1,8:4,64:16,256:16,1024:16 \
   --pairs 10 --warmup 5 --duration 15
 ```
 
@@ -195,22 +202,29 @@ their hashes and the `wrk` hash with every result.
 
 ### Runtime v2 frozen result
 
-The retained v2 runtime was compared with the exact pre-v2 baseline using
-warmed, pinned and alternating pairs:
+The retained v2 runtime at clean commit `5e0208b` was compared with a clean
+build of pre-v2 commit `899ccad` using warmed, pinned and alternating pairs.
+HTTP used ten pairs per cell and a client thread count that did not trigger the
+`wrk` saturation warning:
 
 | Workload | Pre-v2 | Runtime v2 | Paired result |
 |---|---:|---:|---:|
-| HTTP/`wrk`, 1 connection | 14,209 req/s | 13,870 req/s | -2.39%, neutral |
-| HTTP/`wrk`, 64 connections | 634,737 req/s | 783,776 req/s | **+23.48%** |
+| HTTP/`wrk`, 1 connection | 14,242 req/s | 14,339 req/s | +0.67%, neutral |
+| HTTP/`wrk`, 8 connections | 80,645 req/s | 125,598 req/s | **+56.00%** |
+| HTTP/`wrk`, 64 connections | 729,546 req/s | 789,141 req/s | **+8.16%** |
+| HTTP/`wrk`, 256 connections | 773,023 req/s | 771,416 req/s | -0.22%, neutral |
+| HTTP/`wrk`, 1024 connections | 714,915 req/s | 781,518 req/s | **+9.34%** |
 | Echo, 1024 connections, 128 B | 725,717 req/s | 779,580 req/s | **+7.43%** |
 | `spawn()` + join, 8 workers | — | — | **16.86% faster** |
 | `spawn()` + join, 24 workers | — | — | **19.76% faster** |
 | Unbuffered channel, 24 workers | — | — | neutral, B/A ns/op +0.095% |
 
 Detached `go()` remained 6.52% slower at 8 workers and 6.71% slower at 24.
-Saturated network throughput also traded some CPU and p99 latency for higher
-capacity. These costs are part of the release record rather than being hidden
-behind headline throughput.
+HTTP c8 traded its gain for a 4.38-times median p99, c256 was throughput-neutral
+with a 3.02-times median p99, and c1024 improved p50 while raising p99 by about
+19%. These costs are part of the release record rather than being hidden behind
+headline throughput. Full intervals, CPU data, hashes and methodology are in
+[the HTTP comparison](bench/http-comparison/README.md).
 
 An older pre-v2 `wrk` comparison against Go is retained only as historical
 context:
@@ -238,6 +252,8 @@ when instrumentation is disabled.
 - Linux/epoll only; no kqueue, IOCP or io_uring backend is claimed.
 - Scheduling is cooperative. A task that never suspends holds its worker.
 - Cancellation is cooperative and is observed only where the task checks it.
+- A blocking callable that has started cannot be preempted. Runtime shutdown
+  waits for started and already-queued blocking work to finish.
 - Runtime shutdown does not unwind tasks still parked on channels or sockets.
   Calling `Runtime::shutdown()` from one of its own workers throws
   `std::logic_error`.

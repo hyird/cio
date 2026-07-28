@@ -48,6 +48,8 @@ static_assert(std::same_as<decltype(cio::RuntimeOptions::worker_threads),
                            std::size_t>);
 static_assert(std::same_as<decltype(cio::RuntimeOptions::max_blocking_threads),
                            std::size_t>);
+static_assert(std::same_as<decltype(cio::RuntimeOptions::max_blocking_queue),
+                           std::size_t>);
 static_assert(std::is_constructible_v<cio::Runtime, cio::RuntimeOptions>);
 static_assert(!std::is_copy_constructible_v<cio::Runtime>);
 static_assert(!std::is_copy_assignable_v<cio::Runtime>);
@@ -413,6 +415,7 @@ void test_task_laziness_and_runtime_options() {
     cio::RuntimeOptions defaults;
     CIO_CHECK_EQ(defaults.worker_threads, std::size_t{0});
     CIO_CHECK_EQ(defaults.max_blocking_threads, std::size_t{512});
+    CIO_CHECK_EQ(defaults.max_blocking_queue, std::size_t{1024});
 
     bool started = false;
     auto task = lazy_value(&started, 42);
@@ -423,6 +426,7 @@ void test_task_laziness_and_runtime_options() {
     cio::RuntimeOptions options;
     options.worker_threads = 1;
     options.max_blocking_threads = 2;
+    options.max_blocking_queue = 8;
     CIO_CHECK_EQ(cio::run(std::move(task), options), 42);
     CIO_CHECK(started);
 }
@@ -471,6 +475,10 @@ void test_net_and_result_construction() {
     CIO_CHECK(!error.has_value());
     CIO_CHECK(error.error().is(cio::Errc::closed));
     CIO_CHECK_EQ(error.value_or(3), 3);
+
+    const cio::Error overloaded = cio::Errc::overloaded;
+    CIO_CHECK(overloaded.is(cio::Errc::overloaded));
+    CIO_CHECK_EQ(overloaded.message(), std::string{"runtime overloaded"});
 
     const cio::Result<void> success = cio::ok();
     CIO_CHECK(success.has_value());

@@ -122,7 +122,8 @@ public:
     using IoCompletionRoute =
         ::cio::detail::IoCompletionRoute;
 
-    Scheduler(std::size_t worker_count, std::size_t max_blocking_threads);
+    Scheduler(std::size_t worker_count, std::size_t max_blocking_threads,
+              std::size_t max_blocking_queue = 1024);
     ~Scheduler();
 
     Scheduler(const Scheduler&) = delete;

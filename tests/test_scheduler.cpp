@@ -836,6 +836,130 @@ void test_foreign_submission_escapes_arbitrary_busy_worker() {
     CIO_CHECK(done.load(std::memory_order_acquire));
 }
 
+cio::Task<int> gated_blocking_job(
+    std::atomic<bool>* started, std::atomic<bool>* release) {
+    co_return co_await cio::blocking([started, release] {
+        started->store(true, std::memory_order_release);
+        const auto deadline = cio::Clock::now() + 2s;
+        while (!release->load(std::memory_order_acquire) &&
+               cio::Clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        return 1;
+    });
+}
+
+cio::Task<int> observable_blocking_job(
+    std::atomic<bool>* executed) {
+    co_return co_await cio::blocking([executed] {
+        executed->store(true, std::memory_order_release);
+        return 2;
+    });
+}
+
+cio::Task<bool> exercise_blocking_queue_limit() {
+    std::atomic<bool> first_started{false};
+    std::atomic<bool> release_first{false};
+    std::atomic<bool> second_executed{false};
+    std::atomic<bool> rejected_callable_executed{false};
+
+    auto first = cio::spawn(
+        gated_blocking_job(&first_started, &release_first));
+
+    const auto start_deadline = cio::Clock::now() + 1s;
+    while (!first_started.load(std::memory_order_acquire) &&
+           cio::Clock::now() < start_deadline) {
+        co_await cio::yield();
+    }
+    if (!first_started.load(std::memory_order_acquire)) {
+        release_first.store(true, std::memory_order_release);
+        (void)co_await first;
+        co_return false;
+    }
+
+    auto second = cio::spawn(
+        observable_blocking_job(&second_executed));
+
+    // yield() returns behind the newly spawned task, so its blocking job is
+    // deterministically queued behind `first` before the third submission.
+    co_await cio::yield();
+
+    bool overloaded = false;
+    try {
+        (void)co_await cio::blocking([&] {
+            rejected_callable_executed.store(
+                true, std::memory_order_release);
+            return 3;
+        });
+    } catch (const cio::SystemError& error) {
+        overloaded = error.error().is(cio::Errc::overloaded);
+    }
+
+    const bool second_was_queued =
+        !second_executed.load(std::memory_order_acquire);
+    release_first.store(true, std::memory_order_release);
+    const int first_value = co_await first;
+    const int second_value = co_await second;
+
+    co_return overloaded && second_was_queued &&
+              !rejected_callable_executed.load(std::memory_order_acquire) &&
+              first_value == 1 && second_value == 2;
+}
+
+void test_blocking_queue_rejects_overload() {
+    cio::RuntimeOptions options;
+    options.worker_threads = 1;
+    options.max_blocking_threads = 1;
+    options.max_blocking_queue = 1;
+    cio::Runtime runtime(options);
+    CIO_CHECK(runtime.block_on(exercise_blocking_queue_limit()));
+}
+
+struct BlockingRunProbe : cio::detail::BlockingJob {
+    std::atomic<bool>* executed = nullptr;
+};
+
+void run_blocking_probe(cio::detail::BlockingJob* base) noexcept {
+    auto* probe = static_cast<BlockingRunProbe*>(base);
+    probe->executed->store(true, std::memory_order_release);
+}
+
+bool reject_blocking_thread_launch(
+    cio::detail::BlockingPool*) noexcept {
+    return false;
+}
+
+void test_blocking_pool_rejects_failed_first_thread_launch() {
+    cio::detail::BlockingPool pool(
+        1, 1, &reject_blocking_thread_launch);
+
+    std::atomic<bool> executed{false};
+    BlockingRunProbe probe;
+    probe.run = &run_blocking_probe;
+    probe.executed = &executed;
+
+    const auto result = pool.submit(&probe);
+    CIO_CHECK(result ==
+              cio::detail::BlockingSubmitResult::overloaded);
+    CIO_CHECK_EQ(pool.thread_count(), std::size_t{0});
+    CIO_CHECK(!executed.load(std::memory_order_acquire));
+}
+
+void test_stopped_blocking_pool_rejects_without_running_inline() {
+    cio::detail::BlockingPool pool(1, 1);
+    pool.shutdown();
+
+    std::atomic<bool> executed{false};
+    BlockingRunProbe probe;
+    probe.run = &run_blocking_probe;
+    probe.executed = &executed;
+
+    const auto result = pool.submit(&probe);
+    CIO_CHECK(result ==
+              cio::detail::BlockingSubmitResult::shutdown);
+    CIO_CHECK(!executed.load(std::memory_order_acquire));
+}
+
 cio::Task<> blocking_completion_waiter(
     cio::detail::Scheduler* scheduler,
     std::atomic<bool>* job_started,
@@ -1985,6 +2109,9 @@ int main() {
     RUN_TEST(test_foreign_poller_preserves_directed_wake_for_owner);
     RUN_TEST(test_same_runtime_io_completion_follows_active_poller);
     RUN_TEST(test_foreign_submission_escapes_arbitrary_busy_worker);
+    RUN_TEST(test_blocking_queue_rejects_overload);
+    RUN_TEST(test_blocking_pool_rejects_failed_first_thread_launch);
+    RUN_TEST(test_stopped_blocking_pool_rejects_without_running_inline);
     RUN_TEST(test_foreign_blocking_completion_escapes_busy_preference);
     RUN_TEST(test_cross_runtime_join_completion_escapes_busy_preference);
     RUN_TEST(test_foreign_wait_group_wake_escapes_busy_preference);

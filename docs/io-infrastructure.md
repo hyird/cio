@@ -378,10 +378,18 @@ executor. Built-in classes have independent asynchronous admission limits:
 struct RuntimeOptions {
     std::size_t worker_threads = 0;
     std::size_t max_blocking_threads = 512;
+    std::size_t max_blocking_queue = 1024;
     std::size_t max_file_operations = 32;
     std::size_t max_resolver_operations = 8;
 };
 ```
+
+The shared executor FIFO has a hard global bound. If it is full, a generic
+`cio::blocking()` submission fails with `Errc::overloaded`; built-in fallible
+I/O operations return the same error through their `Result`. This bound
+protects coroutine-frame memory during a sustained overload. Per-class
+admission below that global bound remains an additive facility for File and
+resolver APIs.
 
 The last two values limit admitted operations, not threads. A task waiting for
 admission is parked without consuming an executor thread. Class-aware wait

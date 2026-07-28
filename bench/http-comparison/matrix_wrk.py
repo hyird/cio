@@ -35,7 +35,7 @@ from typing import Any
 HERE = pathlib.Path(__file__).resolve().parent
 DEFAULT_A = HERE / "build" / "cio_http_v2_baseline"
 DEFAULT_B = HERE / "build" / "cio_http_v2_spawn_direct_final"
-DEFAULT_CELLS = "1:1,8:2,64:8,256:8,1024:8"
+DEFAULT_CELLS = "1:1,8:4,64:16,256:16,1024:16"
 T95 = {
     1: 12.706,
     2: 4.303,
@@ -681,7 +681,7 @@ def summarize(
     *,
     interrupted: bool,
     hashes_unchanged: bool,
-) -> tuple[list[dict[str, Any]], int, bool]:
+) -> tuple[list[dict[str, Any]], int, bool, list[str]]:
     summaries: list[dict[str, Any]] = []
     invalid_pairs = 0
     for cell in cells:
@@ -809,10 +809,20 @@ def summarize(
             for summary in summaries
         )
     )
-    if matrix_valid:
+    saturated = [
+        f"c{summary['connections']}/t{summary['wrk_threads']}"
+        for summary in summaries
+        if summary.get("client_saturation_warning")
+    ]
+    if matrix_valid and not saturated:
         status = (
-            f"**Status: VALID.** All {expected_pairs * len(cells)} expected "
-            "pairs passed."
+            f"**Status: VALID AND PUBLICATION-READY.** All "
+            f"{expected_pairs * len(cells)} expected pairs passed."
+        )
+    elif matrix_valid:
+        status = (
+            "**Status: VALID BUT NOT PUBLICATION-READY.** All expected pairs "
+            "passed, but the client-capacity gate failed."
         )
     else:
         status = (
@@ -864,11 +874,6 @@ def summarize(
             "",
         ]
     )
-    saturated = [
-        f"c{summary['connections']}/t{summary['wrk_threads']}"
-        for summary in summaries
-        if summary.get("client_saturation_warning")
-    ]
     if saturated:
         lines.extend(
             [
@@ -878,7 +883,7 @@ def summarize(
             ]
         )
     (output_directory / "summary.md").write_text("\n".join(lines))
-    return summaries, invalid_pairs, matrix_valid
+    return summaries, invalid_pairs, matrix_valid, saturated
 
 
 def environment_snapshot() -> dict[str, Any]:
@@ -1162,7 +1167,7 @@ def main(argv: Sequence[str]) -> int:
         end_hashes = {}
         print(f"matrix invalid: cannot re-hash inputs: {error}", file=sys.stderr)
     hashes_unchanged = end_hashes == hashes
-    summaries, invalid_pairs, matrix_valid = summarize(
+    summaries, invalid_pairs, matrix_valid, saturated = summarize(
         cells,
         results,
         args.pairs,
@@ -1175,15 +1180,19 @@ def main(argv: Sequence[str]) -> int:
     manifest["interrupted"] = interrupted
     manifest["completed_runs"] = len(results)
     manifest["invalid_pairs"] = invalid_pairs
+    manifest["hashes_unchanged"] = hashes_unchanged
     manifest["matrix_valid"] = matrix_valid
+    manifest["client_saturation_cells"] = saturated
+    manifest["publication_ready"] = matrix_valid and not saturated
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
     print()
     print((output_directory / "summary.md").read_text(), end="")
-    if not matrix_valid:
+    if not manifest["publication_ready"]:
         print(
-            f"matrix invalid: interrupted={interrupted}, "
-            f"invalid_pairs={invalid_pairs}, hashes_unchanged={hashes_unchanged}",
+            f"matrix not publication-ready: interrupted={interrupted}, "
+            f"invalid_pairs={invalid_pairs}, hashes_unchanged={hashes_unchanged}, "
+            f"client_saturation_cells={saturated}",
             file=sys.stderr,
         )
         return 1

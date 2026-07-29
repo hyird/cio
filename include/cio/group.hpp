@@ -22,6 +22,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <vector>
 #include <utility>
 
 #include "cio/chan.hpp"
@@ -33,12 +34,60 @@ namespace cio {
 
 namespace detail {
 
+struct CancelAccess;
+
+// Something to run when cancellation fires, for waiters that cannot select on
+// a channel. A parked socket read is the motivating case: the flag alone gates
+// the next syscall, but an operation already blocked in epoll has to be woken.
+//
+// Hooks are shared-owned so a hook outlives the object that registered it; a
+// detached hook goes inert rather than being unlinked from under a firing
+// cancel.
+struct CancelHook {
+    virtual ~CancelHook() = default;
+    virtual void on_cancel() noexcept = 0;
+};
+
 struct CancelState {
     std::atomic<bool> cancelled{false};
     Chan<Unit> done = make_chan<Unit>(0);
 
+    std::mutex hooks_mutex;
+    std::vector<std::shared_ptr<CancelHook>> hooks;
+    bool fired = false;
+
+    // False when cancellation already fired; the caller must act immediately
+    // instead of waiting for a callback that will never come.
+    bool add_hook(std::shared_ptr<CancelHook> hook) {
+        std::lock_guard<std::mutex> lock(hooks_mutex);
+        if (fired) return false;
+        hooks.push_back(std::move(hook));
+        return true;
+    }
+
+    void remove_hook(const std::shared_ptr<CancelHook>& hook) {
+        std::lock_guard<std::mutex> lock(hooks_mutex);
+        for (auto it = hooks.begin(); it != hooks.end(); ++it) {
+            if (*it == hook) {
+                hooks.erase(it);
+                return;
+            }
+        }
+    }
+
     void cancel() {
         if (cancelled.exchange(true, std::memory_order_acq_rel)) return;
+
+        // Detach the list before running anything: a hook may re-enter this
+        // state, and none of them may run under the lock.
+        std::vector<std::shared_ptr<CancelHook>> to_fire;
+        {
+            std::lock_guard<std::mutex> lock(hooks_mutex);
+            fired = true;
+            to_fire.swap(hooks);
+        }
+        for (const auto& hook : to_fire) hook->on_cancel();
+
         // Closing wakes every parked receiver, including select cases.
         done.close();
     }
@@ -67,8 +116,22 @@ public:
     explicit operator bool() const noexcept { return state_ != nullptr; }
 
 private:
+    friend struct detail::CancelAccess;
     std::shared_ptr<detail::CancelState> state_;
 };
+
+namespace detail {
+
+// Lets the runtime bind a token's flag to a descriptor without making the
+// shared state public.
+struct CancelAccess {
+    static const std::shared_ptr<CancelState>& state(
+        const CancelToken& token) noexcept {
+        return token.state_;
+    }
+};
+
+}  // namespace detail
 
 // The write side. Independent of TaskGroup so it can be used on its own.
 class CancelSource {

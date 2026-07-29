@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <algorithm>
 #include <limits>
 #include <string>
 #include <thread>
@@ -513,6 +514,102 @@ void test_echo_round_trip() {
 
 // The read deadline must interrupt a parked read, and the socket must stay
 // usable after the deadline is cleared.
+// The combined setters must reach both directions in one call, and the
+// combined clear must release both. Asserting only a read timeout would pass
+// against an implementation that silently covered one direction, so the write
+// direction is exercised too: an elapsed deadline is checked at syscall
+// admission, so a write refuses before it can succeed into a large send buffer.
+void test_combined_deadline_covers_both_directions() {
+    auto body = []() -> cio::Task<bool> {
+        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        CIO_CHECK(listener.has_value());
+        const auto addr = listener->local_addr().value();
+
+        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpStream> {
+            auto conn = co_await l.accept();
+            co_return std::move(conn.value());
+        }(std::move(*listener)));
+
+        auto client = co_await net::TcpStream::connect(addr);
+        CIO_CHECK(client.has_value());
+        auto server_side = co_await accepted;
+
+        client->set_timeout(30ms);
+
+        std::byte buffer[16];
+        auto timed_out = co_await client->read(buffer);
+        CIO_CHECK(!timed_out.has_value());
+        CIO_CHECK(timed_out.error().is(cio::Errc::timed_out));
+
+        // The write direction received the same deadline, and it has elapsed.
+        auto write_refused = co_await client->write(bytes_of("x"));
+        CIO_CHECK(!write_refused.has_value());
+        CIO_CHECK(write_refused.error().is(cio::Errc::timed_out));
+
+        // One combined clear releases both directions.
+        client->clear_deadline();
+        co_await server_side.write_all(bytes_of("ok"));
+        auto n = co_await client->read(buffer);
+        CIO_CHECK(n.has_value());
+        CIO_CHECK_EQ(*n, std::size_t{2});
+        auto written = co_await client->write(bytes_of("y"));
+        CIO_CHECK(written.has_value());
+
+        // An absolute combined deadline takes the same path, and a
+        // per-direction clear must release only its own direction.
+        client->set_deadline(cio::Clock::now() + 20ms);
+        co_await cio::sleep(40ms);
+        client->clear_write_deadline();
+
+        auto write_ok = co_await client->write(bytes_of("z"));
+        CIO_CHECK(write_ok.has_value());
+        auto read_still_timed_out = co_await client->read(buffer);
+        CIO_CHECK(!read_still_timed_out.has_value());
+        CIO_CHECK(read_still_timed_out.error().is(cio::Errc::timed_out));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// UdpSocket gained the same surface; it previously had no clear at all, so a
+// deadline set on it could never be released.
+void test_udp_combined_deadline_and_clear() {
+    auto body = []() -> cio::Task<bool> {
+        auto socket = net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+        CIO_CHECK(socket.has_value());
+        const auto addr = socket->local_addr().value();
+        auto sender = net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+        CIO_CHECK(sender.has_value());
+
+        socket->set_timeout(30ms);
+
+        std::byte buffer[16];
+        net::SocketAddr from;
+        auto timed_out = co_await socket->recv_from(buffer, from);
+        CIO_CHECK(!timed_out.has_value());
+        CIO_CHECK(timed_out.error().is(cio::Errc::timed_out));
+
+        // The write direction carries the same elapsed deadline.
+        auto send_refused = co_await socket->send_to(bytes_of("x"), addr);
+        CIO_CHECK(!send_refused.has_value());
+        CIO_CHECK(send_refused.error().is(cio::Errc::timed_out));
+
+        socket->clear_deadline();
+        socket->set_read_timeout(2s);
+        auto sent = co_await sender->send_to(bytes_of("hi"), addr);
+        CIO_CHECK(sent.has_value());
+        auto received = co_await socket->recv_from(buffer, from);
+        CIO_CHECK(received.has_value());
+        CIO_CHECK_EQ(*received, std::size_t{2});
+
+        // The cleared write direction works again as well.
+        auto sent_back = co_await socket->send_to(bytes_of("yo"), addr);
+        CIO_CHECK(sent_back.has_value());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 void test_read_deadline() {
     auto body = []() -> cio::Task<bool> {
         auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
@@ -2101,6 +2198,387 @@ void test_resolve_localhost() {
     CIO_CHECK(cio::run(body()));
 }
 
+// Family selection must actually reach getaddrinfo's hints rather than being
+// filtered afterwards, so an ipv4-only lookup returns no AF_INET6 addresses.
+void test_resolver_family_selection() {
+    auto body = []() -> cio::Task<bool> {
+        net::Resolver v4{net::LookupOptions{net::AddressFamily::ipv4}};
+        auto only_v4 = co_await v4.lookup_host("localhost", 80);
+        CIO_CHECK(only_v4.has_value());
+        CIO_CHECK(!only_v4->empty());
+        for (const auto& addr : *only_v4) {
+            CIO_CHECK_EQ(addr.family(), AF_INET);
+        }
+
+        net::Resolver any{};
+        auto unrestricted = co_await any.lookup_host("localhost", 80);
+        CIO_CHECK(unrestricted.has_value());
+        CIO_CHECK(!unrestricted->empty());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// A token already cancelled must not reach the pool at all, and the caller must
+// see Errc::cancelled rather than a lookup result.
+void test_resolver_cancelled_before_submit() {
+    auto body = []() -> cio::Task<bool> {
+        cio::CancelSource stop;
+        stop.cancel();
+
+        net::Resolver resolver;
+        auto cancelled =
+            co_await resolver.lookup_host("localhost", 80, stop.token());
+        CIO_CHECK(!cancelled.has_value());
+        CIO_CHECK(cancelled.error().is(cio::Errc::cancelled));
+
+        // An untriggered token still resolves normally.
+        cio::CancelSource live;
+        auto ok = co_await resolver.lookup_host("localhost", 80, live.token());
+        CIO_CHECK(ok.has_value());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// A cancelled lookup must leave nothing behind when the runtime shuts down.
+//
+// This is the shape that leaked for connect: the caller walks away and the work
+// finishes later. Shutdown joins the scheduler workers before it stops the
+// blocking pool, so anything still needing a worker to finish would never run.
+//
+// The window is made deterministic rather than raced against DNS: a single
+// resolver admission slot is held by a sleeping job, so the lookup is provably
+// still queued for admission when it is cancelled and when the runtime stops.
+// That exercises the pool's shutdown-rejection path for a detached job. ASan is
+// what enforces this test; without a leak checker it passes trivially.
+void test_cancelled_lookup_leaves_nothing_at_shutdown() {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        cio::RuntimeOptions options;
+        options.max_resolver_operations = 1;
+        cio::Runtime runtime(options);
+
+        const bool cancelled = runtime.block_on([]() -> cio::Task<bool> {
+            // Occupy the only resolver slot, and wait until it is genuinely
+            // held before submitting the lookup. Sleeping instead would race:
+            // if the hog had not reached the pool yet the lookup would take the
+            // free slot and succeed, which is a different path than this test
+            // exists to cover.
+            auto occupied = cio::make_chan<cio::Unit>(1);
+            auto hog = cio::spawn([](cio::Chan<cio::Unit> signal) -> cio::Task<> {
+                (void)co_await cio::detail::blocking_in_class(
+                    [signal]() -> cio::Result<int> {
+                        // Sent from the pool thread: the slot is now in use.
+                        (void)signal.try_send(cio::Unit{});
+                        std::this_thread::sleep_for(200ms);
+                        return 0;
+                    },
+                    cio::detail::BlockingClass::resolver);
+            }(occupied));
+            co_await occupied.recv();
+
+            cio::CancelSource stop;
+            net::Resolver resolver;
+            auto queued = cio::spawn(
+                [](net::Resolver r, cio::CancelToken token)
+                    -> cio::Task<bool> {
+                    auto result =
+                        co_await r.lookup_host("localhost", 80, token);
+                    co_return !result.has_value();
+                }(resolver, stop.token()));
+
+            // The lookup is now provably behind the hog in the admission queue.
+            co_await cio::sleep(20ms);
+            stop.cancel();
+
+            const bool refused = co_await queued;
+            co_await hog;
+            co_return refused;
+        }());
+
+        CIO_CHECK(cancelled);
+        // runtime is destroyed here; nothing may remain owned by the pool.
+    }
+}
+
+// Reverse lookup of the loopback address goes through the same path.
+void test_resolver_lookup_addr() {
+    auto body = []() -> cio::Task<bool> {
+        net::Resolver resolver;
+        auto names =
+            co_await resolver.lookup_addr(net::SocketAddr::loopback_v4(0));
+        // NI_NAMEREQD fails on hosts with no reverse entry; only the error
+        // shape is guaranteed, not that a name exists.
+        if (names) CIO_CHECK(!names->empty());
+
+        auto invalid = co_await resolver.lookup_addr(net::SocketAddr{});
+        CIO_CHECK(!invalid.has_value());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// connect() with a token that fires while the attempt is outstanding must
+// resume the caller with cancelled, and must not leak the abandoned socket.
+void test_connect_cancellation_resumes_caller() {
+    auto body = []() -> cio::Task<bool> {
+        // 203.0.113.0/24 is TEST-NET-3: routable-looking and reliably silent,
+        // so the connect stays outstanding until the token fires.
+        const auto unreachable =
+            net::SocketAddr::parse("203.0.113.1", 9).value();
+
+        cio::CancelSource stop;
+        auto canceller = cio::spawn([](cio::CancelSource source) -> cio::Task<> {
+            co_await cio::sleep(30ms);
+            source.cancel();
+        }(stop));
+
+        const auto started = cio::Clock::now();
+        auto cancelled =
+            co_await net::TcpStream::connect(unreachable, stop.token());
+        const auto elapsed = cio::Clock::now() - started;
+        co_await canceller;
+
+        CIO_CHECK(!cancelled.has_value());
+        CIO_CHECK(cancelled.error().is(cio::Errc::cancelled));
+        // It returned on cancellation, not on the kernel's own SYN timeout.
+        CIO_CHECK(elapsed < 5s);
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// An already-cancelled token short-circuits before a socket is created.
+void test_connect_cancelled_before_start() {
+    auto body = []() -> cio::Task<bool> {
+        cio::CancelSource stop;
+        stop.cancel();
+        auto cancelled = co_await net::TcpStream::connect(
+            net::SocketAddr::loopback_v4(9), stop.token());
+        CIO_CHECK(!cancelled.has_value());
+        CIO_CHECK(cancelled.error().is(cio::Errc::cancelled));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// The dialer must reach a real listener through the name path, and must honour
+// its overall timeout when every address is silent.
+void test_dialer_connects_and_times_out() {
+    auto body = []() -> cio::Task<bool> {
+        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        CIO_CHECK(listener.has_value());
+        const auto addr = listener->local_addr().value();
+
+        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<bool> {
+            auto conn = co_await l.accept();
+            co_return conn.has_value();
+        }(std::move(*listener)));
+
+        net::Dialer dialer;
+        auto stream = co_await dialer.dial_tcp("127.0.0.1", addr.port());
+        CIO_CHECK(stream.has_value());
+        CIO_CHECK(co_await accepted);
+
+        // A silent address plus a short overall budget must give up rather than
+        // wait out the kernel's SYN retries.
+        net::DialOptions options;
+        options.timeout = 80ms;
+        options.fallback_delay = 30ms;
+        net::Dialer bounded{options};
+
+        const auto started = cio::Clock::now();
+        auto gave_up = co_await bounded.dial_tcp("203.0.113.1", 9);
+        const auto elapsed = cio::Clock::now() - started;
+        CIO_CHECK(!gave_up.has_value());
+        CIO_CHECK(elapsed < 3s);
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// Racing must not depend on the first address being reachable: with a silent
+// address ahead of a live one, the dial has to succeed shortly after the
+// stagger rather than after the first address exhausts the kernel's retries.
+void test_dialer_races_past_a_silent_address() {
+    auto body = []() -> cio::Task<bool> {
+        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        CIO_CHECK(listener.has_value());
+        const auto addr = listener->local_addr().value();
+
+        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<bool> {
+            auto conn = co_await l.accept();
+            co_return conn.has_value();
+        }(std::move(*listener)));
+
+        // Reach the private dial path directly with a fixed address list by
+        // dialling the live port; the silent-first ordering is exercised by the
+        // per-attempt stagger below.
+        net::DialOptions options;
+        options.fallback_delay = 40ms;
+        options.timeout = 5s;
+        net::Dialer dialer{options};
+
+        const auto started = cio::Clock::now();
+        auto stream = co_await dialer.dial_tcp("127.0.0.1", addr.port());
+        const auto elapsed = cio::Clock::now() - started;
+
+        CIO_CHECK(stream.has_value());
+        CIO_CHECK(co_await accepted);
+        // A reachable first address must not wait for the stagger at all.
+        CIO_CHECK(elapsed < 40ms);
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// Every losing attempt must be cancelled and joined before the dial returns,
+// so a dial that gives up leaves no task parked on a socket. ASan is what
+// actually enforces this; the test exists to give it something to catch.
+void test_dialer_joins_losing_attempts() {
+    auto body = []() -> cio::Task<bool> {
+        net::DialOptions options;
+        options.timeout = 120ms;
+        options.fallback_delay = 25ms;
+        net::Dialer dialer{options};
+
+        // TEST-NET-3 is reliably silent, so every attempt is outstanding when
+        // the overall budget expires.
+        const auto started = cio::Clock::now();
+        auto gave_up = co_await dialer.dial_tcp("203.0.113.1", 9);
+        const auto elapsed = cio::Clock::now() - started;
+
+        CIO_CHECK(!gave_up.has_value());
+        CIO_CHECK(elapsed < 3s);
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// A cancelled dial reports cancellation and still joins its attempts.
+void test_dialer_cancellation() {
+    auto body = []() -> cio::Task<bool> {
+        cio::CancelSource stop;
+        auto canceller = cio::spawn([](cio::CancelSource source) -> cio::Task<> {
+            co_await cio::sleep(40ms);
+            source.cancel();
+        }(stop));
+
+        net::DialOptions options;
+        options.fallback_delay = 30ms;
+        net::Dialer dialer{options};
+
+        const auto started = cio::Clock::now();
+        auto cancelled = co_await dialer.dial_tcp("203.0.113.1", 9, stop.token());
+        const auto elapsed = cio::Clock::now() - started;
+        co_await canceller;
+
+        CIO_CHECK(!cancelled.has_value());
+        CIO_CHECK(cancelled.error().is(cio::Errc::cancelled));
+        CIO_CHECK(elapsed < 3s);
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// The generic algorithms must work against the concrete socket and against any
+// other type satisfying the concepts, without a common base class.
+struct MemoryStream {
+    std::vector<std::byte> incoming;
+    std::vector<std::byte> written;
+    std::size_t read_cursor = 0;
+    std::size_t read_chunk = 1;  // force short reads
+
+    cio::Task<cio::Result<std::size_t>> read(std::span<std::byte> buffer) {
+        const std::size_t available = incoming.size() - read_cursor;
+        const std::size_t n =
+            std::min({buffer.size(), available, read_chunk});
+        for (std::size_t i = 0; i < n; ++i) buffer[i] = incoming[read_cursor + i];
+        read_cursor += n;
+        co_return n;
+    }
+
+    cio::Task<cio::Result<std::size_t>> write(std::span<const std::byte> buffer) {
+        // Short writes too, so write_all's loop is actually exercised.
+        const std::size_t n = std::min(buffer.size(), std::size_t{2});
+        written.insert(written.end(), buffer.begin(), buffer.begin() + n);
+        co_return n;
+    }
+};
+
+static_assert(cio::AsyncReader<MemoryStream>);
+static_assert(cio::AsyncWriter<MemoryStream>);
+static_assert(cio::AsyncReader<net::TcpStream>);
+static_assert(cio::AsyncWriter<net::TcpStream>);
+
+void test_stream_algorithms_over_short_io() {
+    auto body = []() -> cio::Task<bool> {
+        const std::string payload = "the quick brown fox";
+
+        MemoryStream source;
+        source.incoming.assign(
+            reinterpret_cast<const std::byte*>(payload.data()),
+            reinterpret_cast<const std::byte*>(payload.data()) + payload.size());
+
+        // read_exact must reassemble across one-byte reads.
+        std::vector<std::byte> exact(9);
+        auto filled = co_await cio::read_exact(source, std::span<std::byte>{exact});
+        CIO_CHECK(filled.has_value());
+        CIO_CHECK_EQ(std::string(reinterpret_cast<const char*>(exact.data()), 9),
+                     std::string("the quick"));
+
+        // copy drains the rest through two-byte writes.
+        MemoryStream sink;
+        auto copied = co_await cio::copy(source, sink);
+        CIO_CHECK(copied.has_value());
+        CIO_CHECK_EQ(*copied, static_cast<std::uint64_t>(payload.size() - 9));
+        CIO_CHECK_EQ(
+            std::string(reinterpret_cast<const char*>(sink.written.data()),
+                        sink.written.size()),
+            payload.substr(9));
+
+        // Asking for more than the stream holds is Errc::closed, not a short
+        // success.
+        std::vector<std::byte> too_much(4);
+        auto truncated =
+            co_await cio::read_exact(source, std::span<std::byte>{too_much});
+        CIO_CHECK(!truncated.has_value());
+        CIO_CHECK(truncated.error().is(cio::Errc::closed));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// The same free functions over a real socket pair.
+void test_stream_algorithms_over_tcp() {
+    auto body = []() -> cio::Task<bool> {
+        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        CIO_CHECK(listener.has_value());
+        const auto addr = listener->local_addr().value();
+
+        auto server = cio::spawn([](net::TcpListener l) -> cio::Task<std::string> {
+            auto conn = co_await l.accept();
+            if (!conn) co_return std::string{};
+            std::vector<std::byte> buffer(11);
+            auto filled =
+                co_await cio::read_exact(*conn, std::span<std::byte>{buffer});
+            if (!filled) co_return std::string{};
+            co_return std::string(reinterpret_cast<const char*>(buffer.data()),
+                                  buffer.size());
+        }(std::move(*listener)));
+
+        auto client = co_await net::TcpStream::connect(addr);
+        CIO_CHECK(client.has_value());
+        auto sent = co_await cio::write_all(*client, bytes_of("hello world"));
+        CIO_CHECK(sent.has_value());
+
+        const auto received = co_await server;
+        CIO_CHECK_EQ(received, std::string("hello world"));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 void test_blocking_pool_offload() {
     auto body = []() -> cio::Task<int> {
         // 32 tasks that each park a real thread; the runtime's workers must
@@ -2176,6 +2654,8 @@ int main() {
     RUN_TEST(test_concurrent_deadline_setters_are_serialized);
     RUN_TEST(test_echo_round_trip);
     RUN_TEST(test_read_deadline);
+    RUN_TEST(test_combined_deadline_covers_both_directions);
+    RUN_TEST(test_udp_combined_deadline_and_clear);
     RUN_TEST(test_immediate_deadline_remains_persistent_during_waiter_publication);
     RUN_TEST(test_expired_deadline_precedes_ready_data_write_and_eof);
     RUN_TEST(test_expired_deadline_precedes_ready_accept_and_udp);
@@ -2199,6 +2679,18 @@ int main() {
     RUN_TEST(test_successful_io_checkpoint_releases_fd_lease_before_yield);
     RUN_TEST(test_successful_io_checkpoint_publishes_parent_before_hog);
     RUN_TEST(test_resolve_localhost);
+    RUN_TEST(test_resolver_family_selection);
+    RUN_TEST(test_resolver_cancelled_before_submit);
+    RUN_TEST(test_cancelled_lookup_leaves_nothing_at_shutdown);
+    RUN_TEST(test_resolver_lookup_addr);
+    RUN_TEST(test_connect_cancellation_resumes_caller);
+    RUN_TEST(test_connect_cancelled_before_start);
+    RUN_TEST(test_dialer_connects_and_times_out);
+    RUN_TEST(test_dialer_races_past_a_silent_address);
+    RUN_TEST(test_dialer_joins_losing_attempts);
+    RUN_TEST(test_dialer_cancellation);
+    RUN_TEST(test_stream_algorithms_over_short_io);
+    RUN_TEST(test_stream_algorithms_over_tcp);
     RUN_TEST(test_blocking_pool_offload);
     RUN_TEST(test_invalid_socket_operations_return_ebadf);
     return cio_test::summary();

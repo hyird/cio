@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cio LANGUAGES CXX VERSION 0.0.1)
+project(cio LANGUAGES CXX VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,6 +42,9 @@ set(CIO_SOURCES
   src/reactor_common.cpp
   src/reactor_epoll.cpp
   src/blocking_pool.cpp
+  src/dns.cpp
+  src/fs.cpp
+  src/signal.cpp
   src/runtime.cpp
   src/net.cpp
   src/metrics.cpp
@@ -95,6 +98,17 @@ elseif(CIO_SANITIZE STREQUAL "asan")
   target_link_options(cio PUBLIC -fsanitize=address,undefined)
 endif()
 
+# The TLS module is optional because it is the only part of the project with an
+# external dependency. The core library must stay dependency-free.
+option(CIO_TLS "Build the optional TLS module (requires OpenSSL)" OFF)
+if(CIO_TLS)
+  find_package(OpenSSL REQUIRED)
+  add_library(cio_tls src/tls.cpp)
+  add_library(cio::tls ALIAS cio_tls)
+  target_link_libraries(cio_tls PUBLIC cio OpenSSL::SSL OpenSSL::Crypto)
+  target_compile_features(cio_tls PUBLIC cxx_std_20)
+endif()
+
 function(cio_add_program dir name)
   add_executable(${name} ${dir}/${name}.cpp)
   target_link_libraries(${name} PRIVATE cio)
@@ -106,9 +120,16 @@ endfunction()
 if(CIO_BUILD_TESTS)
   enable_testing()
   file(GLOB CIO_TEST_FILES RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
+  # test_tls only builds with the optional module that it exercises.
+  if(NOT CIO_TLS)
+    list(REMOVE_ITEM CIO_TEST_FILES test_tls.cpp)
+  endif()
   foreach(test_file ${CIO_TEST_FILES})
     get_filename_component(test_name ${test_file} NAME_WE)
     cio_add_program(tests ${test_name})
+    if(test_name STREQUAL "test_tls")
+      target_link_libraries(${test_name} PRIVATE cio_tls)
+    endif()
     add_test(NAME ${test_name} COMMAND ${test_name})
     set_tests_properties(${test_name} PROPERTIES TIMEOUT 300)
   endforeach()

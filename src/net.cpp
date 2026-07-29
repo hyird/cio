@@ -13,9 +13,14 @@
 #include <cassert>
 #include <cerrno>
 #include <cstring>
+#include <optional>
+#include <vector>
+#include <type_traits>
 
 #include "cio/blocking.hpp"
 #include "cio/detail/scheduler.hpp"
+#include "cio/select.hpp"
+#include "cio/spawn.hpp"
 
 namespace cio::net {
 namespace {
@@ -265,6 +270,36 @@ IoOperation capture_operation(int& socket_fd,
     return operation;
 }
 
+// Applies one absolute deadline to the selected directions. Zero clears.
+//
+// Both directions share a single captured incarnation rather than capturing
+// twice: set_deadline() revalidates against the captured generation either way,
+// so one token cannot outlive the descriptor it names, and a combined
+// set_deadline() cannot land its two directions on different incarnations.
+// An invalid or closing descriptor is a no-op, matching the per-direction
+// setters, which have always been safe to call on a closed socket.
+void apply_deadline(int& socket_fd, detail::IoDesc*& socket_desc,
+                    bool read, bool write,
+                    std::int64_t deadline_ns) noexcept {
+    const IoOperation operation = capture_operation(socket_fd, socket_desc);
+    if (!operation) return;
+    detail::Reactor& reactor = reactor_for(operation.desc);
+    if (read) {
+        reactor.set_deadline(operation.desc, detail::Dir::kRead,
+                             operation.generation, deadline_ns);
+    }
+    if (write) {
+        reactor.set_deadline(operation.desc, detail::Dir::kWrite,
+                             operation.generation, deadline_ns);
+    }
+}
+
+std::int64_t absolute_ns(TimePoint deadline) noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               deadline.time_since_epoch())
+        .count();
+}
+
 CooperativeIoTask<Result<std::size_t>>
 tcp_read_some(
     detail::IoDesc* desc, std::uint32_t generation,
@@ -448,33 +483,243 @@ std::string SocketAddr::to_string() const {
     }
 }
 
+namespace {
+
+int af_of(AddressFamily family) noexcept {
+    switch (family) {
+        case AddressFamily::ipv4: return AF_INET;
+        case AddressFamily::ipv6: return AF_INET6;
+        case AddressFamily::any: break;
+    }
+    return AF_UNSPEC;
+}
+
+// The synchronous body. Owns its inputs so it can outlive a cancelled caller.
+Result<std::vector<SocketAddr>> lookup_host_blocking(const std::string& host,
+                                                     std::uint16_t port,
+                                                     int family) {
+    addrinfo hints{};
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_STREAM;
+
+    const std::string service = std::to_string(port);
+    addrinfo* head = nullptr;
+    const int rc = ::getaddrinfo(host.c_str(), service.c_str(), &hints, &head);
+    if (rc != 0) return Error{rc == EAI_SYSTEM ? errno : EINVAL};
+
+    std::vector<SocketAddr> addresses;
+    for (addrinfo* it = head; it != nullptr; it = it->ai_next) {
+        addresses.push_back(
+            SocketAddr::from_raw(it->ai_addr, static_cast<unsigned>(it->ai_addrlen)));
+    }
+    ::freeaddrinfo(head);
+    if (addresses.empty()) return Error{ENOENT};
+    return addresses;
+}
+
+Result<std::vector<std::string>> lookup_addr_blocking(const SocketAddr& address) {
+    char host[NI_MAXHOST];
+    const int rc = ::getnameinfo(address.raw(), address.length(), host,
+                                 sizeof(host), nullptr, 0, NI_NAMEREQD);
+    if (rc != 0) return Error{rc == EAI_SYSTEM ? errno : ENOENT};
+    return std::vector<std::string>{std::string(host)};
+}
+
+// A self-owned lookup job.
+//
+// Deliberately not a coroutine. A cancelled caller must be able to walk away
+// while getaddrinfo() finishes, and a detached coroutine that outlives the
+// scheduler workers can never be resumed to completion: Scheduler::shutdown()
+// joins the workers before it stops the blocking pool, so a completion
+// dispatched afterwards has nothing to run it and its frame leaks. Owning the
+// job on the heap and delivering through a non-suspending try_send() removes
+// the frame, and with it the leak, on every path.
+template <typename Work, typename Value>
+struct DetachedLookup final : detail::BlockingJob {
+    Work work;
+    Chan<Value> out;
+
+    DetachedLookup(Work w, Chan<Value> channel)
+        : work(std::move(w)), out(std::move(channel)) {}
+
+    static void deliver(detail::BlockingJob* base, Value value) noexcept {
+        auto* self = static_cast<DetachedLookup*>(base);
+        // The channel is buffered to one and written once, so this never fails
+        // for lack of room. A caller that already gave up simply never reads
+        // it, and the value dies with the last channel reference.
+        (void)self->out.try_send(std::move(value));
+        delete self;
+    }
+
+    static void run_job(detail::BlockingJob* base) noexcept {
+        auto* self = static_cast<DetachedLookup*>(base);
+        Value value{Error{Errc::broken}};
+        try {
+            value = self->work();
+        } catch (...) {
+            value = Value{Error{Errc::broken}};
+        }
+        deliver(base, std::move(value));
+    }
+
+    // Still waiting for an admission slot when the pool stopped.
+    static void fail_job(detail::BlockingJob* base) noexcept {
+        deliver(base, Value{Error{Errc::shutdown}});
+    }
+};
+
+// Runs `work` on the blocking pool so that a cancellation can resume the caller
+// without waiting for the syscall.
+//
+// Without a token the ordinary awaiter is used, so a plain lookup pays for
+// neither a heap job nor a channel.
+template <typename Work>
+Task<std::invoke_result_t<Work&>> cancellable_blocking(Work work,
+                                                       CancelToken cancel) {
+    // Work already returns a Result<T>; do not wrap it again.
+    using Value = std::invoke_result_t<Work&>;
+
+    if (!cancel) {
+        co_return co_await detail::blocking_in_class(
+            std::move(work), detail::BlockingClass::resolver);
+    }
+    if (cancel.cancelled()) co_return Value{Error{Errc::cancelled}};
+
+    detail::Scheduler* const scheduler = detail::current_scheduler();
+    if (scheduler == nullptr) co_return Value{Error{Errc::shutdown}};
+
+    auto out = cio::make_chan<Value>(1);
+    using Job = DetachedLookup<Work, Value>;
+    auto* job = new Job(std::move(work), out);
+    job->run = &Job::run_job;
+    job->fail = &Job::fail_job;
+    job->klass = detail::BlockingClass::resolver;
+
+    switch (scheduler->blocking().submit(job)) {
+        case detail::BlockingSubmitResult::accepted:
+            break;
+        case detail::BlockingSubmitResult::overloaded:
+            delete job;
+            co_return Value{Error{Errc::overloaded}};
+        case detail::BlockingSubmitResult::shutdown:
+            delete job;
+            co_return Value{Error{Errc::shutdown}};
+    }
+
+    auto selected = cio::select(cio::recv(out), cio::recv(cancel.done()));
+    if (co_await selected == 1) co_return Value{Error{Errc::cancelled}};
+
+    auto received = selected.template get<0>();
+    if (!received) co_return Value{Error{Errc::broken}};
+    co_return std::move(*received);
+}
+
+}  // namespace
+
+Task<Result<std::vector<SocketAddr>>> Resolver::lookup_host(
+    std::string host, std::uint16_t port, CancelToken cancel) const {
+    const int family = af_of(options_.family);
+    co_return co_await cancellable_blocking(
+        [host = std::move(host), port, family] {
+            return lookup_host_blocking(host, port, family);
+        },
+        std::move(cancel));
+}
+
+Task<Result<std::vector<std::string>>> Resolver::lookup_addr(
+    SocketAddr address, CancelToken cancel) const {
+    if (!address.valid()) co_return Error{EINVAL};
+    co_return co_await cancellable_blocking(
+        [address] { return lookup_addr_blocking(address); }, std::move(cancel));
+}
+
 Task<Result<std::vector<SocketAddr>>> resolve(std::string host, std::uint16_t port) {
-    // getaddrinfo has no non-blocking form worth using, so it goes to the pool.
-    // This is the canonical example of why the pool exists.
-    auto result = co_await blocking(
-        [host = std::move(host), port]() -> Result<std::vector<SocketAddr>> {
-            addrinfo hints{};
-            hints.ai_family = AF_UNSPEC;
-            hints.ai_socktype = SOCK_STREAM;
-
-            const std::string service = std::to_string(port);
-            addrinfo* head = nullptr;
-            const int rc = ::getaddrinfo(host.c_str(), service.c_str(), &hints, &head);
-            if (rc != 0) return Error{rc == EAI_SYSTEM ? errno : EINVAL};
-
-            std::vector<SocketAddr> addresses;
-            for (addrinfo* it = head; it != nullptr; it = it->ai_next) {
-                addresses.push_back(
-                    SocketAddr::from_raw(it->ai_addr, static_cast<unsigned>(it->ai_addrlen)));
-            }
-            ::freeaddrinfo(head);
-            if (addresses.empty()) return Error{ENOENT};
-            return addresses;
-        });
-    co_return result;
+    co_return co_await Resolver{}.lookup_host(std::move(host), port);
 }
 
 // ---------------------------------------------------------------- Socket ---
+
+namespace {
+
+// Wakes a descriptor's parked operations when its bound token fires.
+//
+// Holds the scheduler lifetime because the hook may outlive the Socket: the
+// CancelState keeps a reference until cancellation happens, and the descriptor
+// slab must still exist when it does. The generation check inside
+// cancel_waiters() makes a hook for a closed or recycled descriptor inert.
+class SocketCancelHook final : public detail::CancelHook {
+public:
+    SocketCancelHook(std::shared_ptr<detail::Scheduler> scheduler,
+                     detail::IoDesc* desc, std::uint32_t generation) noexcept
+        : scheduler_(std::move(scheduler)),
+          desc_(desc),
+          generation_(generation) {}
+
+    void on_cancel() noexcept override {
+        if (!active_.load(std::memory_order_acquire)) return;
+        if (desc_ == nullptr || desc_->owner == nullptr) return;
+        desc_->owner->cancel_waiters(desc_, generation_);
+    }
+
+    // The binding was replaced or the socket closed. Going inert is safer than
+    // unlinking, which would race a cancel already running the hook list.
+    void detach() noexcept { active_.store(false, std::memory_order_release); }
+
+private:
+    std::shared_ptr<detail::Scheduler> scheduler_;
+    detail::IoDesc* desc_ = nullptr;
+    std::uint32_t generation_ = 0;
+    std::atomic<bool> active_{true};
+};
+
+}  // namespace
+
+void Socket::set_cancel(CancelToken token) {
+    if (cancel_binding_ != nullptr) {
+        static_cast<SocketCancelHook*>(cancel_binding_.get())->detach();
+        if (const auto& previous = detail::CancelAccess::state(cancel_token_);
+            previous != nullptr) {
+            previous->remove_hook(cancel_binding_);
+        }
+        cancel_binding_.reset();
+    }
+
+    const IoOperation operation = capture_operation(fd_, desc_);
+    cancel_token_ = std::move(token);
+    const auto& state = detail::CancelAccess::state(cancel_token_);
+
+    // Publish the flag first: even without a live descriptor, a later
+    // operation on this socket must observe the binding.
+    if (operation) {
+        operation.desc->cancel_flag.store(
+            state != nullptr ? &state->cancelled : nullptr,
+            std::memory_order_release);
+    }
+    if (state == nullptr || !operation) return;
+
+    auto hook = std::make_shared<SocketCancelHook>(
+        scheduler_lifetime_, operation.desc, operation.generation);
+    if (!state->add_hook(hook)) {
+        // Already cancelled; nothing will call back, so wake now.
+        hook->on_cancel();
+        return;
+    }
+    cancel_binding_ = std::move(hook);
+}
+
+TimePoint Socket::deadline(bool write_direction) const {
+    const IoOperation operation =
+        capture_operation(const_cast<int&>(fd_),
+                          const_cast<detail::IoDesc*&>(desc_));
+    if (!operation) return TimePoint{};
+    const auto index = static_cast<unsigned>(
+        write_direction ? detail::Dir::kWrite : detail::Dir::kRead);
+    const std::int64_t deadline_ns =
+        operation.desc->absolute_deadline_ns[index].load(
+            std::memory_order_acquire);
+    if (deadline_ns == 0) return TimePoint{};
+    return TimePoint{std::chrono::nanoseconds{deadline_ns}};
+}
 
 Result<void> Socket::adopt(int fd, bool already_nonblocking) {
     if (!already_nonblocking) {
@@ -504,6 +749,19 @@ Result<void> Socket::adopt(int fd, bool already_nonblocking) {
 }
 
 void Socket::close() {
+    // Retire any cancellation binding first: the descriptor is about to be
+    // unregistered, and a hook that fires afterwards must not touch it. The
+    // generation check would already make it inert; going inert here as well
+    // keeps a closed socket from holding the token's hook list open.
+    if (cancel_binding_ != nullptr) {
+        static_cast<SocketCancelHook*>(cancel_binding_.get())->detach();
+        if (const auto& state = detail::CancelAccess::state(cancel_token_);
+            state != nullptr) {
+            state->remove_hook(cancel_binding_);
+        }
+        cancel_binding_.reset();
+    }
+
     std::atomic_ref<detail::IoDesc*> desc_field(desc_);
     detail::IoDesc* const desc =
         desc_field.load(std::memory_order_acquire);
@@ -642,11 +900,11 @@ Task<Result<void>> TcpStream::write_all(std::span<const std::byte> buffer) {
     co_return ok();
 }
 
-Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr) {
-    if (!addr.valid()) co_return Error{EINVAL};
+Result<bool> TcpStream::begin_connect(SocketAddr addr, TcpStream& stream) {
+    if (!addr.valid()) return Error{EINVAL};
 
     const int fd = ::socket(addr.family(), SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (fd < 0) co_return Error::from_errno();
+    if (fd < 0) return Error::from_errno();
 
     // Start the state machine before registering EPOLLOUT. A never-connected
     // TCP fd is itself reported writable by epoll; registering it first can
@@ -657,18 +915,18 @@ Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr) {
         ::connect(pending.get(), addr.raw(), addr.length());
     const int connect_error = connect_result == 0 ? 0 : errno;
     if (connect_result != 0 && connect_error != EINPROGRESS) {
-        co_return Error{connect_error};
+        return Error{connect_error};
     }
 
-    TcpStream stream;
     if (auto adopted =
             stream.adopt(pending.release(), /*already_nonblocking=*/true);
         !adopted) {
-        co_return adopted.error();
+        return adopted.error();
     }
+    return connect_result == 0;
+}
 
-    if (connect_result == 0) co_return std::move(stream);
-
+Task<Result<void>> TcpStream::await_connect(TcpStream& stream) {
     const std::uint32_t generation =
         stream.desc_->generation.load(std::memory_order_acquire);
 
@@ -696,7 +954,7 @@ Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr) {
         if (::getpeername(stream.fd_,
                           reinterpret_cast<sockaddr*>(&peer),
                           &peer_length) == 0) {
-            co_return std::move(stream);
+            co_return ok();
         }
 
         const int peer_error = errno;
@@ -709,67 +967,269 @@ Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr) {
     }
 }
 
-Task<Result<TcpStream>> TcpStream::connect(std::string host, std::uint16_t port) {
-    if (auto literal = SocketAddr::parse(host, port); literal) {
-        co_return co_await connect(*literal);
-    }
-    auto addresses = co_await resolve(std::move(host), port);
-    if (!addresses) co_return addresses.error();
+Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr) {
+    TcpStream stream;
+    auto started = begin_connect(addr, stream);
+    if (!started) co_return started.error();
+    if (*started) co_return std::move(stream);
 
+    if (auto ready = co_await await_connect(stream); !ready) {
+        co_return ready.error();
+    }
+    co_return std::move(stream);
+}
+
+Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr, CancelToken cancel) {
+    if (!cancel) co_return co_await connect(addr);
+    if (cancel.cancelled()) co_return Error{Errc::cancelled};
+
+    // Cancellation closes the socket rather than merely abandoning the wait.
+    //
+    // An earlier version detached the attempt and let the caller stop waiting
+    // for it. That resumed the caller correctly but left the connect parked
+    // until the kernel gave up on its SYN retries — holding a descriptor for
+    // roughly two minutes, and leaking the frame outright if the runtime shut
+    // down first, because shutdown does not unwind tasks parked on sockets.
+    //
+    // Closing the descriptor wakes the parked awaiter immediately, so the
+    // watcher and the connect both finish at cancellation time. The stream is
+    // shared because the watcher runs concurrently with the connect; close() is
+    // documented to be safe against a parked reader or writer.
+    auto stream = std::make_shared<TcpStream>();
+    auto started = begin_connect(addr, *stream);
+    if (!started) co_return started.error();
+    if (*started) co_return std::move(*stream);
+
+    // Closed on every exit path to release the watcher when no cancellation
+    // arrived; recv() on a closed channel completes rather than parking.
+    auto settled = make_chan<Unit>(1);
+    auto watcher = spawn([](std::shared_ptr<TcpStream> target, CancelToken token,
+                            Chan<Unit> done) -> Task<bool> {
+        auto selected = cio::select(cio::recv(token.done()), cio::recv(done));
+        const bool cancelled = (co_await selected) == 0;
+        if (cancelled) target->close();
+        co_return cancelled;
+    }(stream, cancel, settled));
+
+    auto ready = co_await await_connect(*stream);
+
+    settled.close();
+    // Joined before the stream is moved out, so the watcher cannot touch it
+    // afterwards.
+    const bool cancelled = co_await watcher;
+    if (cancelled) co_return Error{Errc::cancelled};
+    if (!ready) co_return ready.error();
+    co_return std::move(*stream);
+}
+
+Task<Result<TcpStream>> TcpStream::connect(std::string host, std::uint16_t port) {
+    co_return co_await Dialer{}.dial_tcp(std::move(host), port);
+}
+
+Task<Result<TcpStream>> TcpStream::connect(std::string host, std::uint16_t port,
+                                           CancelToken cancel) {
+    co_return co_await Dialer{}.dial_tcp(std::move(host), port,
+                                         std::move(cancel));
+}
+
+// ---------------------------------------------------------------- Dialer ---
+
+namespace {
+
+constexpr auto kDefaultFallbackDelay = std::chrono::milliseconds(300);
+
+// Go's ordering: alternate families so a blackholed IPv6 route costs one
+// attempt's delay rather than every v6 address in the list.
+std::vector<SocketAddr> interleave_families(
+    const std::vector<SocketAddr>& addresses) {
+    std::vector<SocketAddr> v6;
+    std::vector<SocketAddr> v4;
+    for (const auto& addr : addresses) {
+        (addr.family() == AF_INET6 ? v6 : v4).push_back(addr);
+    }
+
+    // Whichever family the resolver listed first keeps priority, matching the
+    // system's own address-selection preference.
+    const bool v6_first =
+        addresses.empty() || addresses.front().family() == AF_INET6;
+    std::vector<SocketAddr>& primary = v6_first ? v6 : v4;
+    std::vector<SocketAddr>& secondary = v6_first ? v4 : v6;
+
+    std::vector<SocketAddr> ordered;
+    ordered.reserve(addresses.size());
+    for (std::size_t i = 0; i < primary.size() || i < secondary.size(); ++i) {
+        if (i < primary.size()) ordered.push_back(primary[i]);
+        if (i < secondary.size()) ordered.push_back(secondary[i]);
+    }
+    return ordered;
+}
+
+}  // namespace
+
+Task<Result<TcpStream>> Dialer::dial_tcp(std::string host, std::uint16_t port,
+                                         CancelToken cancel) const {
+    if (cancel && cancel.cancelled()) co_return Error{Errc::cancelled};
+
+    const bool has_overall_timeout = options_.timeout > Duration::zero();
+    const TimePoint overall_deadline =
+        has_overall_timeout ? Clock::now() + options_.timeout : TimePoint{};
+
+    std::vector<SocketAddr> targets;
+    if (auto literal = SocketAddr::parse(host, port); literal) {
+        targets.push_back(*literal);
+    } else {
+        Resolver resolver{LookupOptions{options_.family}};
+        auto addresses =
+            co_await resolver.lookup_host(std::move(host), port, cancel);
+        if (!addresses) co_return addresses.error();
+        targets = interleave_families(*addresses);
+    }
+    if (targets.empty()) co_return Error{ENOENT};
+
+    const Duration fallback_delay = options_.fallback_delay > Duration::zero()
+                                        ? options_.fallback_delay
+                                        : Duration{kDefaultFallbackDelay};
+
+    // Attempts are raced, not tried one at a time: a new address is started
+    // every fallback_delay until one connects. The first success wins and the
+    // rest are cancelled, which closes their sockets, and then joined. Nothing
+    // is detached — an attempt outliving the dial would leak its frame if the
+    // runtime shut down while it was parked on a socket.
+    CancelSource stop;
+    auto results = make_chan<Result<TcpStream>>(targets.size());
+
+    // One watcher maps the caller's token onto the shared attempt source, so
+    // the racing loop never has to special-case an absent token.
+    auto settled = make_chan<Unit>(1);
+    JoinHandle<void> watcher;
+    if (cancel) {
+        watcher = spawn([](CancelToken token, CancelSource source,
+                           Chan<Unit> done) -> Task<void> {
+            auto selected = cio::select(cio::recv(token.done()), cio::recv(done));
+            if ((co_await selected) == 0) source.cancel();
+        }(cancel, stop, settled));
+    }
+
+    std::vector<JoinHandle<void>> attempts;
+    attempts.reserve(targets.size());
+
+    Result<TcpStream> winner = Error{EHOSTUNREACH};
     Result<TcpStream> last = Error{EHOSTUNREACH};
-    for (const auto& addr : *addresses) {
-        last = co_await connect(addr);
-        if (last) co_return last;
+    std::size_t started = 0;
+    std::size_t finished = 0;
+
+    while (finished < targets.size()) {
+        if (started < targets.size()) {
+            attempts.push_back(spawn(
+                [](SocketAddr target, CancelToken attempt_cancel,
+                   Chan<Result<TcpStream>> out) -> Task<void> {
+                    auto stream = co_await TcpStream::connect(
+                        target, std::move(attempt_cancel));
+                    co_await out.send(std::move(stream));
+                }(targets[started], stop.token(), results)));
+            ++started;
+        }
+
+        // While addresses remain, a result and the stagger tick race; once all
+        // are running only the overall deadline can end the wait early.
+        std::optional<Result<TcpStream>> received;
+        if (started < targets.size()) {
+            if (has_overall_timeout) {
+                auto selected = cio::select(cio::recv(results),
+                                            cio::after(fallback_delay),
+                                            cio::after_deadline(overall_deadline));
+                const std::size_t index = co_await selected;
+                if (index == 2) break;
+                if (index == 1) continue;
+                received = selected.get<0>();
+            } else {
+                auto selected =
+                    cio::select(cio::recv(results), cio::after(fallback_delay));
+                if ((co_await selected) == 1) continue;
+                received = selected.get<0>();
+            }
+        } else if (has_overall_timeout) {
+            auto selected = cio::select(cio::recv(results),
+                                        cio::after_deadline(overall_deadline));
+            if ((co_await selected) == 1) break;
+            received = selected.get<0>();
+        } else {
+            received = co_await results.recv();
+        }
+
+        if (!received) break;
+        ++finished;
+
+        last = std::move(*received);
+        if (last) {
+            winner = std::move(last);
+            last = Error{EHOSTUNREACH};
+            break;
+        }
+        // The caller's token fired; stop racing and report it.
+        if (last.error().is(Errc::cancelled)) break;
+    }
+
+    // Cancel first so every loser closes its socket, then join them all. The
+    // join is prompt precisely because cancellation closes rather than
+    // abandons.
+    stop.cancel();
+    for (auto& attempt : attempts) co_await attempt;
+    settled.close();
+    if (watcher.valid()) co_await watcher;
+
+    if (winner) {
+        if (options_.nodelay) (void)winner->set_nodelay(true);
+        co_return winner;
+    }
+    if (cancel && cancel.cancelled()) co_return Error{Errc::cancelled};
+    if (has_overall_timeout && Clock::now() >= overall_deadline &&
+        !last.error().is(Errc::cancelled)) {
+        co_return Error{Errc::timed_out};
     }
     co_return last;
 }
 
+Task<Result<TcpStream>> dial_tcp(std::string host, std::uint16_t port,
+                                 CancelToken cancel) {
+    co_return co_await Dialer{}.dial_tcp(std::move(host), port,
+                                         std::move(cancel));
+}
+
+void TcpStream::set_deadline(TimePoint deadline) {
+    apply_deadline(fd_, desc_, true, true, absolute_ns(deadline));
+}
+
 void TcpStream::set_read_deadline(TimePoint deadline) {
-    const IoOperation operation = capture_operation(fd_, desc_);
-    if (!operation) return;
-    reactor_for(operation.desc).set_deadline(
-        operation.desc, detail::Dir::kRead, operation.generation,
-        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
-            .count());
+    apply_deadline(fd_, desc_, true, false, absolute_ns(deadline));
 }
 
 void TcpStream::set_write_deadline(TimePoint deadline) {
-    const IoOperation operation = capture_operation(fd_, desc_);
-    if (!operation) return;
-    reactor_for(operation.desc).set_deadline(
-        operation.desc, detail::Dir::kWrite, operation.generation,
-        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
-            .count());
+    apply_deadline(fd_, desc_, false, true, absolute_ns(deadline));
+}
+
+void TcpStream::set_timeout(Duration timeout) {
+    apply_deadline(fd_, desc_, true, true, deadline_from_now(timeout));
 }
 
 void TcpStream::set_read_timeout(Duration timeout) {
-    const IoOperation operation = capture_operation(fd_, desc_);
-    if (!operation) return;
-    reactor_for(operation.desc).set_deadline(
-        operation.desc, detail::Dir::kRead, operation.generation,
-        deadline_from_now(timeout));
+    apply_deadline(fd_, desc_, true, false, deadline_from_now(timeout));
 }
 
 void TcpStream::set_write_timeout(Duration timeout) {
-    const IoOperation operation = capture_operation(fd_, desc_);
-    if (!operation) return;
-    reactor_for(operation.desc).set_deadline(
-        operation.desc, detail::Dir::kWrite, operation.generation,
-        deadline_from_now(timeout));
+    apply_deadline(fd_, desc_, false, true, deadline_from_now(timeout));
+}
+
+void TcpStream::clear_deadline() {
+    apply_deadline(fd_, desc_, true, true, 0);
 }
 
 void TcpStream::clear_read_deadline() {
-    const IoOperation operation = capture_operation(fd_, desc_);
-    if (!operation) return;
-    reactor_for(operation.desc).set_deadline(
-        operation.desc, detail::Dir::kRead, operation.generation, 0);
+    apply_deadline(fd_, desc_, true, false, 0);
 }
 
 void TcpStream::clear_write_deadline() {
-    const IoOperation operation = capture_operation(fd_, desc_);
-    if (!operation) return;
-    reactor_for(operation.desc).set_deadline(
-        operation.desc, detail::Dir::kWrite, operation.generation, 0);
+    apply_deadline(fd_, desc_, false, true, 0);
 }
 
 Result<void> TcpStream::set_nodelay(bool on) {
@@ -1021,22 +1481,40 @@ Task<Result<std::size_t>> UdpSocket::send_to(std::span<const std::byte> buffer,
     }
 }
 
+void UdpSocket::set_deadline(TimePoint deadline) {
+    apply_deadline(fd_, desc_, true, true, absolute_ns(deadline));
+}
+
 void UdpSocket::set_read_deadline(TimePoint deadline) {
-    const IoOperation operation = capture_operation(fd_, desc_);
-    if (!operation) return;
-    reactor_for(operation.desc).set_deadline(
-        operation.desc, detail::Dir::kRead, operation.generation,
-        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
-            .count());
+    apply_deadline(fd_, desc_, true, false, absolute_ns(deadline));
 }
 
 void UdpSocket::set_write_deadline(TimePoint deadline) {
-    const IoOperation operation = capture_operation(fd_, desc_);
-    if (!operation) return;
-    reactor_for(operation.desc).set_deadline(
-        operation.desc, detail::Dir::kWrite, operation.generation,
-        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
-            .count());
+    apply_deadline(fd_, desc_, false, true, absolute_ns(deadline));
+}
+
+void UdpSocket::set_timeout(Duration timeout) {
+    apply_deadline(fd_, desc_, true, true, deadline_from_now(timeout));
+}
+
+void UdpSocket::set_read_timeout(Duration timeout) {
+    apply_deadline(fd_, desc_, true, false, deadline_from_now(timeout));
+}
+
+void UdpSocket::set_write_timeout(Duration timeout) {
+    apply_deadline(fd_, desc_, false, true, deadline_from_now(timeout));
+}
+
+void UdpSocket::clear_deadline() {
+    apply_deadline(fd_, desc_, true, true, 0);
+}
+
+void UdpSocket::clear_read_deadline() {
+    apply_deadline(fd_, desc_, true, false, 0);
+}
+
+void UdpSocket::clear_write_deadline() {
+    apply_deadline(fd_, desc_, false, true, 0);
 }
 
 }  // namespace cio::net

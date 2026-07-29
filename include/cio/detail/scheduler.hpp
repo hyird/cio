@@ -158,6 +158,7 @@ public:
 
     Scheduler(std::size_t worker_count, std::size_t max_blocking_threads,
               std::size_t max_blocking_queue = 1024);
+    Scheduler(std::size_t worker_count, BlockingLimits blocking_limits);
     ~Scheduler();
 
     Scheduler(const Scheduler&) = delete;

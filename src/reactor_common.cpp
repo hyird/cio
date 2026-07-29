@@ -211,6 +211,18 @@ std::coroutine_handle<> Reactor::on_deadline(Timer* timer) noexcept {
     return {};  // unblock() already scheduled whoever was parked
 }
 
+void Reactor::cancel_waiters(IoDesc* desc,
+                             std::uint32_t expected_generation) noexcept {
+    desc->lock_lifecycle();
+    if (!desc->closing.load(std::memory_order_acquire) &&
+        desc->generation.load(std::memory_order_acquire) ==
+            expected_generation) {
+        unblock(desc, Dir::kRead, Error{Errc::cancelled});
+        unblock(desc, Dir::kWrite, Error{Errc::cancelled});
+    }
+    desc->unlock_lifecycle();
+}
+
 void Reactor::set_deadline(IoDesc* desc, Dir dir,
                            std::uint32_t expected_generation,
                            std::int64_t deadline_ns) {

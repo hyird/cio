@@ -28,6 +28,7 @@
 
 #include "cio/clock.hpp"
 #include "cio/detail/reactor.hpp"
+#include "cio/group.hpp"
 #include "cio/result.hpp"
 #include "cio/task.hpp"
 
@@ -65,7 +66,44 @@ private:
     unsigned length_ = 0;
 };
 
-// Name resolution runs on the blocking pool: getaddrinfo has no async form.
+enum class AddressFamily {
+    any,
+    ipv4,
+    ipv6,
+};
+
+struct LookupOptions {
+    AddressFamily family = AddressFamily::any;
+};
+
+// Name resolution runs on the blocking pool: getaddrinfo has no async form, and
+// the system resolver is the source of truth so /etc/hosts, nsswitch.conf and
+// libc policy keep applying. cio implements no DNS protocol and no cache.
+//
+// CANCELLATION: a lookup cancelled before it starts never reaches the pool. One
+// cancelled after getaddrinfo() has begun resumes the caller with
+// Errc::cancelled while the lookup finishes in the background; its late result
+// is discarded and never resumes the caller a second time. That is why the job
+// owns its own strings and result storage rather than borrowing the frame's.
+class Resolver {
+public:
+    Resolver() = default;
+    explicit Resolver(LookupOptions options) noexcept : options_(options) {}
+
+    Task<Result<std::vector<SocketAddr>>> lookup_host(
+        std::string host, std::uint16_t port, CancelToken cancel = {}) const;
+
+    // Reverse lookup. Returns the names for an address, longest-standing first.
+    Task<Result<std::vector<std::string>>> lookup_addr(
+        SocketAddr address, CancelToken cancel = {}) const;
+
+    const LookupOptions& options() const noexcept { return options_; }
+
+private:
+    LookupOptions options_{};
+};
+
+// Delegates to a default-constructed Resolver.
 Task<Result<std::vector<SocketAddr>>> resolve(std::string host, std::uint16_t port);
 
 // Base for the socket types: owns the fd and its reactor registration.
@@ -77,7 +115,9 @@ public:
     Socket(Socket&& other) noexcept
         : fd_(std::exchange(other.fd_, -1)),
           desc_(std::exchange(other.desc_, nullptr)),
-          scheduler_lifetime_(std::move(other.scheduler_lifetime_)) {}
+          scheduler_lifetime_(std::move(other.scheduler_lifetime_)),
+          cancel_binding_(std::move(other.cancel_binding_)),
+          cancel_token_(std::move(other.cancel_token_)) {}
     Socket& operator=(Socket&& other) noexcept {
         if (this != &other) {
             close();
@@ -85,6 +125,8 @@ public:
             desc_ = std::exchange(other.desc_, nullptr);
             scheduler_lifetime_ =
                 std::move(other.scheduler_lifetime_);
+            cancel_binding_ = std::move(other.cancel_binding_);
+            cancel_token_ = std::move(other.cancel_token_);
         }
         return *this;
     }
@@ -100,6 +142,25 @@ public:
 
     Result<SocketAddr> local_addr() const;
     Result<SocketAddr> peer_addr() const;
+
+    // Binds a cancellation signal to this socket.
+    //
+    // Once the token fires, every operation in either direction fails with
+    // Errc::cancelled — including one already parked, which is woken — and
+    // every later operation fails immediately, exactly as an elapsed deadline
+    // does. This is why read(), write() and accept() take no cancel parameter:
+    // like deadlines, cancellation lives on the connection, not on the call.
+    //
+    // Binding an already-cancelled token cancels the socket at once. Binding a
+    // new token replaces the previous binding; a default-constructed token
+    // clears it.
+    void set_cancel(CancelToken token);
+    void clear_cancel() { set_cancel(CancelToken{}); }
+
+    // The absolute deadline currently set on a direction, or a default-
+    // constructed TimePoint when none is. Exposed so a scoped deadline can put
+    // back exactly what it found.
+    TimePoint deadline(bool write_direction) const;
 
 protected:
     // Takes ownership of `fd` and registers it with the reactor.
@@ -119,14 +180,25 @@ protected:
     // is deliberately not stored in IoDesc, which would create Scheduler ->
     // Reactor -> IoDesc -> Scheduler ownership cycles.
     std::shared_ptr<detail::Scheduler> scheduler_lifetime_;
+    // Kept alive here and by the CancelState until cancellation fires, so a
+    // hook can never reference a destroyed binding.
+    std::shared_ptr<detail::CancelHook> cancel_binding_;
+    CancelToken cancel_token_;
 };
 
 class TcpStream : public Socket {
 public:
     TcpStream() = default;
 
+    // Already-resolved connect. With a cancel token, a cancellation resumes the
+    // caller with Errc::cancelled; the abandoned socket is closed once its
+    // connect settles, so no descriptor is leaked.
     static Task<Result<TcpStream>> connect(SocketAddr addr);
+    static Task<Result<TcpStream>> connect(SocketAddr addr, CancelToken cancel);
+    // Convenience: resolves through a default Dialer.
     static Task<Result<TcpStream>> connect(std::string host, std::uint16_t port);
+    static Task<Result<TcpStream>> connect(std::string host, std::uint16_t port,
+                                           CancelToken cancel);
 
     // Reads whatever is available. 0 means the peer closed cleanly (EOF).
     Task<Result<std::size_t>> read(std::span<std::byte> buffer);
@@ -146,10 +218,16 @@ public:
         return detail::IoAwaiter{desc_, detail::Dir::kWrite};
     }
 
+    // Deadlines are per-direction and persist until reset: once one elapses,
+    // every operation in that direction fails until it is changed or cleared.
+    // The unsuffixed forms apply to both directions at once.
+    void set_deadline(TimePoint deadline);
     void set_read_deadline(TimePoint deadline);
     void set_write_deadline(TimePoint deadline);
+    void set_timeout(Duration timeout);
     void set_read_timeout(Duration timeout);
     void set_write_timeout(Duration timeout);
+    void clear_deadline();
     void clear_read_deadline();
     void clear_write_deadline();
 
@@ -158,6 +236,12 @@ public:
 
 private:
     friend class TcpListener;
+
+    // Shared by both connect() overloads. begin_connect() creates, connects and
+    // adopts the socket, reporting whether it completed without parking;
+    // await_connect() runs the writability/SO_ERROR loop.
+    static Result<bool> begin_connect(SocketAddr addr, TcpStream& stream);
+    static Task<Result<void>> await_connect(TcpStream& stream);
 };
 
 class TcpListener : public Socket {
@@ -174,6 +258,41 @@ public:
     void clear_deadline();
 };
 
+struct DialOptions {
+    // Covers resolution and every connection attempt. Zero means no overall
+    // timeout.
+    Duration timeout{};
+    // How long one address gets before the next is tried. Zero selects 300ms.
+    Duration fallback_delay{};
+    bool nodelay = true;
+    AddressFamily family = AddressFamily::any;
+};
+
+// Name resolution and address selection live here, not on TcpStream.
+//
+// Addresses are tried with the families interleaved (v6, v4, v6, ...) rather
+// than exhausting one family before starting the other, so a host whose IPv6
+// route is a blackhole does not have to fail every v6 address first. Attempts
+// run one at a time, each bounded by fallback_delay; cio does not yet race
+// attempts concurrently the way RFC 8305 does.
+class Dialer {
+public:
+    Dialer() = default;
+    explicit Dialer(DialOptions options) noexcept : options_(options) {}
+
+    Task<Result<TcpStream>> dial_tcp(std::string host, std::uint16_t port,
+                                     CancelToken cancel = {}) const;
+
+    const DialOptions& options() const noexcept { return options_; }
+
+private:
+    DialOptions options_{};
+};
+
+// Delegates to a default-constructed Dialer.
+Task<Result<TcpStream>> dial_tcp(std::string host, std::uint16_t port,
+                                 CancelToken cancel = {});
+
 class UdpSocket : public Socket {
 public:
     UdpSocket() = default;
@@ -184,8 +303,16 @@ public:
     Task<Result<std::size_t>> send_to(std::span<const std::byte> buffer,
                                       const SocketAddr& to);
 
+    // Same deadline rules as TcpStream.
+    void set_deadline(TimePoint deadline);
     void set_read_deadline(TimePoint deadline);
     void set_write_deadline(TimePoint deadline);
+    void set_timeout(Duration timeout);
+    void set_read_timeout(Duration timeout);
+    void set_write_timeout(Duration timeout);
+    void clear_deadline();
+    void clear_read_deadline();
+    void clear_write_deadline();
 };
 
 }  // namespace cio::net

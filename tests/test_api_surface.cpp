@@ -399,6 +399,11 @@ cio::Task<int> exercise_concurrency_surface() {
     stream.clear_read_deadline();
     stream.clear_write_deadline();
 
+    // Combined forms cover both directions in one call.
+    stream.set_deadline(cio::Clock::now() + 1s);
+    stream.set_timeout(1s);
+    stream.clear_deadline();
+
     const auto accepted = co_await listener.accept();
     (void)accepted;
     listener.set_deadline(cio::Clock::now() + 1s);
@@ -409,6 +414,55 @@ cio::Task<int> exercise_concurrency_surface() {
     const auto sent = co_await datagram.send_to(output, peer);
     (void)received;
     (void)sent;
+
+    // Generic stream algorithms apply to the concrete socket types.
+    static_assert(cio::AsyncReader<cio::net::TcpStream>);
+    static_assert(cio::AsyncWriter<cio::net::TcpStream>);
+    const auto exact = co_await cio::read_exact(stream, input);
+    (void)exact;
+    const auto all_written = co_await cio::write_all(stream, output);
+    (void)all_written;
+    const auto copied = co_await cio::copy(stream, stream);
+    (void)copied;
+    const auto copied_scratch = co_await cio::copy(stream, stream, input);
+    (void)copied_scratch;
+
+    // Resolver and dialer: the object forms plus the free-function shorthands.
+    cio::CancelSource stop;
+    const cio::net::Resolver resolver{
+        cio::net::LookupOptions{cio::net::AddressFamily::ipv4}};
+    const auto looked_up =
+        co_await resolver.lookup_host("localhost", 80, stop.token());
+    (void)looked_up;
+    const auto reversed = co_await resolver.lookup_addr(peer, stop.token());
+    (void)reversed;
+    const auto resolved = co_await cio::net::resolve("localhost", 80);
+    (void)resolved;
+
+    cio::net::DialOptions dial_options;
+    dial_options.timeout = 5s;
+    dial_options.fallback_delay = 300ms;
+    dial_options.nodelay = true;
+    dial_options.family = cio::net::AddressFamily::any;
+    const cio::net::Dialer dialer{dial_options};
+    const auto dialed = co_await dialer.dial_tcp("localhost", 80, stop.token());
+    (void)dialed;
+    const auto dialed_free = co_await cio::net::dial_tcp("localhost", 80);
+    (void)dialed_free;
+
+    const auto connected = co_await cio::net::TcpStream::connect(peer, stop.token());
+    (void)connected;
+    const auto connected_by_name =
+        co_await cio::net::TcpStream::connect("localhost", 80, stop.token());
+    (void)connected_by_name;
+
+    datagram.set_read_timeout(1s);
+    datagram.set_write_timeout(1s);
+    datagram.set_deadline(cio::Clock::now() + 1s);
+    datagram.set_timeout(1s);
+    datagram.clear_read_deadline();
+    datagram.clear_write_deadline();
+    datagram.clear_deadline();
 }
 
 void test_task_laziness_and_runtime_options() {

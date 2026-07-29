@@ -102,6 +102,17 @@ struct CIO_CACHE_ALIGNED IoDesc {
     // new async work after cio::run() has stopped that scheduler, instead of
     // parking behind an epoll shard that no longer has a worker.
     const std::atomic<bool>* runtime_stop = nullptr;
+    // Optional cancellation bound to this descriptor.
+    //
+    // Cancellation rides the same syscall-admission check as the deadline
+    // rather than being threaded through every operation's signature: a
+    // descriptor-scoped signal is what makes read/write/accept cancellable
+    // without changing a single public signature, and it matches the existing
+    // rule that deadlines live on the connection, not on the call.
+    //
+    // The pointee is owned by a CancelToken the Socket holds, so it outlives
+    // every binding; the pointer is cleared under the lifecycle lock.
+    std::atomic<const std::atomic<bool>*> cancel_flag{nullptr};
     IoDesc* free_next = nullptr;
 
     IoTimer deadline_timer[kDirCount];
@@ -174,6 +185,12 @@ struct CIO_CACHE_ALIGNED IoDesc {
                deadline_seq[i].load(std::memory_order_acquire);
     }
 
+    bool cancelled() const noexcept {
+        const std::atomic<bool>* const flag =
+            cancel_flag.load(std::memory_order_acquire);
+        return flag != nullptr && flag->load(std::memory_order_acquire);
+    }
+
     bool runtime_stopping() const noexcept {
         return runtime_stop != nullptr &&
                runtime_stop->load(std::memory_order_acquire);
@@ -193,6 +210,7 @@ struct CIO_CACHE_ALIGNED IoDesc {
             return Error{Errc::closed};
         }
         if (runtime_stopping()) return Error{Errc::shutdown};
+        if (cancelled()) return Error{Errc::cancelled};
 
         const bool expired = timed_out(d);
         if (generation.load(std::memory_order_acquire) != expected_generation ||
@@ -215,6 +233,8 @@ struct CIO_CACHE_ALIGNED IoDesc {
             state = Error{Errc::closed};
         } else if (runtime_stopping()) {
             state = Error{Errc::shutdown};
+        } else if (cancelled()) {
+            state = Error{Errc::cancelled};
         } else if (timed_out(d)) {
             state = Error{Errc::timed_out};
         } else if (syscall_active[i].load(std::memory_order_relaxed)) {
@@ -405,6 +425,12 @@ public:
 
     // Wakes the task parked on (desc, dir), or records readiness if none.
     // A default-constructed `err` means "ready".
+    // Fails both directions of a live descriptor with Errc::cancelled, waking
+    // anything parked on it. Same shape as the deadline callback: taken under
+    // the lifecycle lock and gated on the incarnation, so a hook that fires
+    // after the descriptor was closed or recycled is a no-op.
+    void cancel_waiters(IoDesc* desc, std::uint32_t expected_generation) noexcept;
+
     void unblock(IoDesc* desc, Dir dir, Error err) noexcept {
         unblock_impl(desc, dir, err, nullptr);
     }

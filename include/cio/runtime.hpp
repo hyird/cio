@@ -27,6 +27,13 @@ struct RuntimeOptions {
     // with Errc::overloaded instead of retaining coroutine frames without
     // bound. 0 selects the default limit of 1024.
     std::size_t max_blocking_queue = 1024;
+    // Concurrently admitted built-in file operations. These bound operations,
+    // not threads: a task waiting for admission is parked and occupies no pool
+    // thread. Each class has its own wait queue, so a burst of one kind cannot
+    // sit in front of the other. 0 means the class is not separately limited.
+    std::size_t max_file_operations = 32;
+    // Concurrently admitted name lookups.
+    std::size_t max_resolver_operations = 8;
 };
 
 class Runtime {

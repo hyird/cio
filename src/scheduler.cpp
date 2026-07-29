@@ -1,9 +1,13 @@
 #include "cio/detail/scheduler.hpp"
 
+#include <pthread.h>
+#include <sched.h>
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -91,15 +95,230 @@ thread_local Worker* t_worker = nullptr;
 std::atomic<Scheduler*> g_default_scheduler{nullptr};
 
 constexpr std::int64_t kMonitorPollStaleNs = 200'000;  // 200us
+constexpr std::int64_t kMonitorDriverGraceNs = 200'000;  // 200us
 constexpr std::uint32_t kInboxDrainBatch = 32;
 // While a worker has an indefinitely non-empty local queue, this bounds how
 // many coroutine resumptions may pass before it services targeted submissions,
-// its reactor shard and its timer shard. This budget is intentionally separate
-// from kGlobalQueueInterval: rotating global/FIFO fairness must not turn one
-// remote wake into a 122+-resume delay.
+// its reactor shard and its timer shard. This periodic checkpoint is one of
+// two bounded monitor-ticket acknowledgement sites; the other is the cold
+// I/O-completion quota checkpoint. Neither adds a shared load to ordinary
+// I/O completions or task selections.
 constexpr std::uint32_t kLocalServiceInterval = 32;
 
 }  // namespace
+
+thread_local constinit std::uint64_t t_cooperative_io_budget = 0;
+#if defined(__GNUC__) || defined(__clang__)
+extern thread_local constinit std::uint64_t
+    t_cooperative_io_budget_local
+    __attribute__((
+        alias("_ZN3cio6detail23t_cooperative_io_budgetE"),
+        visibility("hidden")));
+#endif
+
+// A stable scheduler control frame, allocated once per Reactor. It never
+// completes by itself: each resume performs at most one non-blocking shard
+// poll and suspends again. Reactor owns and destroys the frame only after the
+// monitor and all workers have joined, so a queued-but-never-run control item
+// cannot leak or outlive its shard during shutdown.
+struct Reactor::DriverCoroutine {
+    struct promise_type {
+        DriverCoroutine get_return_object() noexcept {
+            return DriverCoroutine{
+                std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_always initial_suspend() const noexcept { return {}; }
+        std::suspend_always final_suspend() const noexcept { return {}; }
+        void return_void() const noexcept {}
+        [[noreturn]] void unhandled_exception() const noexcept {
+            std::terminate();
+        }
+    };
+
+    using Handle = std::coroutine_handle<promise_type>;
+
+    explicit DriverCoroutine(Handle handle) noexcept : handle_(handle) {}
+    DriverCoroutine(DriverCoroutine&& other) noexcept
+        : handle_(std::exchange(other.handle_, {})) {}
+    DriverCoroutine(const DriverCoroutine&) = delete;
+    DriverCoroutine& operator=(const DriverCoroutine&) = delete;
+    ~DriverCoroutine() {
+        if (handle_) handle_.destroy();
+    }
+
+    Handle release() noexcept {
+        return std::exchange(handle_, {});
+    }
+
+private:
+    Handle handle_{};
+};
+
+struct Reactor::DriverSuspend {
+    Reactor* reactor;
+
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<>) const noexcept {
+        // This release publication is deliberately the final operation in
+        // await_suspend. Once visible, another worker may queue and resume the
+        // same stable frame immediately.
+        reactor->driver_phase_.store(
+            DriverPhase::kSuspended, std::memory_order_release);
+    }
+    void await_resume() const noexcept {}
+};
+
+Reactor::DriverCoroutine Reactor::driver_loop() {
+    for (;;) {
+        run_driver_once();
+        co_await DriverSuspend{this};
+    }
+}
+
+void Reactor::initialize_driver() {
+    DriverCoroutine driver = driver_loop();
+    driver_handle_ = driver.release();
+    driver_phase_.store(
+        DriverPhase::kSuspended, std::memory_order_release);
+}
+
+void Reactor::destroy_driver() noexcept {
+    driver_phase_.store(
+        DriverPhase::kUnavailable, std::memory_order_release);
+    const std::coroutine_handle<> handle =
+        std::exchange(driver_handle_, {});
+    if (handle) handle.destroy();
+}
+
+void Reactor::cover_driver_epoch(std::uint64_t epoch) noexcept {
+    std::uint64_t covered =
+        driver_covered_epoch_.load(std::memory_order_relaxed);
+    while (covered < epoch &&
+           !driver_covered_epoch_.compare_exchange_weak(
+               covered, epoch, std::memory_order_release,
+               std::memory_order_relaxed)) {
+    }
+}
+
+void Reactor::observe_driver_coverage() noexcept {
+    for (;;) {
+        const std::uint64_t requested =
+            driver_requested_epoch_.load(std::memory_order_acquire);
+        if (driver_covered_epoch_.load(std::memory_order_acquire) >=
+            requested) {
+            return;
+        }
+        const std::int64_t requested_at =
+            driver_requested_at_ns_.load(std::memory_order_relaxed);
+        if (driver_requested_epoch_.load(std::memory_order_acquire) !=
+            requested) {
+            continue;
+        }
+        if (last_poll_ns_.load(std::memory_order_acquire) >=
+            requested_at) {
+            cover_driver_epoch(requested);
+        }
+        return;
+    }
+}
+
+bool Reactor::request_driver_at(
+    std::int64_t requested_ns) noexcept {
+    observe_driver_coverage();
+    const std::uint64_t requested =
+        driver_requested_epoch_.load(std::memory_order_acquire);
+    if (driver_covered_epoch_.load(std::memory_order_acquire) <
+        requested) {
+        return false;
+    }
+
+    // monitor_main is the sole producer. Publish the timestamp before its
+    // generation so a worker's acquire snapshot cannot pair a new epoch with
+    // the preceding request's deadline.
+    driver_requested_at_ns_.store(
+        requested_ns, std::memory_order_relaxed);
+    driver_requested_epoch_.store(
+        requested + 1, std::memory_order_release);
+    return true;
+}
+
+bool Reactor::queue_driver() noexcept {
+    const std::uint64_t requested =
+        driver_requested_epoch_.load(std::memory_order_acquire);
+    if (driver_covered_epoch_.load(std::memory_order_acquire) >=
+            requested ||
+        driver_attempted_epoch_.load(std::memory_order_acquire) >=
+            requested) {
+        return false;
+    }
+
+    DriverPhase expected = DriverPhase::kSuspended;
+    if (!driver_phase_.compare_exchange_strong(
+            expected, DriverPhase::kQueued,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return false;
+    }
+
+    // This is intentionally global, not a fixed owner's MPSC inbox. The
+    // control item has no hard affinity, and any idle worker can provide the
+    // worker context that keeps completions local.
+    sched_.global_.push(driver_handle_.address());
+    sched_.wake_one_idle(shard_id_ + 1);
+    return true;
+}
+
+void Reactor::run_driver_once() noexcept {
+    driver_phase_.store(
+        DriverPhase::kRunning, std::memory_order_relaxed);
+
+    std::uint64_t requested = 0;
+    std::int64_t requested_at = 0;
+    for (;;) {
+        requested =
+            driver_requested_epoch_.load(std::memory_order_acquire);
+        requested_at =
+            driver_requested_at_ns_.load(std::memory_order_relaxed);
+        if (driver_requested_epoch_.load(std::memory_order_acquire) ==
+            requested) {
+            break;
+        }
+    }
+
+    std::uint64_t attempted =
+        driver_attempted_epoch_.load(std::memory_order_relaxed);
+    while (attempted < requested &&
+           !driver_attempted_epoch_.compare_exchange_weak(
+               attempted, requested, std::memory_order_release,
+               std::memory_order_relaxed)) {
+    }
+
+    if (driver_covered_epoch_.load(std::memory_order_acquire) >=
+            requested ||
+        last_poll_ns_.load(std::memory_order_acquire) >=
+            requested_at) {
+        cover_driver_epoch(requested);
+        return;
+    }
+
+    if (sched_.stopping() || registered() == 0) {
+        cover_driver_epoch(requested);
+        return;
+    }
+
+    const int result = poll(0);
+    if (result >= 0) {
+        // Cover only the generation captured before poll(). A newer request
+        // published during this run remains outstanding and will requeue the
+        // frame after DriverSuspend makes it safely resumable.
+        cover_driver_epoch(requested);
+    } else {
+        // Another owner already has polling_. Its eventual freshness
+        // publication, or the monitor's absolute grace backstop, provides
+        // coverage; a failed claim is not completion by itself.
+        observe_driver_coverage();
+    }
+}
 
 SchedulerLease::SchedulerLease(
     SchedulerLease&& other) noexcept
@@ -395,8 +614,9 @@ void Worker::stage_fairness_item(void* item) noexcept {
 }
 
 void* Worker::service_fairness() noexcept {
-    // Do all three services before selecting the next task. A permanently
-    // non-empty inbox must not hide local I/O or timers, and vice versa.
+    // Service each owner-local concern before selecting the next task. A
+    // permanently non-empty inbox must not hide reactor service or timers,
+    // and vice versa.
     void* const inbox_item = drain_inbox();
     if (inbox_item != nullptr) {
         // Reserve runnext for the already-selected inbox task before polling.
@@ -421,9 +641,13 @@ void* Worker::service_fairness() noexcept {
     // If inbox work was selected above, runnext is reserved and every new
     // completion enters the published FIFO. Otherwise at most one newly-ready
     // continuation gets runnext priority; the rest of the batch enters FIFO.
-    // Since checkpoints are bounded by kLocalServiceInterval, that priority
-    // exception is bounded too.
-    if (reactor_->registered() > 0) reactor_->poll(0);
+    // The fixed owner checkpoint preserves prompt I/O service; the monitor
+    // ticket only keeps the stale-reactor fallback owner-first.
+    if (reactor_->registered() > 0) {
+        // A failed claim means the foreign fallback already owns the shard.
+        // The ticket is still acknowledged: there is no retry state.
+        (void)reactor_->poll(0);
+    }
 
     const std::int64_t timer_deadline =
         sched_->timers_->next_deadline_ns(index_);
@@ -465,7 +689,11 @@ void* Worker::service_global_fairness() noexcept {
 
 void* Worker::next_local() noexcept {
     const std::uint32_t tick = ++tick_;
+
     if (tick % kLocalServiceInterval == 0) {
+        // Fold the ticket load into the fairness checkpoint that already
+        // exists, avoiding another shared load on every task selection.
+        (void)reactor_->take_owner_poll_request_ns();
         if (void* item = service_fairness()) return item;
     }
 
@@ -578,7 +806,7 @@ void* Worker::find_work() noexcept {
     // equivalent readiness service.
     if (reactor_->registered() > 0 &&
         sched_->stealable_workers_->any()) {
-        reactor_->poll(0);
+        (void)reactor_->poll(0);
         if (void* item = take_local()) return item;
         if (void* item = drain_inbox()) return item;
     }
@@ -615,6 +843,12 @@ void Worker::run() {
 
         if (item != nullptr) {
             CIO_METRIC(tasks_run, 1);
+            // A top-level scheduler return is already a fairness boundary.
+            // The extra count lets one full quota of terminal leaf completions
+            // remain in one symmetric-transfer chain; the following completion
+            // performs the cold demand check.
+            t_cooperative_io_budget = kCooperativeIoBudget + 1;
+            cooperative_io_local_grace_ = false;
             std::coroutine_handle<>::from_address(item).resume();
             continue;
         }
@@ -623,6 +857,7 @@ void Worker::run() {
     }
 
     sched_->idle_workers_->clear(index_);
+    t_cooperative_io_budget = 0;
     t_worker = nullptr;
 }
 
@@ -975,7 +1210,10 @@ void Scheduler::finish_io_batch(
         unpublished_local_fifo == 0) {
         return;
     }
-    publish_stealable(*worker, unpublished_local_fifo);
+    if (worker->queue_.maybe_nonempty()) {
+        publish_stealable(
+            *worker, unpublished_local_fifo);
+    }
 }
 
 void Scheduler::reschedule_self(std::coroutine_handle<> handle) noexcept {
@@ -985,6 +1223,184 @@ void Scheduler::reschedule_self(std::coroutine_handle<> handle) noexcept {
         return;
     }
     schedule_frame(handle.address());
+}
+
+std::uint8_t cooperative_io_return_debt_slow() noexcept {
+    t_cooperative_io_budget = 0;
+    Scheduler* const scheduler = current_scheduler();
+    if (scheduler == nullptr) {
+        return kCooperativeIoDebtNone;
+    }
+
+    const std::uint8_t debt =
+        scheduler->prepare_cooperative_io_checkpoint();
+    if (debt == kCooperativeIoDebtNone) {
+        t_cooperative_io_budget =
+            kCooperativeIoBudget + 1;
+    }
+    return debt;
+}
+
+std::uint8_t Scheduler::prepare_cooperative_io_checkpoint() noexcept {
+    Worker* const worker = t_worker;
+    if (worker == nullptr || worker->sched_ != this) {
+        return kCooperativeIoDebtNone;
+    }
+
+    CIO_METRIC(cooperative_io_exhaustions, 1);
+
+    const auto runnable_debt = [this, worker]() noexcept {
+        std::uint8_t debt = kCooperativeIoDebtNone;
+        if (worker->runnext_.load(std::memory_order_acquire) != nullptr ||
+            worker->queue_.maybe_nonempty()) {
+            debt |= kCooperativeIoDebtLocal;
+        }
+        if (!worker->inbox_.empty()) {
+            debt |= kCooperativeIoDebtInbox;
+        }
+        if (!global_.empty()) {
+            debt |= kCooperativeIoDebtGlobal;
+        }
+        return debt;
+    };
+
+    const auto record_yield = [worker](std::uint8_t debt) noexcept {
+        worker->cooperative_io_local_grace_ = false;
+        CIO_METRIC(cooperative_io_forced_yields, 1);
+        const std::uint8_t runnable = debt & static_cast<std::uint8_t>(
+            kCooperativeIoDebtLocal |
+            kCooperativeIoDebtInbox |
+            kCooperativeIoDebtGlobal);
+        if (runnable == kCooperativeIoDebtLocal) {
+            CIO_METRIC(cooperative_io_yield_local_only, 1);
+        }
+        if ((runnable & kCooperativeIoDebtInbox) != 0) {
+            CIO_METRIC(cooperative_io_yield_inbox, 1);
+        }
+        if ((runnable & kCooperativeIoDebtGlobal) != 0) {
+            CIO_METRIC(cooperative_io_yield_global, 1);
+        }
+    };
+
+    if (stopping()) {
+        record_yield(kCooperativeIoDebtStop);
+        return kCooperativeIoDebtStop;
+    }
+
+    // Existing runnable work is already sufficient reason to yield. Avoid an
+    // opportunistic kernel call in that case; the normal owner checkpoint
+    // retains the ticket and will service it.
+    if (std::uint8_t debt = runnable_debt();
+        debt != kCooperativeIoDebtNone) {
+        if (debt == kCooperativeIoDebtLocal &&
+            !worker->cooperative_io_local_grace_) {
+            worker->cooperative_io_local_grace_ = true;
+            CIO_METRIC(
+                cooperative_io_deferred_local_only, 1);
+            return kCooperativeIoDebtNone;
+        }
+        record_yield(debt);
+        return debt;
+    }
+
+    Reactor& reactor = *worker->reactor_;
+    if (reactor.take_owner_poll_request_ns() != 0) {
+        if (reactor.registered() > 0) {
+            CIO_METRIC(cooperative_io_ticket_polls, 1);
+            (void)reactor.poll(0);
+            if (std::uint8_t debt = runnable_debt();
+                debt != kCooperativeIoDebtNone) {
+                CIO_METRIC(
+                    cooperative_io_ticket_polls_productive, 1);
+                record_yield(debt);
+                return debt;
+            }
+            CIO_METRIC(cooperative_io_ticket_polls_empty, 1);
+        }
+    }
+
+    // Avoid a clock read when this shard has no timer at all. An expired
+    // callback may complete inline without making a task runnable, so decide
+    // whether to yield from the queues after firing, not from the deadline.
+    const std::int64_t timer_deadline =
+        timers_->next_deadline_ns(worker->index_);
+    if (timer_deadline != INT64_MAX) {
+        CIO_METRIC(cooperative_io_timer_checks, 1);
+        if (timer_deadline <= now_ns()) {
+            timers_->run_expired(worker->index_);
+            if (std::uint8_t debt = runnable_debt();
+                debt != kCooperativeIoDebtNone) {
+                CIO_METRIC(cooperative_io_timer_productive, 1);
+                record_yield(debt);
+                return debt;
+            }
+        }
+    }
+
+    if (stopping()) {
+        record_yield(kCooperativeIoDebtStop);
+        return kCooperativeIoDebtStop;
+    }
+
+    worker->cooperative_io_local_grace_ = false;
+    CIO_METRIC(cooperative_io_renew_no_demand, 1);
+    return kCooperativeIoDebtNone;
+}
+
+void Scheduler::reschedule_self_for_cooperative_io(
+    std::coroutine_handle<> handle, std::uint8_t debt) noexcept {
+    Worker* const worker = t_worker;
+    if (worker == nullptr || worker->sched_ != this) {
+        schedule_frame(handle.address());
+        return;
+    }
+
+    // Convert one shared item, then one owner-directed item, into concrete
+    // local ordering before publishing the current continuation. Staging the
+    // inbox item last gives owner-only work runnext priority; any displaced
+    // global/local item is published for idle thieves.
+    bool staged_nonlocal = false;
+    if ((debt & kCooperativeIoDebtGlobal) != 0) {
+        if (void* item = global_.pop(); item != nullptr) {
+            worker->fair_cursor_ = 1;
+            worker->stage_fairness_item(item);
+            staged_nonlocal = true;
+        }
+    }
+    if ((debt & kCooperativeIoDebtInbox) != 0) {
+        if (void* item = worker->drain_inbox(); item != nullptr) {
+            worker->stage_fairness_item(item);
+            staged_nonlocal = true;
+        }
+    }
+
+    // With spare capacity, expose a local-only parent as well: the selected
+    // local task may never suspend, and an idle peer can then steal either the
+    // parent or enough older debt for the owner to reach it. Under saturation,
+    // keep ordinary local yields private to preserve connection locality.
+    const bool publish_parent =
+        staged_nonlocal ||
+        (((debt & kCooperativeIoDebtLocal) != 0) &&
+         idle_workers_->any());
+
+    // Final action: publication can let a peer resume and destroy this
+    // coroutine before await_suspend returns.
+    worker->push(handle.address(), publish_parent);
+}
+
+std::coroutine_handle<> defer_cooperative_io_continuation(
+    std::coroutine_handle<> continuation,
+    std::uint8_t debt) noexcept {
+    Worker* const worker = current_worker();
+    if (worker == nullptr) {
+        return continuation;
+    }
+
+    // Final action: publishing the parent may let it destroy the completed
+    // child frame whose FinalAwaiter called us.
+    worker->scheduler().reschedule_self_for_cooperative_io(
+        continuation, debt);
+    return std::noop_coroutine();
 }
 
 void Scheduler::schedule_next_frame(void* frame) noexcept {
@@ -1148,7 +1564,91 @@ void Scheduler::park(Worker& worker) {
     timers_->run_expired(worker.index_);
 }
 
+void Scheduler::monitor_pass(std::int64_t now) noexcept {
+    for (auto& worker : workers_) {
+        Reactor& reactor = *worker->reactor_;
+        if (!reactor.polling() && reactor.registered() > 0 &&
+            now - reactor.last_poll_ns() >
+                kMonitorPollStaleNs) {
+            // Give the shard owner one bounded checkpoint before using the
+            // worker-context driver. With one worker there is no independent
+            // executor for that control item, so retain the direct fallback.
+            if (!reactor.request_owner_poll_at(now)) {
+                if (workers_.size() == 1) {
+                    (void)reactor.poll(0);
+                } else {
+                    (void)reactor.request_driver_at(now);
+                    (void)reactor.queue_driver();
+
+                    std::uint64_t requested = 0;
+                    std::int64_t requested_at = 0;
+                    for (;;) {
+                        requested =
+                            reactor.driver_requested_epoch_.load(
+                                std::memory_order_acquire);
+                        requested_at =
+                            reactor.driver_requested_at_ns_.load(
+                                std::memory_order_relaxed);
+                        if (reactor.driver_requested_epoch_.load(
+                                std::memory_order_acquire) ==
+                            requested) {
+                            break;
+                        }
+                    }
+
+                    if (reactor.driver_covered_epoch_.load(
+                            std::memory_order_acquire) <
+                            requested &&
+                        now - requested_at >=
+                            kMonitorDriverGraceNs) {
+                        const int result = reactor.poll(0);
+                        if (result >= 0) {
+                            reactor.cover_driver_epoch(requested);
+                        } else {
+                            reactor.observe_driver_coverage();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Timer firing is serialized by the shard heap and is safe even while
+        // the owner is blocked in its reactor. Checking due timers
+        // unconditionally is a defensive backstop for any stale poll timeout
+        // or missed kernel wake.
+        if (timers_->next_deadline_ns(worker->index_) <= now) {
+            timers_->run_expired(worker->index_);
+        }
+    }
+}
+
+bool Scheduler::should_use_batch_monitor_policy(
+    int inherited_policy) noexcept {
+    return inherited_policy == SCHED_OTHER;
+}
+
 void Scheduler::monitor_main() {
+    (void)::pthread_setname_np(
+        ::pthread_self(), "cio-monitor");
+
+    // The watchdog must remain runnable when every worker executes
+    // non-suspending user code, so SCHED_IDLE is too weak. SCHED_BATCH remains
+    // in the normal fair class while reducing this short-sleeping background
+    // thread's wakeup-preemption advantage. Preserve any policy explicitly
+    // configured by the creator and inherited by std::thread.
+    int inherited_policy = SCHED_OTHER;
+    sched_param inherited_param{};
+    if (::pthread_getschedparam(
+            ::pthread_self(), &inherited_policy,
+            &inherited_param) == 0 &&
+        should_use_batch_monitor_policy(inherited_policy)) {
+#if defined(SCHED_BATCH)
+        sched_param batch_param{};
+        (void)::pthread_setschedparam(
+            ::pthread_self(), SCHED_BATCH, &batch_param);
+#endif
+    }
+
     std::int64_t delay_us = 50;
 
     while (!stopping()) {
@@ -1156,21 +1656,7 @@ void Scheduler::monitor_main() {
             std::chrono::microseconds(delay_us));
         if (stopping()) break;
 
-        const std::int64_t now = now_ns();
-        for (auto& worker : workers_) {
-            Reactor& reactor = *worker->reactor_;
-            if (!reactor.polling() && reactor.registered() > 0 &&
-                now - reactor.last_poll_ns() > kMonitorPollStaleNs) {
-                reactor.poll(0);
-            }
-            // Timer firing is serialized by the shard heap and is safe even
-            // while the owner is blocked in its reactor. Checking due timers
-            // unconditionally is a defensive backstop for any stale poll
-            // timeout or missed kernel wake.
-            if (timers_->next_deadline_ns(worker->index_) <= now) {
-                timers_->run_expired(worker->index_);
-            }
-        }
+        monitor_pass(now_ns());
 
         if (idle_workers_->all()) {
             delay_us = std::min<std::int64_t>(delay_us * 2, 10'000);

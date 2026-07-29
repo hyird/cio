@@ -1,8 +1,10 @@
 # Runtime v2: affinity-sharded scheduler and reactor
 
-Status: implemented and final-gated runtime-only candidate. Retained
-mechanisms below are normative; benchmark-rejected variants are explicitly
-labelled historical.
+Status: the runtime-v2 base and the work-aware scheduler follow-up are
+implemented in the retagged v0.0.1 source. Frozen-screen results whose complete
+artifact hash predates the final ABI refinement remain diagnostic rather than
+exact-final performance evidence. Benchmark-rejected variants are labelled
+historical.
 
 This milestone only restructures the existing runtime. It adds no public API,
 operation, protocol, backend or configuration option. Its goal is to reduce
@@ -523,13 +525,40 @@ connections remain asleep instead of repeatedly issuing empty
 Per-worker reactors must not let a CPU-heavy task hide readiness on its shard.
 The existing monitor remains as a backstop:
 
-- every shard publishes `last_poll_ns`;
-- a per-shard CAS grants temporary poll ownership;
-- the monitor may non-blockingly poll a stale shard; completions produced there
-  use the shared fallback queue so an idle worker can escape a CPU-bound owner;
+- every shard publishes `last_poll_ns` after `epoll_wait` returns, so a poll
+  that has just completed is fresh even when the kernel wait itself was long;
+- attaching a descriptor arms a coalesced owner-poll ticket, and the monitor's
+  first stale-shard pass arms the same ticket;
+- the owner acknowledges the ticket at either of two bounded cold points: the
+  periodic worker-loop local-service checkpoint, or an I/O-completion quota
+  checkpoint that found no pre-existing runnable debt. Neither path adds a
+  shared read to the ordinary I/O-completion or task-selection fast path;
+- if a later stale pass finds the ticket still unacknowledged, it queues one
+  reusable control coroutine on the shared fallback. Any scheduler worker may
+  run that coroutine, perform one non-blocking shard poll through the existing
+  single-poller CAS, and place completions on its local fast path;
+- the control coroutine is allocated once per reactor and reused through an
+  epoch/phase handshake. Reactor shutdown owns its frame after all monitor and
+  worker threads have joined, including when the last queued activation never
+  runs;
+- a one-worker runtime, or a multi-worker driver activation still uncovered
+  after a separate 200 us grace period, retains direct monitor polling as the
+  absolute liveness backstop. Foreign completions use the shared fallback;
+- the monitor uses Linux `SCHED_BATCH` only when it inherited the default
+  `SCHED_OTHER` policy. This keeps the liveness thread in the normal fair class
+  while reducing wakeup preemption of busy workers; explicitly inherited
+  FIFO, RR, IDLE or already-batch policies are preserved;
 - a foreign poller never drains the shard owner's eventfd token or clears its
   `wake_pending` publication;
 - normal local polling never shares a shard concurrently.
+
+This is an owner-first, worker-driver, hard-backstop protocol rather than a
+shorter watchdog interval. It avoids making the short-sleeping monitor the
+common poller while retaining a foreign-poll escape for a worker monopolized by
+non-cooperative user code. The ticket timestamp is a latch, not a queue:
+multiple stale observations coalesce. Driver generations likewise coalesce,
+and a late reusable frame adopts the newest uncovered generation instead of
+losing it or allocating another frame.
 
 An earlier skew screen of the predecessor `candidate_frozen` build, not the
 retained final candidate, exposed a possible boundary of this backstop. With
@@ -764,9 +793,268 @@ connection-to-shard mappings, the result is only consistent with placement
 imbalance and does not establish it as the cause. No rejected soft-affinity MPSC
 variant is present in the final source.
 
+### v0.0.1 retag monitor-balance history
+
+The owner-ticket and `SCHED_BATCH` monitor protocol above is a later engineering
+candidate. Its focused HTTP confirmation compared the frozen published-runtime
+server with the exact candidate server for ten pairs per cell, five AB and five
+BA. Both sides used eight server workers on CPUs 0-7; the same third-party
+`wrk` used 14 threads on CPUs 8-21, while the harness stayed on CPU 23. Each
+side had a 5-second warm-up and a separate 15-second measured window.
+
+| connections | baseline mean req/s | candidate mean req/s | paired geometric candidate/baseline (95% CI) | median p50 | median p75 | median p90 | median p99 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 786,646 | 796,591 | **+1.27%** (+0.01% to +2.55%) | 60/59 us | 72/70.5 us | 88.5/86 us | 467.5/539.5 us |
+| 1024 | 777,135 | 859,820 | **+10.65%** (+9.08% to +12.25%) | 1100/1100 us | 1900/1220 us | 2325/1530 us | 4565/2060 us |
+
+At 1024 connections the candidate's paired geometric latency deltas were
+-0.71% at p50, -36.05% at p75, -34.65% at p90 and -54.69% at p99. The
+throughput gain reproduced in both order strata: +10.02% in AB and +11.29% in
+BA. The small c1024 p50 effect was mildly order-sensitive (+0.55% in AB and
+-1.96% in BA), so it is described as neutral rather than an improvement. At 64
+connections p90 improved by 2.48% overall and in both order strata, but p99 was
+position-sensitive: AB was +35.93% while BA was -35.30%. That c64 p99 is
+therefore recorded as order-dependent, not as a candidate improvement or
+regression.
+
+The single maximum latency reported by each c1024 `wrk` run did not follow the
+p99 improvement: its paired geometric delta was +24.70%, with baseline maxima
+of 61.25-93.95 ms and candidate maxima of 86.41-167.46 ms. No candidate p99
+exceeded 5 ms and no maximum exceeded the predeclared 200 ms rare-tail trigger,
+so the gate did not require an observer rerun. The maximum-latency movement is
+still retained as a diagnostic caveat; this result does not claim that every
+extreme-tail statistic improved.
+
+The second-run versus first-run throughput drift was +0.15% at c64 and -0.57%
+at c1024. All 40 measured sides had zero socket and HTTP errors, neither cell
+hit the client-capacity warning, both servers stayed live, and all input hashes
+were unchanged. The exact executable hashes were
+`c9c978fb4b4c2aae98eecd886825fcf4206b7343f0cdae0a5f09c925189c1adf`
+(baseline),
+`80d71422932a59b90b1cb3eb6395dce52e06fbfae9c6763b9add36d5544a6239`
+(candidate), and
+`3722bf8b31651d8b029b4856af9239dfb491ca93e92447368a4e183e8863b588`
+(`wrk`).
+
+This is frozen-binary engineering evidence, not yet a release claim: the
+candidate executable does not map to a committed clean source revision.
+Before publication it must be rebuilt from the eventual clean revision and the
+confirmation repeated or byte-reproduced from that revision.
+
+Two narrower follow-ups were rejected. Replacing the ticket with monitor-local
+progress tracking moved c1024 throughput only +0.41% relative to this candidate
+while worsening p99 by about 4.7% and producing a 228 ms maximum-latency run.
+Removing `finish_io_batch()`'s final non-empty check moved c64 throughput
+-1.74% and c1024 -0.47%, with no compensating latency gain. Neither rejected
+variant is present in the retained source.
+
+The extended `wrk` histogram exposed a real tradeoff hidden above p99. In a
+four-pair, 30-second c1024 diagnostic against the original 2026-07-28 v0.0.1
+publication binary, the monitor-balance candidate gained 7.87% throughput and
+reduced p90 and p99 by 33.11% and 53.60%. Its p99.99, p99.999 and maximum
+latency nevertheless rose 22.29%, 13.95% and 17.89%. The scheduler observer
+made this a diagnostic rather than publication matrix, and the intended gains
+reproduced in both order strata, but so did the extreme-tail cost. This result
+does not replace the ten-pair confirmation; it narrows the next optimization
+target to rare foreign-monitor dispatch rather than common readiness
+processing.
+
+Two designs aimed at that rare path were subsequently measured and rejected:
+
+- Foreign-completion batching kept all monitor-polled completions together
+  before publishing them. Against the exact monitor-balance candidate, its
+  four-pair c64 screen lost 1.38% throughput, raised p50 by 3.01%, and raised
+  p99.99, p99.999 and Max by 13.44%, 58.34% and 58.78%. The c1024 aggregate
+  looked better, but the BA stratum worsened p99.99 by 125.27%, p99.999 by
+  53.21% and Max by 45.95%; the aggregate was therefore an order-dependent
+  outlier, not a stable win.
+- Normal-worker reactor rescue published stale shards through a generation
+  latch and bitmap so an ordinary scheduler worker could perform `poll(0)`,
+  leaving direct monitor polling as a final backstop. The complete
+  correctness, sanitizer, race-repeat and soak gates passed, but the frozen
+  four-pair HTTP screen failed the performance gate. At c64, throughput was
+  neutral (-0.02%) while p99.999 and Max rose 16.67% and 40.91%; Max worsened
+  in both AB and BA strata. At c1024, throughput fell 1.97%, p50/p90 worsened
+  1.97%/1.06%, and p99.99, p99.999 and Max rose 26.59%, 26.46% and 23.93%.
+  The AB stratum was especially unstable: throughput fell 5.64% and Max rose
+  53.95%, whereas BA was mostly neutral. The candidate executable was
+  `de4fc489aa089ba347f9fe9c45ea276b42bb927fe7f0bcc4893cb388735044a1`;
+  the retained comparison executable remained
+  `80d71422932a59b90b1cb3eb6395dce52e06fbfae9c6763b9add36d5544a6239`.
+  The rescue state machine and its tests were removed, restoring the retained
+  runtime and static-library hash
+  `2aadef6c6990a47a39411324cf77182a80eeca684cea603f782aab605838eea9`.
+
+The reusable worker-driver protocol described above was the next retained
+candidate. A ten-pair confirmation compared the exact monitor-balance server
+with the worker-driver server at 64 and 1024 connections. At c64, worker-driver
+throughput was neutral at -0.31% (95% CI -1.25% to +0.63%). Its p50 and p75
+rose by 2.72% and 1.69%, one microsecond at the reported medians, while p99,
+p99.9 and p99.99 fell by 46.21%, 4.09% and 14.21%. The three tail improvements
+reproduced in both AB and BA strata. At c1024, throughput was likewise neutral
+at -0.49% (-1.50% to +0.54%); p50 through p99 and p99.99 through Max were
+neutral. The p99.9 aggregate favored the driver but had a very wide interval
+and reversed in magnitude by order, so it is not claimed as an improvement.
+
+All 40 measured sides completed without socket or HTTP errors, client
+saturation, early server exit or hash drift. The exact server hashes were
+`80d71422932a59b90b1cb3eb6395dce52e06fbfae9c6763b9add36d5544a6239`
+(monitor balance) and
+`f1841caae0037b6306eefee81eb6c5fd928d0f9ae3f9ed56303e5caa2c141948`
+(worker driver). The retained worker-driver static library is
+`55190fdc7fab84882a7875e2e97a9db1c9d1ed9f5c9735d19f360a9a38d6b3bc`.
+As with the preceding engineering candidates, these hashes identify frozen
+dirty-tree artifacts rather than a committed release revision.
+
+Fixed, unconditional-yield cooperative I/O budgets were then tested and
+rejected.
+Symmetric child tasks shared a thread-local top-level-resume budget; successful
+TCP, UDP and accept leaf operations consumed it only after releasing their
+syscall lease. Exhaustion returned the coroutine through the scheduler's local
+fairness checkpoint. The implementation passed Release, ASan/UBSan, TSan,
+repeated race tests and a non-sanitized soak before measurement, but its
+periodic forced yield created an unacceptable latency distribution:
+
+- With a budget of 64 successful operations, the ten-pair confirmation moved
+  c64 throughput +1.45% (+0.43% to +2.47%) and improved p50/p75 by 3.30%/2.07%.
+  Average latency nevertheless rose 4.18%, p99 rose 51.43% (+29.70% to
+  +76.80%) in all ten pairs, and p99.9 rose 2.85% (+1.19% to +4.54%). At
+  c1024, throughput was neutral at -0.15% (-1.48% to +1.20%) while p99 rose
+  2.40% (+0.15% to +4.69%). The c64 throughput gain therefore failed the
+  joint latency gate.
+- Halving the budget to 32 did not repair the tradeoff. In the four-pair
+  screen, c1024 throughput moved -2.50% (-5.12% to +0.19%), average latency
+  rose 5.06%, and p90 rose 2.50%. At c64, throughput moved -0.68% and p50
+  rose 1.28%. Its aggregate p99 appeared 15.41% lower, but the AB/BA strata
+  were -28.93% and +0.68%, so the apparent benefit was position-dependent.
+
+The rejected fixed budget-64 and budget-32 server hashes were
+`12a964fc14f360824903cbfe59f60206ee94c2aae2e174b0128573a231428119`
+and
+`bc8305025e6500473fa0439a4ae053c0bdd4f21aef3af28ce52c38fa760e787d`.
+Those unconditional-yield variants and their dedicated tests were removed.
+Rebuilding that restored tree reproduced the retained worker-driver library
+and server hashes above byte for byte.
+
+The next work-aware candidate keeps an operation counter but makes exhaustion
+work-aware. A top-level scheduler resume grants 128 terminal leaf-completion
+slots. TCP read/write leaves consume one slot for every terminal result,
+including an error; an error ends that chain anyway, while counting it avoids
+a success-flag store, load and branch on every ordinary completion. Accept and
+UDP retain explicit post-success checkpoints. All paths touch the counter only
+after the syscall lease and operation-local guards have been released. The
+next boundary enters an outlined cold checkpoint, which applies these rules:
+
+- stop, inbox debt or global debt returns to the scheduler immediately;
+- purely local debt receives one extra 128-operation grace quota, then forces
+  a scheduler return at the next exhausted boundary;
+- with no runnable debt, an armed owner ticket performs one non-blocking poll;
+  a productive poll returns to the scheduler, while an empty poll continues
+  to the timer check;
+- a productive timer check or a newly observed stop returns to the scheduler;
+  otherwise the quota renews inline without a context switch.
+
+Before returning, global and inbox debt are staged ahead of the parent
+continuation. A non-local return publishes the parent for stealing. A
+local-only return keeps the normal private FIFO path unless an idle-worker hint
+shows that publication can let a peer run the parent while the owner consumes
+the displaced local task. The hint affects only placement: the queue
+publication and idle/search epoch handshake remain the source of visibility
+and lost-wakeup safety.
+
+Diagnostic counters distinguish quota exhaustion, no-demand renewal,
+first-local-boundary deferral and actual forced yield. Once workers are
+quiescent they satisfy:
+
+```text
+exhaustions =
+    renew_no_demand + deferred_local_only + forced_yields
+ticket_polls =
+    ticket_polls_empty + ticket_polls_productive
+```
+
+The counters are independent relaxed atomics, so a live snapshot can
+temporarily violate either identity while a checkpoint is in flight. The
+local/inbox/global yield-reason counters are also not a partition: inbox and
+global can overlap, and stop-only yields have no reason counter.
+
+The common counter is a `uint64_t` TLS value. Zero is dormant outside a worker;
+an unsigned decrement wraps it to `UINT64_MAX`, avoiding a separate disabled
+check without the short wrap interval of a 32-bit counter. The shared-library
+ABI exports a default-visible detail symbol so consumers retain the compiler's
+normal TLS model. Library translation units use a hidden alias of that exact
+storage, allowing a GCC-built statically linked PIE to relax each TCP
+completion to one segment-relative `subq` and one predicted-not-taken branch.
+The final GCC read and write coroutine actors are each 1,382 bytes, equal to
+the pre-quota worker-driver build and without a quota TLS initialization guard.
+Clang 19 preserves the semantics but does not perform the same final
+relaxation, so the single-instruction code-generation claim is GCC-specific.
+
+### Work-aware quota balance result
+
+The first frozen work-aware build still carried a success flag and a
+non-relaxable TLS access on every TCP completion. Against the worker-driver
+baseline, its publication-ready ten-pair standard `wrk` confirmation was
+neutral at c64, at -0.34% throughput (95% CI -2.21% to +1.57%). At c1024 it
+lost 2.52% throughput (-3.79% to -1.24%), while paired p50 and p90 rose 3.47%
+(+2.03% to +4.93%) and 2.33% (+0.07% to +4.63%). Requests per server CPU
+second fell 2.51%, with both sides using about 7.91 server cores. That is a
+real common-path efficiency regression, not client saturation or an idle
+server.
+
+The same build's four-pair mixed confirmation showed why the fairness
+mechanism remains useful: pipelined bulk throughput was neutral at -0.07%
+(-1.13% to +1.01%), while the ordinary probe gained 100.61% throughput and
+reduced p50, p90 and p99 by 49.47%, 38.53% and 30.57%. Thus the pre-fast-TLS
+build passed the mixed fairness objective but failed the joint standard-load
+gate at c1024.
+
+Removing the success flag, using the hidden TLS alias and widening the counter
+produced frozen screen binary
+`cc5b9945e734c0e17589af92bb98700b8e940a51803f0c5992597b763c109bed`.
+Its four-pair mixed screen kept bulk throughput neutral at -0.22%
+(-1.85% to +1.43%), while probe throughput rose 91.35% and probe p50, p90 and
+p99 fell 47.19%, 37.02% and 31.73%. In the standard screen, c64 throughput was
++0.91% (+0.02% to +1.79%). C1024 did not establish parity: its aggregate was
+-5.07% with a wide -16.24% to +7.60% interval, driven by paired results of
+-0.50%, -15.61%, -1.35% and -1.95%. The low run had normal server/client CPU,
+no socket or HTTP error and cannot be discarded.
+
+After that screen, the TLS storage was changed from one hidden symbol to the
+shared-safe default-visible/hidden dual-symbol ABI described above. The final
+static-library and HTTP-server hashes are
+`699fd88b69df76d8605a3b690d47adb52b6cab9d2964998eb6f01cb7942eedd6`
+and
+`aa9834d2167a6436fb451a274abc5b8cdcb09aca05ea8239519d581cded43af4`;
+the shared-library hash is
+`dca78bd16f0d2b294b57d1014d991f0a1b8c98613d6b457ce6401e8739350f3`.
+Two independent Release builds reproduced the static library and HTTP server
+byte for byte. Static Release, shared Release, ASan/UBSan and TSan each passed
+all ten tests. The final ABI
+change preserves the screen binary's entire `.text` section byte for byte
+(raw section SHA-256
+`b91f518c268c70239dc85220dad1bce8e67560e728df196e797a0955e1c1dedd`),
+but changes the full artifact hash. The screen above is therefore mechanism
+evidence rather than a performance claim for the final binary.
+
+This round therefore ends with a clear tradeoff: mixed-load fairness and probe
+latency improved materially at nearly neutral bulk throughput, but ordinary
+c1024 throughput parity was not demonstrated and a residual scheduling
+instability remains. The retagged v0.0.1 includes the correctness-gated
+implementation with that limitation disclosed; the frozen screen remains
+mechanism evidence rather than an exact-final performance result.
+
 A stage is rejected if its intended regime does not improve outside noise, if
 it materially regresses channel/synchronization microbenchmarks, or if it gives
 back cio's skew advantage to win only the flat echo case.
+
+For scheduler HTTP work, acceptance is a joint gate rather than a throughput
+headline. Low-load throughput must remain neutral within the documented
+regression budget; saturated throughput and p50-p99 must not materially
+regress; p99.9, p99.99, p99.999 and Max are checked separately. A rare-tail
+benefit or regression must reproduce in both AB and BA order before it is
+attributed to the design. A valid matrix proves that the measurement completed
+correctly, not that the candidate passed this performance gate.
 
 “No improvement” is a valid result: the stage is removed and the previous
 internal implementation remains. Completing the refactor is not itself a

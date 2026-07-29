@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cassert>
 #include <cerrno>
 #include <cstring>
 
@@ -76,6 +77,163 @@ struct IoOperation {
     explicit operator bool() const noexcept { return !error; }
 };
 
+template <typename T>
+class CooperativeIoTask;
+
+template <typename T>
+struct CooperativeIoPromise final
+    : detail::TaskPromiseBase {
+    struct FinalAwaiter {
+        CooperativeIoPromise* promise;
+
+        bool await_ready() const noexcept { return false; }
+
+        std::coroutine_handle<> await_suspend(
+            std::coroutine_handle<>) noexcept {
+            void* const continuation =
+                promise->continuation_or_completion;
+            // CooperativeIoTask is internal and every started instance is
+            // immediately awaited by its public wrapper. A never-started task
+            // can be destroyed, but a completing one always has a parent.
+            assert(continuation != nullptr);
+
+            // co_return destroys the syscall scope before entering
+            // final_suspend, so no descriptor lease is held here. Count every
+            // completed leaf result: errors terminate the hot chain anyway,
+            // and avoiding a success flag removes one store, one load and one
+            // branch from every successful operation.
+            const std::uint8_t debt =
+                detail::cooperative_io_return_debt();
+            if (debt !=
+                detail::kCooperativeIoDebtNone) {
+                // The cold call may publish the parent, which can destroy
+                // this completed child immediately. It is therefore the
+                // final operation that depends on `promise`.
+                return detail::
+                    defer_cooperative_io_continuation(
+                        std::coroutine_handle<>::
+                            from_address(continuation),
+                        debt);
+            }
+
+            return std::coroutine_handle<>::from_address(
+                continuation);
+        }
+
+        void await_resume() const noexcept {}
+    };
+
+    CooperativeIoTask<T>
+    get_return_object() noexcept;
+    FinalAwaiter final_suspend() noexcept {
+        return FinalAwaiter{this};
+    }
+    void unhandled_exception() noexcept {
+        exception = std::current_exception();
+    }
+
+    template <typename U = T>
+        requires std::convertible_to<U&&, T>
+    void return_value(U&& value_to_store) {
+        value.emplace(
+            std::forward<U>(value_to_store));
+    }
+
+    T&& result() {
+        rethrow_if_failed();
+        return std::move(*value);
+    }
+
+    std::optional<T> value;
+};
+
+template <typename T>
+class [[nodiscard]] CooperativeIoTask {
+public:
+    using promise_type = CooperativeIoPromise<T>;
+    using handle_type =
+        std::coroutine_handle<promise_type>;
+
+    explicit CooperativeIoTask(
+        handle_type handle) noexcept
+        : handle_(handle) {}
+    CooperativeIoTask(
+        CooperativeIoTask&& other) noexcept
+        : handle_(
+              std::exchange(other.handle_, {})) {}
+    CooperativeIoTask& operator=(
+        CooperativeIoTask&& other) noexcept {
+        if (this != &other) {
+            destroy();
+            handle_ =
+                std::exchange(other.handle_, {});
+        }
+        return *this;
+    }
+    CooperativeIoTask(
+        const CooperativeIoTask&) = delete;
+    CooperativeIoTask& operator=(
+        const CooperativeIoTask&) = delete;
+    ~CooperativeIoTask() { destroy(); }
+
+    auto operator co_await() const& noexcept {
+        return Awaiter{handle_};
+    }
+    auto operator co_await() const&& noexcept {
+        return Awaiter{handle_};
+    }
+
+private:
+    struct Awaiter {
+        handle_type coroutine;
+
+        bool await_ready() const noexcept {
+            return !coroutine || coroutine.done();
+        }
+        std::coroutine_handle<> await_suspend(
+            std::coroutine_handle<>
+                awaiting) noexcept {
+            coroutine.promise().
+                continuation_or_completion =
+                    awaiting.address();
+            return coroutine;
+        }
+        T&& await_resume() {
+            if (!coroutine) {
+                throw std::logic_error(
+                    "cio: awaited an invalid "
+                    "cooperative I/O task");
+            }
+            return coroutine.promise().result();
+        }
+    };
+
+    void destroy() noexcept {
+        if (handle_) {
+            handle_.destroy();
+            handle_ = {};
+        }
+    }
+
+    handle_type handle_{};
+};
+
+template <typename T>
+CooperativeIoTask<T>
+CooperativeIoPromise<T>::
+get_return_object() noexcept {
+    return CooperativeIoTask<T>{
+        std::coroutine_handle<
+            CooperativeIoPromise<T>>::
+            from_promise(*this)};
+}
+
+static_assert(
+    sizeof(CooperativeIoPromise<
+               Result<std::size_t>>) ==
+    sizeof(detail::TaskPromise<
+               Result<std::size_t>>));
+
 // Capture one Socket incarnation without changing its public layout. close()
 // updates the two fields atomically while holding this descriptor's lifecycle
 // lock, so a task either gets the old incarnation token or observes closure;
@@ -107,7 +265,8 @@ IoOperation capture_operation(int& socket_fd,
     return operation;
 }
 
-Task<Result<std::size_t>> tcp_read_some(
+CooperativeIoTask<Result<std::size_t>>
+tcp_read_some(
     detail::IoDesc* desc, std::uint32_t generation,
     std::span<std::byte> buffer) {
     for (;;) {
@@ -146,7 +305,8 @@ Task<Result<std::size_t>> tcp_read_some(
     }
 }
 
-Task<Result<std::size_t>> tcp_write_some(
+CooperativeIoTask<Result<std::size_t>>
+tcp_write_some(
     detail::IoDesc* desc, std::uint32_t generation,
     std::span<const std::byte> buffer) {
     for (;;) {
@@ -701,6 +861,7 @@ Task<Result<TcpStream>> TcpListener::accept() {
                 // accept() also continues on the selected worker, so the
                 // conventional immediate go(serve(stream)) remains local.
                 AcceptedFd accepted(accepted_fd);
+                co_await detail::CooperativeIoCheckpoint{};
                 detail::Scheduler* const sched = detail::current_scheduler();
                 if (sched == nullptr) co_return Error{Errc::shutdown};
                 const detail::WorkerId target = sched->choose_worker();
@@ -771,28 +932,37 @@ Task<Result<std::size_t>> UdpSocket::recv_from(std::span<std::byte> buffer, Sock
     for (;;) {
         sockaddr_storage storage{};
         socklen_t length = sizeof(storage);
+        ssize_t n = -1;
+        int syscall_error = 0;
         {
             detail::FdUseGuard fd_use{
                 operation.desc, detail::Dir::kRead,
                 operation.generation};
             if (!fd_use) co_return fd_use.error();
 
-            const ssize_t n =
-                ::recvfrom(fd_use.fd(), buffer.data(), buffer.size(), 0,
-                           reinterpret_cast<sockaddr*>(&storage), &length);
-            const int syscall_error = n < 0 ? errno : 0;
-            if (n >= 0) {
-                from = SocketAddr::from_raw(&storage, length);
-                co_return static_cast<std::size_t>(n);
+            n = ::recvfrom(
+                fd_use.fd(), buffer.data(), buffer.size(), 0,
+                reinterpret_cast<sockaddr*>(&storage), &length);
+            syscall_error = n < 0 ? errno : 0;
+            if (n < 0 &&
+                (syscall_error == EAGAIN ||
+                 syscall_error == EWOULDBLOCK)) {
+                // Unlike a stream, a short datagram says nothing about whether
+                // more are queued, so only EAGAIN can clear the hint here.
+                operation.desc->note_would_block(
+                    detail::Dir::kRead);
             }
-            if (syscall_error == EINTR) continue;
-            if (syscall_error != EAGAIN &&
-                syscall_error != EWOULDBLOCK) {
-                co_return Error{syscall_error};
-            }
-            // Unlike a stream, a short datagram says nothing about whether
-            // more are queued, so only EAGAIN can clear the hint here.
-            operation.desc->note_would_block(detail::Dir::kRead);
+        }
+
+        if (n >= 0) {
+            from = SocketAddr::from_raw(&storage, length);
+            co_await detail::CooperativeIoCheckpoint{};
+            co_return static_cast<std::size_t>(n);
+        }
+        if (syscall_error == EINTR) continue;
+        if (syscall_error != EAGAIN &&
+            syscall_error != EWOULDBLOCK) {
+            co_return Error{syscall_error};
         }
 
         if (auto ready =
@@ -811,23 +981,34 @@ Task<Result<std::size_t>> UdpSocket::send_to(std::span<const std::byte> buffer,
     if (!operation) co_return operation.error;
 
     for (;;) {
+        ssize_t n = -1;
+        int syscall_error = 0;
         {
             detail::FdUseGuard fd_use{
                 operation.desc, detail::Dir::kWrite,
                 operation.generation};
             if (!fd_use) co_return fd_use.error();
 
-            const ssize_t n =
-                ::sendto(fd_use.fd(), buffer.data(), buffer.size(),
-                         MSG_NOSIGNAL, to.raw(), to.length());
-            const int syscall_error = n < 0 ? errno : 0;
-            if (n >= 0) co_return static_cast<std::size_t>(n);
-            if (syscall_error == EINTR) continue;
-            if (syscall_error != EAGAIN &&
-                syscall_error != EWOULDBLOCK) {
-                co_return Error{syscall_error};
+            n = ::sendto(
+                fd_use.fd(), buffer.data(), buffer.size(),
+                MSG_NOSIGNAL, to.raw(), to.length());
+            syscall_error = n < 0 ? errno : 0;
+            if (n < 0 &&
+                (syscall_error == EAGAIN ||
+                 syscall_error == EWOULDBLOCK)) {
+                operation.desc->note_would_block(
+                    detail::Dir::kWrite);
             }
-            operation.desc->note_would_block(detail::Dir::kWrite);
+        }
+
+        if (n >= 0) {
+            co_await detail::CooperativeIoCheckpoint{};
+            co_return static_cast<std::size_t>(n);
+        }
+        if (syscall_error == EINTR) continue;
+        if (syscall_error != EAGAIN &&
+            syscall_error != EWOULDBLOCK) {
+            co_return Error{syscall_error};
         }
 
         if (auto ready =

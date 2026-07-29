@@ -191,10 +191,16 @@ both sides, disjoint server/client CPU sets, warm-up, alternating AB/BA pairs,
 input SHA-256 checks, error rejection and retained raw logs:
 
 ```sh
-python3 bench/http-comparison/matrix_wrk.py \
+taskset -c 23 python3 bench/http-comparison/matrix_wrk.py \
   path/to/baseline-server path/to/candidate-server \
-  --cells 1:1,8:4,64:16,256:16,1024:16 \
-  --pairs 10 --warmup 5 --duration 15
+  --cells 1:1,8:4,64:14,256:14,1024:14 \
+  --pairs 10 --warmup 5 --duration 15 \
+  --server-cores 0-7 --client-cores 8-21 \
+  --tail-script bench/http-comparison/wrk_tail.lua \
+  --expected-a-sha256 <sha256> \
+  --expected-b-sha256 <sha256> \
+  --expected-wrk-sha256 <sha256> \
+  --expected-tail-script-sha256 <sha256>
 ```
 
 Frozen local binaries are generated artifacts and are not committed. Record
@@ -225,6 +231,12 @@ with a 3.02-times median p99, and c1024 improved p50 while raising p99 by about
 19%. These costs are part of the release record rather than being hidden behind
 headline throughput. Full intervals, CPU data, hashes and methodology are in
 [the HTTP comparison](bench/http-comparison/README.md).
+
+The
+[v0.0.1 retag work-aware scheduler result](bench/http-comparison/README.md#v001-retag-work-aware-scheduler-result)
+improves mixed-load fairness substantially. Its frozen screens are diagnostic
+mechanism evidence rather than exact-final performance evidence, and standard
+c1024 throughput parity has not been demonstrated.
 
 An older pre-v2 `wrk` comparison against Go is retained only as historical
 context:

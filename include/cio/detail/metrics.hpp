@@ -49,6 +49,38 @@ RuntimeMetrics runtime_metrics() noexcept;
 
 namespace detail {
 
+// Internal diagnostic snapshot for the work-aware cooperative-I/O completion
+// quota. Keep this separate from the public RuntimeMetrics layout: these
+// counters exist to accept or reject scheduler experiments, not as a stable
+// API commitment.
+//
+// In a quiescent snapshot:
+//   exhaustions =
+//       renew_no_demand + deferred_local_only + forced_yields
+//   ticket_polls = ticket_polls_empty + ticket_polls_productive
+// The fields are independent relaxed atomics, so an in-flight checkpoint can
+// make a live snapshot temporarily violate either identity. "Empty" and
+// "productive" describe runnable debt immediately after the ticket poll; a
+// later timer/stop check at the same boundary can still force a yield. The
+// local/inbox/global reason counters do not partition forced_yields: inbox and
+// global can overlap, and a stop-only yield has no reason counter.
+struct CooperativeIoMetrics {
+    std::uint64_t exhaustions = 0;
+    std::uint64_t renew_no_demand = 0;
+    std::uint64_t deferred_local_only = 0;
+    std::uint64_t forced_yields = 0;
+    std::uint64_t yield_local_only = 0;
+    std::uint64_t yield_inbox = 0;
+    std::uint64_t yield_global = 0;
+    std::uint64_t ticket_polls = 0;
+    std::uint64_t ticket_polls_empty = 0;
+    std::uint64_t ticket_polls_productive = 0;
+    std::uint64_t timer_checks = 0;
+    std::uint64_t timer_productive = 0;
+};
+
+CooperativeIoMetrics cooperative_io_metrics() noexcept;
+
 #if defined(CIO_METRICS)
 
 struct CIO_CACHE_ALIGNED MetricCounter {
@@ -74,6 +106,18 @@ struct Metrics {
     MetricCounter local_overflow;
     MetricCounter global_batch_pops;
     MetricCounter global_batch_items;
+    MetricCounter cooperative_io_exhaustions;
+    MetricCounter cooperative_io_renew_no_demand;
+    MetricCounter cooperative_io_deferred_local_only;
+    MetricCounter cooperative_io_forced_yields;
+    MetricCounter cooperative_io_yield_local_only;
+    MetricCounter cooperative_io_yield_inbox;
+    MetricCounter cooperative_io_yield_global;
+    MetricCounter cooperative_io_ticket_polls;
+    MetricCounter cooperative_io_ticket_polls_empty;
+    MetricCounter cooperative_io_ticket_polls_productive;
+    MetricCounter cooperative_io_timer_checks;
+    MetricCounter cooperative_io_timer_productive;
 };
 
 Metrics& metrics() noexcept;

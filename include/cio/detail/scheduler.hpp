@@ -40,6 +40,37 @@ namespace cio::detail {
 class Scheduler;
 struct SchedulerTestAccess;
 
+// Counted leaf I/O completions may remain entirely inside a symmetric coroutine
+// chain, bypassing the worker loop. TCP counts every terminal result; accept
+// and UDP use explicit successful-syscall checkpoints. Capture failures,
+// connect and try_* do not count. The thread-local quota keeps that hot path
+// free of shared state; only an exhausted quota asks the scheduler whether
+// there is real work to let through. A worker installs budget + 1, so 128
+// completions pass before the following one enters the cold checkpoint.
+inline constexpr std::uint32_t kCooperativeIoBudget = 128;
+extern thread_local constinit std::uint64_t
+    t_cooperative_io_budget;
+
+// The default-visible detail symbol lets shared-library consumers use their
+// normal TLS model. Library translation units use a hidden alias of that exact
+// storage; with GCC, a statically linked PIE can relax the TCP-completion hot
+// path to a direct segment-relative access. The alias is defined beside the
+// storage in scheduler.cpp.
+#if (defined(__GNUC__) || defined(__clang__)) && \
+    defined(CIO_BUILDING_LIBRARY)
+extern thread_local constinit
+    __attribute__((visibility("hidden")))
+    std::uint64_t t_cooperative_io_budget_local;
+#endif
+
+enum CooperativeIoDebt : std::uint8_t {
+    kCooperativeIoDebtNone = 0,
+    kCooperativeIoDebtLocal = 1u << 0,
+    kCooperativeIoDebtInbox = 1u << 1,
+    kCooperativeIoDebtGlobal = 1u << 2,
+    kCooperativeIoDebtStop = 1u << 3,
+};
+
 class CIO_CACHE_ALIGNED Worker {
 public:
     WorkerId index() const noexcept { return index_; }
@@ -87,6 +118,9 @@ private:
     // stealable bitmap bit to repair; private yield/handoff chains skip that
     // shared-line load entirely.
     bool has_published_stealable_ = false;
+    // A purely local backlog gets one extra quota before it forces a context
+    // switch. Inbox/global work, productive I/O and timers bypass this grace.
+    bool cooperative_io_local_grace_ = false;
 
     struct CIO_CACHE_ALIGNED StealablePublication {
         // The owner writes publish_epoch before consulting clear_epoch.
@@ -176,6 +210,15 @@ public:
     // task's worth of cache misses.
     void reschedule_self(std::coroutine_handle<> h) noexcept;
 
+    // Cold half of the cooperative-I/O completion quota. A monitor ticket
+    // means "check the shard", not "always yield": an empty owner poll simply
+    // renews the quota. When actual runnable work exists, the suspend half
+    // places one inbox and one global item ahead of the current continuation
+    // before tail-queuing it.
+    std::uint8_t prepare_cooperative_io_checkpoint() noexcept;
+    CIO_NOINLINE void reschedule_self_for_cooperative_io(
+        std::coroutine_handle<> h, std::uint8_t debt) noexcept;
+
     // Hand-off: run this task next on the current worker. Use when the caller
     // just produced the exact data the target is waiting for.
     void schedule_next(std::coroutine_handle<> h) noexcept { schedule_next_frame(h.address()); }
@@ -237,6 +280,9 @@ private:
     void publish_stealable(Worker& worker, std::uint32_t wake_count = 1) noexcept;
     bool repair_stealable(Worker& worker) noexcept;
     void poller_returned(WorkerId shard) noexcept;
+    void monitor_pass(std::int64_t now) noexcept;
+    static bool should_use_batch_monitor_policy(
+        int inherited_policy) noexcept;
     void monitor_main();
 
     std::vector<std::unique_ptr<Worker>> workers_;
@@ -256,13 +302,84 @@ private:
     SchedulerTarget completion_target_;
 };
 
-// The worker running on this thread, or nullptr on a foreign thread.
+// Thread ownership helpers used by the inline checkpoint below.
 Worker* current_worker() noexcept;
 WorkerId current_worker_id(const Scheduler* sched = nullptr) noexcept;
-
-// The scheduler this thread belongs to: the current worker's, or the process
-// default set by the most recently constructed Runtime.
 Scheduler* current_scheduler() noexcept;
+
+// Invoked only when the inline I/O-completion counter reaches its boundary.
+// Keeping scheduler lookup, demand inspection and quota renewal out of line
+// avoids duplicating that cold half in every network coroutine actor.
+CIO_NOINLINE std::uint8_t
+cooperative_io_return_debt_slow() noexcept;
+
+// Common completion fast path used by the explicit successful-operation
+// checkpoint and the internal TCP terminal-completion policy.
+inline std::uint8_t cooperative_io_return_debt() noexcept {
+    // Zero is the disabled value on a foreign thread. Unsigned wrap turns it
+    // into a practically-infinite dormant budget without a second hot-path
+    // comparison; a worker always installs a real budget before resuming a
+    // task. In the frozen GCC x86-64 build this contracts to one TLS decrement
+    // and one not-taken branch.
+#if (defined(__GNUC__) || defined(__clang__)) && \
+    defined(CIO_BUILDING_LIBRARY)
+    std::uint64_t& budget =
+        t_cooperative_io_budget_local;
+#else
+    std::uint64_t& budget =
+        t_cooperative_io_budget;
+#endif
+    const std::uint64_t remaining = budget - 1;
+    budget = remaining;
+    if (CIO_LIKELY(remaining != 0)) {
+        return kCooperativeIoDebtNone;
+    }
+    return cooperative_io_return_debt_slow();
+}
+
+std::coroutine_handle<> defer_cooperative_io_continuation(
+    std::coroutine_handle<> continuation,
+    std::uint8_t debt) noexcept;
+
+// Used by successful accept and UDP paths after releasing their descriptor
+// lease. TCP counts both success and error terminal results from its private
+// final-suspend policy. This type stays header-visible inside detail so the
+// decrement and predicted branch remain inline.
+class CooperativeIoCheckpoint {
+public:
+    bool await_ready() noexcept {
+        const std::uint8_t debt =
+            cooperative_io_checkpoint_debt();
+        if (debt == kCooperativeIoDebtNone) return true;
+        debt_ = debt;
+        return false;
+    }
+
+    void await_suspend(
+        std::coroutine_handle<> handle) noexcept {
+        // Copy before publication: the final scheduler call may make this
+        // frame runnable on another worker immediately.
+        Scheduler* const scheduler = current_scheduler();
+        scheduler->reschedule_self_for_cooperative_io(
+            handle, debt_);
+    }
+
+    void await_resume() const noexcept {}
+
+private:
+    static std::uint8_t
+    cooperative_io_checkpoint_debt() noexcept {
+        return cooperative_io_return_debt();
+    }
+
+    // Written only on the cold path that returns false from await_ready().
+    // Avoiding a default initializer keeps the successful hot path free of a
+    // coroutine-frame store.
+    std::uint8_t debt_;
+};
+
+// The scheduler this thread belongs to is the current worker's, or the process
+// default set by the most recently constructed Runtime.
 void set_default_scheduler(Scheduler* sched) noexcept;
 
 }  // namespace cio::detail

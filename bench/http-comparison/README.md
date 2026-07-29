@@ -3,9 +3,9 @@
 A minimal HTTP/1.1 server on each of the three runtimes, under a load generator
 that none of them is built on.
 
-> Except for the frozen A/B section immediately below, the recorded results and
-> architecture discussion are the pre-runtime-v2 baseline. Current cio uses
-> worker-local reactor shards and directed inboxes; see
+> Historical results and architecture discussion are the pre-runtime-v2
+> baseline. Sections explicitly marked runtime v2 or v0.0.1 retag, plus the
+> current runners, describe later work. See
 > [the runtime-v2 design](../../docs/scheduler-v2.md).
 
 ## Runtime v2 frozen A/B matrix
@@ -76,16 +76,20 @@ historical diagnostic; none of its values appears in the table above.
 `matrix_wrk.py` is the release-gate runner for comparing two cio HTTP server
 binaries. It defaults to the 1/8/64/256/1024-connection matrix, assigns an
 appropriate `wrk` thread count to each cell, alternates AB/BA pairs, rotates
-cell order, and pins the server and client to disjoint CPU sets.
+cell order in AB/BA blocks, and pins the server, client and harness to disjoint
+CPU sets.
 
 ```sh
-python3 matrix_wrk.py \
+taskset -c 23 python3 matrix_wrk.py \
   path/to/pre-v2-server path/to/candidate-server \
-  --cells 1:1,8:4,64:16,256:16,1024:16 \
+  --cells 1:1,8:4,64:14,256:14,1024:14 \
   --pairs 10 --warmup 5 --duration 15 \
+  --server-cores 0-7 --client-cores 8-21 \
+  --tail-script ./wrk_tail.lua \
   --expected-a-sha256 <sha256> \
   --expected-b-sha256 <sha256> \
-  --expected-wrk-sha256 <sha256>
+  --expected-wrk-sha256 <sha256> \
+  --expected-tail-script-sha256 <sha256>
 ```
 
 Every run performs an HTTP correctness probe, rejects socket/non-2xx/server
@@ -95,16 +99,121 @@ matrix invalid rather than silently reducing the sample count. Default outputs
 go under `results/`, which is intentionally ignored; publish only a reviewed
 result set with its manifest and exact source revisions.
 
+The harness itself is hash-frozen and must be launched on CPUs outside both
+measured sets. An even minimum of four pairs is required. Each rotated cell
+order is held for one AB/BA block, so cell position is not confounded with side
+order in a two-cell confirmation. A saturated-only matrix can additionally set
+`--min-server-utilization 0.95`; a cell below that mean worker-capacity gate is
+complete but not publication-ready.
+
+`wrk_tail.lua` is optional and only defines wrk's post-run `done()` callback.
+It reads wrk's already-collected histogram after the measured window and adds
+p99.9, p99.99, p99.999 and Max to the raw and summary outputs; it has no
+per-request hook. When enabled, the runner freezes and rechecks the script hash
+like the two servers and the `wrk` executable. Deep percentiles are diagnostic
+until they reproduce in both AB and BA order; a single Max sample is not a
+latency distribution.
+
 The manifest's `publication_ready` field is the measurement-quality gate:
 correctness, completeness, stable hashes and sufficient client capacity. It
 cannot prove how an input binary was built, so release evidence additionally
 requires the clean source revisions and build-artifact hashes recorded above.
+It is also not a performance verdict. Scheduler candidates are retained only
+after a separate joint review of throughput, p50-p99 and the diagnostic
+p99.9/p99.99/p99.999/Max fields, including AB/BA order strata. An aggregate
+gain that reverses by order, or a throughput gain paid for by a material
+extreme-tail regression, fails that review even when the matrix is
+publication-ready.
 
 Do not publish a cell carrying the client-saturation warning. Increase its
 `wrk` thread count or client CPU capacity and rerun the complete paired matrix;
 the warning-free confirmation, not the saturated screen, is the result. The
 runner records `publication_ready: false` and exits nonzero when this capacity
 gate fails, even if all correctness pairs are otherwise valid.
+
+## Mixed bulk/latency runner
+
+`mixed_wrk.py` measures the scheduler tradeoff that one saturated throughput
+run cannot show. One pinned `wrk` process keeps the server busy with
+256-request HTTP pipelines, while a second, disjoint `wrk` process measures a
+small ordinary connection set with the full latency histogram. The bulk result
+answers how much capacity the fairness mechanism costs; only the ordinary
+probe's latency is used as a request-latency result. `wrk`'s histogram is not a
+valid per-request latency distribution for the pipelined stream itself.
+Each side first runs and discards a separate bulk warm-up. The measured bulk
+and probe processes then start together with the same duration, so bulk RPS,
+probe latency and server CPU describe the same mixed-load window.
+
+The harness must also be pinned outside all server and client CPU sets. On the
+24-core benchmark host:
+
+```sh
+taskset -c 23 python3 mixed_wrk.py \
+  path/to/baseline-server path/to/candidate-server \
+  --pairs 4 --bulk-warmup 5 --duration 15 \
+  --server-cores 0-7 \
+  --bulk-cores 8-17 --bulk-threads 10 --bulk-connections 64 \
+  --probe-cores 18-21 --probe-threads 4 --probe-connections 4 \
+  --expected-a-sha256 <sha256> \
+  --expected-b-sha256 <sha256> \
+  --expected-wrk-sha256 <sha256> \
+  --expected-bulk-script-sha256 <sha256> \
+  --expected-probe-tail-script-sha256 <sha256> \
+  --output results/<new-directory>
+```
+
+The bulk script is frozen to `wrk_pipeline_256.lua`, and the probe script is
+frozen to the report-only `wrk_tail.lua`; custom workload scripts are rejected.
+Publication runs require at least four pairs and equal AB/BA strata.
+The runner rejects overlapping CPU sets, an unpinned harness, more threads than
+assigned CPUs, socket/HTTP/server failures, input hash drift, insufficient
+bulk/probe overlap, client saturation and an underutilized server. It freezes
+and rechecks the harness and imported matrix helper as well as both binaries,
+`wrk` and the Lua scripts. Any capacity or completeness failure sets
+`publication_ready: false` and exits nonzero.
+
+The output retains both client logs, the discarded warm-up, server logs, raw
+samples, order-stratified paired summaries and an environment manifest.
+Positive B/A means higher throughput for the RPS fields but worse latency for
+the latency fields, so the two groups must always be reported together.
+`publication_ready` validates the measurement procedure, not whether a
+throughput/latency tradeoff is worth retaining.
+
+At the ordinary probe's deliberately low request rate, p50-p99 are the primary
+latency evidence and p99.9 is a diagnostic. The manifest records the minimum
+request count and expected samples beyond each deep percentile. When fewer
+than 10,000 or 100,000 requests are available, p99.99 or p99.999 respectively
+is marked unresolved; those fields often collapse to one extreme sample or
+Max and are not independent distribution claims.
+
+## v0.0.1 retag: work-aware scheduler result
+
+The 2026-07-29 experimental round used `/usr/bin/wrk`, servers on CPUs 0-7,
+clients on 8-21 and the harness on 23. The publication-ready ten-pair standard
+confirmation of the first work-aware quota build was neutral at c64
+(-0.34%, 95% CI -2.21% to +1.57%), but lost 2.52% throughput at c1024
+(-3.79% to -1.24%); paired p50 and p90 rose 3.47% and 2.33%. Its separate
+four-pair mixed confirmation kept pipelined bulk throughput neutral at -0.07%,
+while the ordinary probe gained 100.61% throughput and reduced p50, p90 and
+p99 by 49.47%, 38.53% and 30.57%.
+
+A GCC follow-up removed the TCP success flag and relaxed the completion counter
+to one direct TLS decrement plus branch. Its four-pair screens kept mixed bulk
+neutral at -0.22%, improved probe p50/p90/p99 by 47.19%/37.02%/31.73%, and
+moved standard c64 throughput +0.91%. Standard c1024 did not establish parity:
+the paired summary was -5.07% with a wide -16.24% to +7.60% interval, including
+one valid -15.61% pair alongside three pairs from -0.50% to -1.95%.
+
+The screen binary was
+`cc5b9945e734c0e17589af92bb98700b8e940a51803f0c5992597b763c109bed`.
+The final shared-safe dual-symbol TLS refinement changed the server hash to
+`aa9834d2167a6436fb451a274abc5b8cdcb09aca05ea8239519d581cded43af4`
+while preserving the screen binary's entire `.text` section byte for byte.
+Consequently these screens are diagnostic mechanism evidence, not exact-final
+performance evidence for the retag. The round demonstrates a strong mixed-load
+latency/fairness gain with nearly neutral bulk capacity, but it does not
+demonstrate ordinary c1024 throughput parity; that limitation is part of the
+v0.0.1 retag record.
 
 For a quick three-runtime comparison using locally built `cio`, Asio and Go
 servers:

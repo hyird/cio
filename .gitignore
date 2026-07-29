@@ -1,6 +1,7 @@
 build/
 build-*/
 cmake-build-*/
+compiler-tmp/
 .cache/
 compile_commands.json
 __pycache__/

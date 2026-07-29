@@ -70,6 +70,11 @@ int wait_for_events(int epoll_fd, epoll_event* events, int max_events,
 
 Reactor::Reactor(Scheduler& sched, WorkerId shard_id)
     : sched_(sched), shard_id_(shard_id) {
+    // Allocate the reusable control frame before acquiring raw kernel
+    // resources. If allocation throws, construction unwinds without leaking
+    // an epoll/eventfd pair from an object whose destructor cannot run.
+    initialize_driver();
+
     backend_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
     if (backend_fd_ < 0) fatal("epoll_create1");
 
@@ -88,6 +93,7 @@ Reactor::Reactor(Scheduler& sched, WorkerId shard_id)
 }
 
 Reactor::~Reactor() {
+    destroy_driver();
     if (backend_fd_ >= 0) ::close(backend_fd_);
     if (wake_fd_ >= 0) ::close(wake_fd_);
     const std::uint32_t chunks = chunk_count_.load(std::memory_order_acquire);
@@ -140,6 +146,9 @@ Result<IoDesc*> Reactor::attach(int fd) {
     }
 
     registered_.fetch_add(1, std::memory_order_relaxed);
+    // Give the owner one prompt poll ticket for a newly attached descriptor.
+    // Later tickets come from stale monitor passes.
+    (void)request_owner_poll();
     return desc;
 }
 
@@ -195,7 +204,6 @@ int Reactor::poll(std::int64_t timeout_ns) {
     }
 
     const std::int64_t started = now_ns();
-    last_poll_ns_.store(started, std::memory_order_relaxed);
     poller_deadline_ns_.store(
         timeout_ns < 0 ? INT64_MAX : started + timeout_ns,
         std::memory_order_release);
@@ -211,6 +219,10 @@ int Reactor::poll(std::int64_t timeout_ns) {
     // nothing.
     sched_.poller_returned(shard_id_);
     poller_deadline_ns_.store(INT64_MAX, std::memory_order_release);
+    // Freshness starts when the kernel wait completes, not when it starts. A
+    // blocking poll that just returned must not look stale merely because it
+    // slept longer than the monitor interval.
+    last_poll_ns_.store(now_ns(), std::memory_order_relaxed);
     if (n <= 0) {
         polling_.store(false, std::memory_order_release);
         return 0;  // timeout/EINTR/error: the worker retries its state checks

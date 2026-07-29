@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -19,6 +20,17 @@
 
 using namespace std::chrono_literals;
 namespace net = cio::net;
+
+namespace cio::detail {
+
+struct SchedulerTestAccess {
+    static void push_global(
+        Scheduler& scheduler, void* frame) {
+        scheduler.global_.push(frame);
+    }
+};
+
+}  // namespace cio::detail
 
 namespace {
 
@@ -1220,12 +1232,12 @@ void test_readiness_then_close_cannot_read_reused_fd() {
 
 struct BusyIoObservation {
     bool received = false;
-    std::uint64_t handoffs_at_resume = 0;
+    std::int64_t resumed_at_ns = 0;
 };
 
 cio::Task<BusyIoObservation> receive_during_runnext_chain(
     InspectableUdpSocket* receiver, cio::Chan<> left, cio::Chan<> right,
-    std::atomic<std::uint64_t>* handoffs, std::atomic<bool>* done) {
+    std::atomic<bool>* done) {
     std::byte byte{};
     net::SocketAddr from;
     auto received = co_await receiver->recv_from(
@@ -1235,8 +1247,7 @@ cio::Task<BusyIoObservation> receive_during_runnext_chain(
     observation.received =
         received.has_value() && *received == 1 &&
         byte == std::byte{'I'};
-    observation.handoffs_at_resume =
-        handoffs->load(std::memory_order_acquire);
+    observation.resumed_at_ns = cio::now_ns();
     done->store(true, std::memory_order_release);
     left.close();
     right.close();
@@ -1259,9 +1270,9 @@ cio::Task<> runnext_io_pong(cio::Chan<> left, cio::Chan<> right,
     }
 }
 
-void test_busy_runnext_chain_services_udp_with_bounded_resumes() {
+void test_busy_runnext_chain_services_udp_with_wall_time_bound() {
     constexpr std::uint64_t kWarmupHandoffs = 8;
-    constexpr std::uint64_t kResumeBound = 256;
+    constexpr std::int64_t kWallTimeBoundNs = 50'000'000;
 
     auto body = []() -> cio::Task<bool> {
         auto bound = bind_inspectable_udp();
@@ -1275,14 +1286,14 @@ void test_busy_runnext_chain_services_udp_with_bounded_resumes() {
         auto left = cio::make_chan<>();
         auto right = cio::make_chan<>();
         std::atomic<std::uint64_t> handoffs{0};
-        std::atomic<std::uint64_t> sent_at{
-            std::numeric_limits<std::uint64_t>::max()};
+        std::atomic<std::int64_t> sent_at_ns{
+            std::numeric_limits<std::int64_t>::max()};
         std::atomic<bool> io_done{false};
         std::atomic<bool> send_ok{false};
         std::atomic<bool> watchdog_fired{false};
 
         auto read = cio::spawn(receive_during_runnext_chain(
-            &receiver, left, right, &handoffs, &io_done));
+            &receiver, left, right, &io_done));
 
         // Receiver must be on the netpoll list before the hot runnable chain
         // starts, otherwise the first recv could simply consume queued data.
@@ -1305,6 +1316,10 @@ void test_busy_runnext_chain_services_udp_with_bounded_resumes() {
             co_return false;
         }
 
+        // Discard attach's initial ticket from the shard owner. The hot chain
+        // below must be serviced by the monitor-to-owner stale-reactor path.
+        (void)desc->owner->take_owner_poll_request_ns();
+
         std::thread sender([&, target = *target] {
             const auto warmup_deadline =
                 cio::Clock::now() + 1s;
@@ -1321,15 +1336,13 @@ void test_busy_runnext_chain_services_udp_with_bounded_resumes() {
                 handoffs.load(std::memory_order_acquire) >=
                     kWarmupHandoffs) {
                 const char payload = 'I';
+                const std::int64_t send_started_ns =
+                    cio::now_ns();
                 const bool sent =
                     ::sendto(fd, &payload, 1, MSG_NOSIGNAL,
                              target.raw(), target.length()) == 1;
-                // Sample after sendto's linearization. If the receiver ran
-                // before this publication, its smaller count is itself proof
-                // that I/O completed within the bound.
-                sent_at.store(
-                    handoffs.load(std::memory_order_acquire),
-                    std::memory_order_release);
+                sent_at_ns.store(
+                    send_started_ns, std::memory_order_release);
                 send_ok.store(sent, std::memory_order_release);
             }
             if (fd >= 0) ::close(fd);
@@ -1356,13 +1369,13 @@ void test_busy_runnext_chain_services_udp_with_bounded_resumes() {
         co_await chain.join();
         sender.join();
 
-        const std::uint64_t sent_count =
-            sent_at.load(std::memory_order_acquire);
+        const std::int64_t sent_ns =
+            sent_at_ns.load(std::memory_order_acquire);
         const bool bounded =
-            sent_count != std::numeric_limits<std::uint64_t>::max() &&
-            (observation.handoffs_at_resume <= sent_count ||
-             observation.handoffs_at_resume - sent_count <
-                 kResumeBound);
+            sent_ns != std::numeric_limits<std::int64_t>::max() &&
+            (observation.resumed_at_ns <= sent_ns ||
+             observation.resumed_at_ns - sent_ns <
+                 kWallTimeBoundNs);
         CIO_CHECK(send_ok.load(std::memory_order_acquire));
         CIO_CHECK(observation.received);
         CIO_CHECK(!watchdog_fired.load(std::memory_order_acquire));
@@ -1416,9 +1429,9 @@ cio::Task<> occupy_worker_without_suspending(
     co_await SwitchToWorker{scheduler, worker};
     started->store(true, std::memory_order_release);
     while (!release->load(std::memory_order_acquire)) {
-        // Yield the OS thread, not the coroutine. The scheduler cannot run a
-        // second task on this worker until `release` is published.
-        std::this_thread::yield();
+        // Deliberately monopolize the worker without yielding either the
+        // coroutine or its OS thread. Foreign polling must remain live even
+        // when the owner executes non-cooperative user code.
     }
     finished->store(true, std::memory_order_release);
 }
@@ -1884,6 +1897,201 @@ void test_parked_io_retains_source_reactor_after_socket_replacement() {
     ::close(fds[1]);
 }
 
+cio::Task<> close_after_successful_read_checkpoint(
+    InspectableTcpStream* stream,
+    cio::detail::IoDesc* desc,
+    std::atomic<bool>* lease_was_released,
+    std::atomic<bool>* closed) {
+    lease_was_released->store(
+        !desc->syscall_active[
+             static_cast<unsigned>(
+                 cio::detail::Dir::kRead)]
+             .load(std::memory_order_acquire),
+        std::memory_order_release);
+    stream->close();
+    closed->store(true, std::memory_order_release);
+    co_return;
+}
+
+cio::Task<bool> successful_read_checkpoint_body(
+    int fd,
+    std::atomic<bool>* lease_was_released,
+    std::atomic<bool>* closed) {
+    InspectableTcpStream stream;
+    auto adopted =
+        stream.adopt_for_test(fd);
+    if (!adopted) co_return false;
+    cio::detail::IoDesc* const desc =
+        stream.descriptor();
+    (void)desc->owner->take_owner_poll_request_ns();
+
+    std::byte byte{};
+    for (std::uint32_t i = 0;
+         i <= cio::detail::kCooperativeIoBudget; ++i) {
+        if (i == cio::detail::kCooperativeIoBudget) {
+            auto observer =
+                close_after_successful_read_checkpoint(
+                    &stream, desc, lease_was_released, closed);
+            auto handle = observer.release();
+            handle.promise().detached = true;
+            auto* const scheduler =
+                cio::detail::current_scheduler();
+            if (scheduler == nullptr) co_return false;
+            cio::detail::SchedulerTestAccess::push_global(
+                *scheduler, handle.address());
+        }
+
+        auto read = co_await stream.read(
+            std::span<std::byte>{&byte, 1});
+        if (!read || *read != 1) co_return false;
+    }
+
+    co_return
+        lease_was_released->load(std::memory_order_acquire) &&
+        closed->load(std::memory_order_acquire) &&
+        !stream.valid();
+}
+
+void test_successful_io_checkpoint_releases_fd_lease_before_yield() {
+    int fds[2] = {-1, -1};
+    CIO_CHECK(open_nonblocking_socket_pair(fds));
+    if (fds[0] < 0 || fds[1] < 0) return;
+
+    char payload[
+        cio::detail::kCooperativeIoBudget + 1];
+    std::memset(payload, 'R', sizeof(payload));
+    CIO_CHECK_EQ(
+        ::send(fds[1], payload, sizeof(payload), MSG_NOSIGNAL),
+        static_cast<ssize_t>(sizeof(payload)));
+
+    std::atomic<bool> lease_was_released{false};
+    std::atomic<bool> closed{false};
+    cio::RuntimeOptions options;
+    options.worker_threads = 1;
+    const bool ok = cio::run(
+        successful_read_checkpoint_body(
+            fds[0], &lease_was_released, &closed),
+        options);
+    CIO_CHECK(ok);
+    CIO_CHECK(lease_was_released.load(std::memory_order_acquire));
+    CIO_CHECK(closed.load(std::memory_order_acquire));
+    ::close(fds[1]);
+}
+
+cio::Task<> hold_checkpoint_owner_until_parent_escapes(
+    std::atomic<bool>* parent_resumed,
+    std::atomic<bool>* parent_escaped,
+    std::atomic<bool>* done) {
+    const auto deadline =
+        cio::Clock::now() + 1s;
+    while (!parent_resumed->load(
+               std::memory_order_acquire) &&
+           cio::Clock::now() < deadline) {
+        // Intentionally non-suspending. The cooperative checkpoint must
+        // publish its parent so the other worker can steal it.
+        std::atomic_signal_fence(
+            std::memory_order_seq_cst);
+    }
+    parent_escaped->store(
+        parent_resumed->load(
+            std::memory_order_acquire),
+        std::memory_order_release);
+    done->store(true, std::memory_order_release);
+    co_return;
+}
+
+cio::Task<bool>
+successful_read_checkpoint_publication_body(
+    int fd, int cycles) {
+    InspectableTcpStream stream;
+    auto adopted = stream.adopt_for_test(fd);
+    if (!adopted) co_return false;
+
+    auto* const scheduler =
+        cio::detail::current_scheduler();
+    if (scheduler == nullptr) co_return false;
+
+    std::byte byte{};
+    for (int cycle = 0; cycle < cycles;
+         ++cycle) {
+        std::atomic<bool> parent_resumed{false};
+        std::atomic<bool> parent_escaped{false};
+        std::atomic<bool> observer_done{false};
+        for (std::uint32_t i = 0;
+             i <=
+             cio::detail::kCooperativeIoBudget;
+             ++i) {
+            if (i ==
+                cio::detail::
+                    kCooperativeIoBudget) {
+                auto observer =
+                    hold_checkpoint_owner_until_parent_escapes(
+                        &parent_resumed,
+                        &parent_escaped,
+                        &observer_done);
+                auto handle = observer.release();
+                handle.promise().detached = true;
+                cio::detail::SchedulerTestAccess::
+                    push_global(
+                        *scheduler,
+                        handle.address());
+            }
+
+            auto read = co_await stream.read(
+                std::span<std::byte>{
+                    &byte, 1});
+            if (!read || *read != 1) {
+                co_return false;
+            }
+        }
+
+        parent_resumed.store(
+            true, std::memory_order_release);
+
+        const auto deadline =
+            cio::Clock::now() + 1s;
+        while (!observer_done.load(
+                   std::memory_order_acquire) &&
+               cio::Clock::now() < deadline) {
+            co_await cio::yield();
+        }
+        if (!observer_done.load(
+                std::memory_order_acquire) ||
+            !parent_escaped.load(
+                std::memory_order_acquire)) {
+            co_return false;
+        }
+    }
+
+    co_return true;
+}
+
+void test_successful_io_checkpoint_publishes_parent_before_hog() {
+    constexpr int kCycles = 16;
+    constexpr std::size_t kBytes =
+        kCycles *
+        (cio::detail::kCooperativeIoBudget +
+         1);
+
+    int fds[2] = {-1, -1};
+    CIO_CHECK(open_nonblocking_socket_pair(fds));
+    if (fds[0] < 0 || fds[1] < 0) return;
+
+    std::vector<char> payload(kBytes, 'P');
+    CIO_CHECK_EQ(
+        ::send(fds[1], payload.data(),
+               payload.size(), MSG_NOSIGNAL),
+        static_cast<ssize_t>(payload.size()));
+
+    cio::RuntimeOptions options;
+    options.worker_threads = 2;
+    CIO_CHECK(cio::run(
+        successful_read_checkpoint_publication_body(
+            fds[0], kCycles),
+        options));
+    ::close(fds[1]);
+}
+
 void test_resolve_localhost() {
     auto body = []() -> cio::Task<bool> {
         auto addresses = co_await net::resolve("localhost", 80);
@@ -1981,13 +2189,15 @@ int main() {
     RUN_TEST(test_failed_io_awaiter_does_not_restore_ready_hint);
     RUN_TEST(test_fd_use_guard_delays_physical_close);
     RUN_TEST(test_readiness_then_close_cannot_read_reused_fd);
-    RUN_TEST(test_busy_runnext_chain_services_udp_with_bounded_resumes);
+    RUN_TEST(test_busy_runnext_chain_services_udp_with_wall_time_bound);
     RUN_TEST(test_monitor_completions_escape_cpu_bound_owner);
     RUN_TEST(test_udp_round_trip);
     RUN_TEST(test_foreign_reactor_readiness_wakes_awaiting_runtime);
     RUN_TEST(test_socket_returned_from_run_keeps_reactor_alive);
     RUN_TEST(test_readiness_ignores_destroyed_target_runtime);
     RUN_TEST(test_parked_io_retains_source_reactor_after_socket_replacement);
+    RUN_TEST(test_successful_io_checkpoint_releases_fd_lease_before_yield);
+    RUN_TEST(test_successful_io_checkpoint_publishes_parent_before_hog);
     RUN_TEST(test_resolve_localhost);
     RUN_TEST(test_blocking_pool_offload);
     RUN_TEST(test_invalid_socket_operations_return_ebadf);

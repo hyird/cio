@@ -33,9 +33,14 @@ from typing import Any
 
 
 HERE = pathlib.Path(__file__).resolve().parent
+HARNESS_PATH = pathlib.Path(__file__).resolve()
 DEFAULT_A = HERE / "build" / "cio_http_v2_baseline"
 DEFAULT_B = HERE / "build" / "cio_http_v2_spawn_direct_final"
-DEFAULT_CELLS = "1:1,8:4,64:16,256:16,1024:16"
+DEFAULT_CELLS = "1:1,8:4,64:14,256:14,1024:14"
+DEFAULT_TAIL_SCRIPT = HERE / "wrk_tail.lua"
+REPORT_ONLY_TAIL_SHA256 = (
+    "69c69764416758532800f53ce8a7c75cea7f628984a3613acaa3d23aa135e323"
+)
 T95 = {
     1: 12.706,
     2: 4.303,
@@ -89,6 +94,10 @@ class WrkResult:
     latency_p75_us: float | None
     latency_p90_us: float | None
     latency_p99_us: float | None
+    latency_p999_us: float | None
+    latency_p9999_us: float | None
+    latency_p99999_us: float | None
+    latency_max_us: float | None
     socket_connect: int
     socket_read: int
     socket_write: int
@@ -129,6 +138,10 @@ class SideResult:
     latency_p75_us: float | None = None
     latency_p90_us: float | None = None
     latency_p99_us: float | None = None
+    latency_p999_us: float | None = None
+    latency_p9999_us: float | None = None
+    latency_p99999_us: float | None = None
+    latency_max_us: float | None = None
     server_cpu_seconds: float | None = None
     wrk_cpu_seconds: float | None = None
     wall_seconds: float | None = None
@@ -250,6 +263,7 @@ def parse_wrk_output(
     cpu_seconds: float,
     wall_seconds: float,
     require_latency: bool,
+    require_tail: bool,
 ) -> WrkResult:
     rps_match = re.search(r"^Requests/sec:\s+([0-9]+(?:\.[0-9]+)?)", text, re.M)
     total_match = re.search(r"^\s*([0-9]+)\s+requests in\s+", text, re.M)
@@ -272,6 +286,21 @@ def parse_wrk_output(
     latency_avg = latency_us(latency_match.group(1)) if latency_match else None
     if require_latency and (latency_avg is None or 50 not in percentiles or 99 not in percentiles):
         raise MatrixError("wrk output has no complete latency distribution")
+
+    tail_match = re.search(
+        r"^CIO_WRK_TAIL_US\s+"
+        r"p99\.9=([0-9]+)\s+"
+        r"p99\.99=([0-9]+)\s+"
+        r"p99\.999=([0-9]+)\s+"
+        r"max=([0-9]+)\s*$",
+        text,
+        re.M,
+    )
+    tail_values: tuple[float, float, float, float] | None = None
+    if tail_match is not None:
+        tail_values = tuple(float(value) for value in tail_match.groups())
+    if require_tail and tail_values is None:
+        raise MatrixError("wrk output has no deep-tail latency report")
 
     socket_counts = {
         "connect": 0,
@@ -307,6 +336,10 @@ def parse_wrk_output(
         latency_p75_us=percentiles.get(75),
         latency_p90_us=percentiles.get(90),
         latency_p99_us=percentiles.get(99),
+        latency_p999_us=tail_values[0] if tail_values else None,
+        latency_p9999_us=tail_values[1] if tail_values else None,
+        latency_p99999_us=tail_values[2] if tail_values else None,
+        latency_max_us=tail_values[3] if tail_values else None,
         socket_connect=socket_counts["connect"],
         socket_read=socket_counts["read"],
         socket_write=socket_counts["write"],
@@ -436,6 +469,7 @@ def run_wrk(
     timeout: str,
     port: int,
     latency: bool,
+    tail_script: pathlib.Path | None,
     log_path: pathlib.Path,
 ) -> WrkResult:
     command = [
@@ -451,6 +485,8 @@ def run_wrk(
     ]
     if latency:
         command.append("--latency")
+    if tail_script is not None:
+        command.extend(("-s", str(tail_script)))
     command.append(f"http://127.0.0.1:{port}/")
 
     start = time.monotonic()
@@ -493,6 +529,7 @@ def run_wrk(
         cpu_seconds=max(0.0, last_cpu - first_cpu),
         wall_seconds=wall_seconds,
         require_latency=latency,
+        require_tail=tail_script is not None,
     )
 
 
@@ -575,6 +612,7 @@ def one_side(
                 timeout=args.timeout,
                 port=port,
                 latency=False,
+                tail_script=None,
                 log_path=run_directory / "warmup.log",
             )
             base.warmup_rps = warmup.rps
@@ -596,6 +634,7 @@ def one_side(
                 timeout=args.timeout,
                 port=port,
                 latency=True,
+                tail_script=args.tail_script,
                 log_path=run_directory / "measure.log",
             )
             base.rps = measured.rps
@@ -605,6 +644,10 @@ def one_side(
             base.latency_p75_us = measured.latency_p75_us
             base.latency_p90_us = measured.latency_p90_us
             base.latency_p99_us = measured.latency_p99_us
+            base.latency_p999_us = measured.latency_p999_us
+            base.latency_p9999_us = measured.latency_p9999_us
+            base.latency_p99999_us = measured.latency_p99999_us
+            base.latency_max_us = measured.latency_max_us
             base.wrk_cpu_seconds = measured.cpu_seconds
             base.wall_seconds = measured.wall_seconds
             base.wrk_cores = measured.cpu_seconds / measured.wall_seconds
@@ -673,6 +716,26 @@ def median_metric(results: Sequence[SideResult], name: str) -> float:
     return statistics.median(values)
 
 
+def paired_metric_delta_pct(
+    pairs: Sequence[tuple[SideResult, SideResult]],
+    name: str,
+) -> float | None:
+    ratios: list[float] = []
+    for a, b in pairs:
+        a_value = getattr(a, name)
+        b_value = getattr(b, name)
+        if a_value is None or b_value is None:
+            return None
+        a_metric = float(a_value)
+        b_metric = float(b_value)
+        # A zero histogram percentile is wrk's "not observable" sentinel for
+        # some pipelined scripts, not a latency sample suitable for a ratio.
+        if a_metric <= 0.0 or b_metric <= 0.0:
+            return None
+        ratios.append(b_metric / a_metric)
+    return (geometric_mean(ratios) - 1.0) * 100.0 if ratios else None
+
+
 def summarize(
     cells: Sequence[Cell],
     results: Sequence[SideResult],
@@ -681,7 +744,15 @@ def summarize(
     *,
     interrupted: bool,
     hashes_unchanged: bool,
-) -> tuple[list[dict[str, Any]], int, bool, list[str]]:
+    server_threads: int,
+    min_server_utilization: float | None,
+) -> tuple[
+    list[dict[str, Any]],
+    int,
+    bool,
+    list[str],
+    list[str],
+]:
     summaries: list[dict[str, Any]] = []
     invalid_pairs = 0
     for cell in cells:
@@ -787,7 +858,34 @@ def summarize(
                 float(run.wrk_cores) >= cell.wrk_threads * 0.95
                 for run in [*a_runs, *b_runs]
             ),
+            "server_underutilization_warning": (
+                min_server_utilization is not None
+                and (
+                    statistics.fmean(
+                        float(run.server_cores) for run in a_runs
+                    )
+                    < server_threads * min_server_utilization
+                    or statistics.fmean(
+                        float(run.server_cores) for run in b_runs
+                    )
+                    < server_threads * min_server_utilization
+                )
+            ),
         }
+        if all(
+            run.latency_p999_us is not None
+            and run.latency_p9999_us is not None
+            and run.latency_p99999_us is not None
+            and run.latency_max_us is not None
+            for run in [*a_runs, *b_runs]
+        ):
+            for suffix in ("p999", "p9999", "p99999", "max"):
+                name = f"latency_{suffix}_us"
+                summary[f"a_median_{suffix}_us"] = median_metric(a_runs, name)
+                summary[f"b_median_{suffix}_us"] = median_metric(b_runs, name)
+                summary[f"paired_{suffix}_delta_pct"] = paired_metric_delta_pct(
+                    pairs, name
+                )
         summaries.append(summary)
 
     summary_fields: list[str] = []
@@ -814,7 +912,12 @@ def summarize(
         for summary in summaries
         if summary.get("client_saturation_warning")
     ]
-    if matrix_valid and not saturated:
+    underutilized = [
+        f"c{summary['connections']}/t{summary['wrk_threads']}"
+        for summary in summaries
+        if summary.get("server_underutilization_warning")
+    ]
+    if matrix_valid and not saturated and not underutilized:
         status = (
             f"**Status: VALID AND PUBLICATION-READY.** All "
             f"{expected_pairs * len(cells)} expected pairs passed."
@@ -822,25 +925,43 @@ def summarize(
     elif matrix_valid:
         status = (
             "**Status: VALID BUT NOT PUBLICATION-READY.** All expected pairs "
-            "passed, but the client-capacity gate failed."
+            "passed, but a capacity/utilization gate failed."
         )
     else:
         status = (
             f"**Status: INVALID.** invalid/incomplete pairs={invalid_pairs}, "
             f"interrupted={interrupted}, hashes_unchanged={hashes_unchanged}."
         )
-    lines = [
-        "# wrk frozen A/B matrix",
-        "",
-        status,
-        "",
-        "| connections | wrk threads | pairs | A mean req/s | B mean req/s | paired B/A geo | 95% CI | median p50 A/B us | median p99 A/B us | server cores A/B | wrk cores A/B |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ]
+    has_tail = any("a_median_p999_us" in summary for summary in summaries)
+    lines = ["# wrk frozen A/B matrix", "", status, ""]
+    if has_tail:
+        lines.extend(
+            [
+                "| connections | wrk threads | pairs | A mean req/s | B mean req/s | paired B/A geo | 95% CI | median p50 A/B us | median p99 A/B us | median p99.9 A/B us | median p99.99 A/B us | median p99.999 A/B us | median Max A/B us | server cores A/B | wrk cores A/B |",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "| connections | wrk threads | pairs | A mean req/s | B mean req/s | paired B/A geo | 95% CI | median p50 A/B us | median p99 A/B us | server cores A/B | wrk cores A/B |",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
     for summary in summaries:
         if not summary.get("valid_pairs"):
+            missing_columns = 15 if has_tail else 11
             lines.append(
-                f"| {summary['connections']} | {summary['wrk_threads']} | 0 | invalid | invalid | — | — | — | — | — | — |"
+                "| "
+                + " | ".join(
+                    [
+                        str(summary["connections"]),
+                        str(summary["wrk_threads"]),
+                        "0",
+                        *(["invalid"] * (missing_columns - 3)),
+                    ]
+                )
+                + " |"
             )
             continue
         if summary["ci95_low_pct"] is None:
@@ -850,17 +971,28 @@ def summarize(
                 f"{summary['ci95_low_pct']:+.2f}%…"
                 f"{summary['ci95_high_pct']:+.2f}%"
             )
-        lines.append(
+        row = (
             "| {connections} | {wrk_threads} | {valid_pairs} | "
             "{a_mean_rps:,.0f} | {b_mean_rps:,.0f} | "
             "{paired_geomean_delta_pct:+.2f}% | {ci} | "
             "{a_median_p50_us:.1f}/{b_median_p50_us:.1f} | "
-            "{a_median_p99_us:.1f}/{b_median_p99_us:.1f} | "
-            "{a_mean_server_cores:.2f}/{b_mean_server_cores:.2f} | "
-            "{a_mean_wrk_cores:.2f}/{b_mean_wrk_cores:.2f} |".format(
-                ci=ci, **summary
-            )
-        )
+            "{a_median_p99_us:.1f}/{b_median_p99_us:.1f} |"
+        ).format(ci=ci, **summary)
+        if has_tail:
+            if "a_median_p999_us" in summary:
+                row += (
+                    " {a_median_p999_us:.1f}/{b_median_p999_us:.1f} |"
+                    " {a_median_p9999_us:.1f}/{b_median_p9999_us:.1f} |"
+                    " {a_median_p99999_us:.1f}/{b_median_p99999_us:.1f} |"
+                    " {a_median_max_us:.1f}/{b_median_max_us:.1f} |"
+                ).format(**summary)
+            else:
+                row += " — | — | — | — |"
+        row += (
+            " {a_mean_server_cores:.2f}/{b_mean_server_cores:.2f} |"
+            " {a_mean_wrk_cores:.2f}/{b_mean_wrk_cores:.2f} |"
+        ).format(**summary)
+        lines.append(row)
     lines.extend(
         [
             "",
@@ -882,8 +1014,23 @@ def summarize(
                 "",
             ]
         )
+    if underutilized:
+        lines.extend(
+            [
+                "Server underutilization warning: at least one side used less",
+                "than the configured minimum worker capacity in "
+                f"{', '.join(underutilized)}.",
+                "",
+            ]
+        )
     (output_directory / "summary.md").write_text("\n".join(lines))
-    return summaries, invalid_pairs, matrix_valid, saturated
+    return (
+        summaries,
+        invalid_pairs,
+        matrix_valid,
+        saturated,
+        underutilized,
+    )
 
 
 def environment_snapshot() -> dict[str, Any]:
@@ -914,16 +1061,29 @@ def validate_inputs(args: argparse.Namespace, cells: Sequence[Cell]) -> dict[str
     for label, path in (("A", args.binary_a), ("B", args.binary_b), ("wrk", args.wrk)):
         if not path.is_file() or not os.access(path, os.X_OK):
             raise MatrixError(f"{label} is not an executable file: {path}")
+    if args.tail_script is not None and not args.tail_script.is_file():
+        raise MatrixError(
+            f"tail script is not a regular file: {args.tail_script}"
+        )
 
     server_cpus = parse_cpu_set(args.server_cores)
     client_cpus = parse_cpu_set(args.client_cores)
-    allowed_cpus = set(os.sched_getaffinity(0))
-    if not server_cpus <= allowed_cpus or not client_cpus <= allowed_cpus:
+    online_count = os.cpu_count() or 0
+    selected_cpus = server_cpus | client_cpus
+    if selected_cpus and max(selected_cpus) >= online_count:
         raise MatrixError(
-            f"CPU sets must be within allowed CPUs {sorted(allowed_cpus)}"
+            f"selected CPU is outside 0-{online_count - 1}"
         )
     if server_cpus & client_cpus:
         raise MatrixError("server and wrk CPU sets overlap")
+    harness_overlap = (
+        set(os.sched_getaffinity(0)) & selected_cpus
+    )
+    if harness_overlap:
+        raise MatrixError(
+            "pin this harness outside server/wrk CPUs; overlap="
+            f"{sorted(harness_overlap)}"
+        )
     if args.server_threads > len(server_cpus):
         raise MatrixError("server threads exceed pinned server CPUs")
     for cell in cells:
@@ -936,15 +1096,24 @@ def validate_inputs(args: argparse.Namespace, cells: Sequence[Cell]) -> dict[str
         "A": sha256(args.binary_a),
         "B": sha256(args.binary_b),
         "wrk": sha256(args.wrk),
+        "harness": sha256(HARNESS_PATH),
     }
+    if args.tail_script is not None:
+        hashes["tail_script"] = sha256(args.tail_script)
+        if hashes["tail_script"] != REPORT_ONLY_TAIL_SHA256:
+            raise MatrixError(
+                "tail script must be the frozen report-only wrk_tail.lua"
+            )
     for label, expected in (
         ("A", args.expected_a_sha256),
         ("B", args.expected_b_sha256),
         ("wrk", args.expected_wrk_sha256),
+        ("tail_script", args.expected_tail_script_sha256),
     ):
-        if expected and hashes[label] != expected.lower():
+        if expected and hashes.get(label) != expected.lower():
             raise MatrixError(
-                f"{label} SHA-256 mismatch: expected {expected}, got {hashes[label]}"
+                f"{label} SHA-256 mismatch: expected {expected}, "
+                f"got {hashes.get(label, '<disabled>')}"
             )
     return hashes
 
@@ -965,7 +1134,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--duration", type=int, default=15)
     parser.add_argument("--server-threads", type=int, default=8)
     parser.add_argument("--server-cores", default="0-7")
-    parser.add_argument("--client-cores", default="8-23")
+    parser.add_argument("--client-cores", default="8-21")
+    parser.add_argument(
+        "--min-server-utilization",
+        type=float,
+        help=(
+            "optional publication gate: minimum mean server CPU / "
+            "configured worker capacity per side and cell"
+        ),
+    )
     parser.add_argument("--timeout", default="2s")
     parser.add_argument("--cooldown", type=float, default=0.5)
     parser.add_argument(
@@ -973,24 +1150,44 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         type=pathlib.Path,
         default=pathlib.Path(shutil.which("wrk") or "/usr/bin/wrk"),
     )
+    parser.add_argument(
+        "--tail-script",
+        type=pathlib.Path,
+        help=(
+            "report-only wrk Lua script for p99.9/p99.99/p99.999/Max; "
+            f"the repository script is {DEFAULT_TAIL_SCRIPT}"
+        ),
+    )
     parser.add_argument("--expected-a-sha256")
     parser.add_argument("--expected-b-sha256")
     parser.add_argument("--expected-wrk-sha256")
+    parser.add_argument("--expected-tail-script-sha256")
     parser.add_argument(
         "--output",
         type=pathlib.Path,
         help="new output directory; defaults under results/",
     )
     args = parser.parse_args(argv)
-    if args.pairs < 1 or args.warmup < 1 or args.duration < 1:
-        parser.error("pairs, warmup and duration must all be positive")
+    if args.pairs < 4 or args.pairs % 2 != 0:
+        parser.error("publication pairs must be even and at least 4")
+    if args.warmup < 1 or args.duration < 1:
+        parser.error("warmup and duration must both be positive")
     if args.server_threads < 1:
         parser.error("server threads must be positive")
     if args.cooldown < 0:
         parser.error("cooldown must not be negative")
+    if (
+        args.min_server_utilization is not None
+        and not 0.0 < args.min_server_utilization <= 1.0
+    ):
+        parser.error(
+            "minimum server utilization must be in (0, 1]"
+        )
     args.binary_a = args.binary_a.resolve()
     args.binary_b = args.binary_b.resolve()
     args.wrk = args.wrk.resolve()
+    if args.tail_script is not None:
+        args.tail_script = args.tail_script.resolve()
     return args
 
 
@@ -1016,8 +1213,12 @@ def main(argv: Sequence[str]) -> int:
         return 2
 
     manifest = {
-        "schema": 1,
-        "argv": [str(pathlib.Path(sys.argv[0]).resolve()), *argv],
+        "schema": 2,
+        "argv": [str(HARNESS_PATH), *argv],
+        "harness": {
+            "path": str(HARNESS_PATH),
+            "sha256": hashes["harness"],
+        },
         "binary_a": {
             "path": str(args.binary_a),
             "sha256": hashes["A"],
@@ -1031,6 +1232,15 @@ def main(argv: Sequence[str]) -> int:
             "sha256": hashes["wrk"],
             "version": command_output([str(args.wrk), "--version"]).splitlines()[0],
         },
+        "tail_script": (
+            {
+                "path": str(args.tail_script),
+                "sha256": hashes["tail_script"],
+                "report_only": True,
+            }
+            if args.tail_script is not None
+            else None
+        ),
         "matrix": [dataclasses.asdict(cell) for cell in cells],
         "pairs": args.pairs,
         "warmup_seconds": args.warmup,
@@ -1038,6 +1248,8 @@ def main(argv: Sequence[str]) -> int:
         "server_threads": args.server_threads,
         "server_cores": args.server_cores,
         "client_cores": args.client_cores,
+        "minimum_server_utilization":
+            args.min_server_utilization,
         "timeout": args.timeout,
         "cooldown_seconds": args.cooldown,
         "git_head": command_output(["git", "-C", str(HERE), "rev-parse", "HEAD"]),
@@ -1045,6 +1257,14 @@ def main(argv: Sequence[str]) -> int:
             ["git", "-C", str(HERE), "status", "--short"]
         ).splitlines(),
         "environment_start": environment_snapshot(),
+        "interrupted": None,
+        "completed_runs": 0,
+        "invalid_pairs": None,
+        "hashes_unchanged": False,
+        "matrix_valid": False,
+        "client_saturation_cells": None,
+        "server_underutilization_cells": None,
+        "publication_ready": False,
     }
     manifest_path = output_directory / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -1053,6 +1273,11 @@ def main(argv: Sequence[str]) -> int:
     print(f"A: {args.binary_a}  sha256={hashes['A']}")
     print(f"B: {args.binary_b}  sha256={hashes['B']}")
     print(f"wrk: {args.wrk}  sha256={hashes['wrk']}")
+    if args.tail_script is not None:
+        print(
+            f"tail script: {args.tail_script}  "
+            f"sha256={hashes['tail_script']}"
+        )
     print(
         f"server={args.server_cores}/{args.server_threads} workers  "
         f"wrk={args.client_cores}  warmup={args.warmup}s "
@@ -1078,7 +1303,10 @@ def main(argv: Sequence[str]) -> int:
             raw_output.flush()
             try:
                 for pair in range(1, args.pairs + 1):
-                    shift = (pair - 1) % len(cells)
+                    # Keep each rotated cell order for one AB/BA block. This
+                    # prevents cell position from being perfectly confounded
+                    # with side order when the matrix has only two cells.
+                    shift = ((pair - 1) // 2) % len(cells)
                     round_cells = [*cells[shift:], *cells[:shift]]
                     order = "AB" if pair % 2 else "BA"
                     print(
@@ -1162,18 +1390,30 @@ def main(argv: Sequence[str]) -> int:
             "A": sha256(args.binary_a),
             "B": sha256(args.binary_b),
             "wrk": sha256(args.wrk),
+            "harness": sha256(HARNESS_PATH),
         }
+        if args.tail_script is not None:
+            end_hashes["tail_script"] = sha256(args.tail_script)
     except OSError as error:
         end_hashes = {}
         print(f"matrix invalid: cannot re-hash inputs: {error}", file=sys.stderr)
     hashes_unchanged = end_hashes == hashes
-    summaries, invalid_pairs, matrix_valid, saturated = summarize(
+    (
+        summaries,
+        invalid_pairs,
+        matrix_valid,
+        saturated,
+        underutilized,
+    ) = summarize(
         cells,
         results,
         args.pairs,
         output_directory,
         interrupted=interrupted,
         hashes_unchanged=hashes_unchanged,
+        server_threads=args.server_threads,
+        min_server_utilization=
+            args.min_server_utilization,
     )
     manifest["environment_end"] = environment_snapshot()
     manifest["end_hashes"] = end_hashes
@@ -1183,7 +1423,14 @@ def main(argv: Sequence[str]) -> int:
     manifest["hashes_unchanged"] = hashes_unchanged
     manifest["matrix_valid"] = matrix_valid
     manifest["client_saturation_cells"] = saturated
-    manifest["publication_ready"] = matrix_valid and not saturated
+    manifest["server_underutilization_cells"] = (
+        underutilized
+    )
+    manifest["publication_ready"] = (
+        matrix_valid
+        and not saturated
+        and not underutilized
+    )
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
     print()
@@ -1192,7 +1439,8 @@ def main(argv: Sequence[str]) -> int:
         print(
             f"matrix not publication-ready: interrupted={interrupted}, "
             f"invalid_pairs={invalid_pairs}, hashes_unchanged={hashes_unchanged}, "
-            f"client_saturation_cells={saturated}",
+            f"client_saturation_cells={saturated}, "
+            f"server_underutilization_cells={underutilized}",
             file=sys.stderr,
         )
         return 1

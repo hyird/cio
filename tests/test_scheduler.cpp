@@ -1,5 +1,10 @@
+#include <fcntl.h>
+#include <sched.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
@@ -15,6 +20,17 @@ using namespace std::chrono_literals;
 namespace cio::detail {
 
 struct SchedulerTestAccess {
+    static bool any_idle(Scheduler& scheduler) {
+        return scheduler.idle_workers_->any();
+    }
+
+    static void push_next_private(
+        Scheduler& scheduler,
+        WorkerId worker,
+        void* frame) {
+        scheduler.workers_[worker]->push_next(frame);
+    }
+
     static void stage_fairness_preselection(
         Scheduler& scheduler, WorkerId worker_id, void* inbox_frame,
         void* runnext_frame) {
@@ -136,6 +152,134 @@ struct SchedulerTestAccess {
 
     static void* pop_global(Scheduler& scheduler) {
         return scheduler.global_.pop();
+    }
+
+    static bool global_empty(Scheduler& scheduler) {
+        return scheduler.global_.empty();
+    }
+
+    static void* runnext(
+        Scheduler& scheduler, WorkerId worker_id) {
+        return scheduler.workers_[worker_id]
+            ->runnext_.load(std::memory_order_acquire);
+    }
+
+    static void stage_runnext(
+        Scheduler& scheduler, WorkerId worker_id,
+        void* runnext_frame) {
+        scheduler.workers_[worker_id]->runnext_.store(
+            runnext_frame, std::memory_order_release);
+    }
+
+    static void set_tick(
+        Scheduler& scheduler, WorkerId worker_id,
+        std::uint32_t tick) {
+        scheduler.workers_[worker_id]->tick_ = tick;
+    }
+
+    static std::uint32_t tick(
+        Scheduler& scheduler, WorkerId worker_id) {
+        return scheduler.workers_[worker_id]->tick_;
+    }
+
+    static void stage_inbox(
+        Scheduler& scheduler, WorkerId worker_id,
+        void* frame) {
+        CIO_CHECK(
+            scheduler.workers_[worker_id]->inbox_.try_push(frame));
+    }
+
+    static void stage_global(
+        Scheduler& scheduler, void* frame) {
+        scheduler.global_.push(frame);
+    }
+
+    static void* select_round(
+        Scheduler& scheduler, WorkerId worker_id) {
+        Worker& worker = *scheduler.workers_[worker_id];
+        void* item = worker.next_local();
+        if (item == nullptr) item = worker.find_work();
+        return item;
+    }
+
+    static void monitor_pass(
+        Scheduler& scheduler, std::int64_t now) {
+        scheduler.monitor_pass(now);
+    }
+
+    static void start_workers_without_monitor(
+        Scheduler& scheduler) {
+        const bool already_started =
+            scheduler.started_.exchange(
+                true, std::memory_order_acq_rel);
+        CIO_CHECK(!already_started);
+        if (already_started) return;
+        for (auto& worker : scheduler.workers_) {
+            worker->thread_ =
+                std::thread([w = worker.get()] { w->run(); });
+        }
+    }
+
+    static std::uint64_t driver_requested_epoch(
+        Scheduler& scheduler, WorkerId worker_id) {
+        return scheduler.workers_[worker_id]
+            ->reactor_->driver_requested_epoch_.load(
+                std::memory_order_acquire);
+    }
+
+    static std::uint64_t driver_attempted_epoch(
+        Scheduler& scheduler, WorkerId worker_id) {
+        return scheduler.workers_[worker_id]
+            ->reactor_->driver_attempted_epoch_.load(
+                std::memory_order_acquire);
+    }
+
+    static std::uint64_t driver_covered_epoch(
+        Scheduler& scheduler, WorkerId worker_id) {
+        return scheduler.workers_[worker_id]
+            ->reactor_->driver_covered_epoch_.load(
+                std::memory_order_acquire);
+    }
+
+    static std::int64_t driver_requested_at(
+        Scheduler& scheduler, WorkerId worker_id) {
+        return scheduler.workers_[worker_id]
+            ->reactor_->driver_requested_at_ns_.load(
+                std::memory_order_acquire);
+    }
+
+    static int driver_phase(
+        Scheduler& scheduler, WorkerId worker_id) {
+        using Phase = Reactor::DriverPhase;
+        const Phase phase = scheduler.workers_[worker_id]
+            ->reactor_->driver_phase_.load(
+                std::memory_order_acquire);
+        switch (phase) {
+            case Phase::kUnavailable: return 0;
+            case Phase::kSuspended: return 1;
+            case Phase::kQueued: return 2;
+            case Phase::kRunning: return 3;
+        }
+        return -1;
+    }
+
+    static bool request_driver(
+        Scheduler& scheduler, WorkerId worker_id,
+        std::int64_t requested_at) {
+        return scheduler.workers_[worker_id]
+            ->reactor_->request_driver_at(requested_at);
+    }
+
+    static bool queue_driver(
+        Scheduler& scheduler, WorkerId worker_id) {
+        return scheduler.workers_[worker_id]
+            ->reactor_->queue_driver();
+    }
+
+    static bool should_use_batch_monitor_policy(
+        int inherited_policy) {
+        return Scheduler::should_use_batch_monitor_policy(
+            inherited_policy);
     }
 };
 
@@ -769,6 +913,743 @@ void schedule_detached_to(
     if (!handle) return;
     handle.promise().detached = true;
     scheduler->schedule_to(handle, worker);
+}
+
+void* release_detached_frame(cio::Task<> task) {
+    auto handle = task.release();
+    CIO_CHECK(static_cast<bool>(handle));
+    if (!handle) return nullptr;
+    handle.promise().continuation_or_completion = nullptr;
+    handle.promise().detached = true;
+    return handle.address();
+}
+
+struct SuspendWithCooperativeIoDebt {
+    cio::detail::Scheduler* scheduler = nullptr;
+    std::uint8_t debt = cio::detail::kCooperativeIoDebtNone;
+
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(
+        std::coroutine_handle<> handle) const noexcept {
+        cio::detail::Scheduler* const selected = scheduler;
+        const std::uint8_t selected_debt = debt;
+        selected->reschedule_self_for_cooperative_io(
+            handle, selected_debt);
+    }
+    void await_resume() const noexcept {}
+};
+
+cio::Task<> record_cooperative_order(
+    std::atomic<int>* sequence,
+    std::atomic<int>* observed) {
+    observed->store(
+        sequence->fetch_add(1, std::memory_order_acq_rel) + 1,
+        std::memory_order_release);
+    co_return;
+}
+
+cio::Task<bool> cooperative_no_demand_renews_inline(
+    cio::detail::Scheduler* scheduler) {
+    const cio::detail::WorkerId worker =
+        cio::detail::current_worker_id(scheduler);
+    cio::detail::SchedulerTestAccess::set_tick(
+        *scheduler, worker, 7);
+
+    const std::uint32_t before =
+        cio::detail::SchedulerTestAccess::tick(
+            *scheduler, worker);
+    cio::detail::t_cooperative_io_budget = 1;
+    co_await cio::detail::CooperativeIoCheckpoint{};
+    const bool first_inline =
+        cio::detail::SchedulerTestAccess::tick(
+            *scheduler, worker) == before &&
+        cio::detail::t_cooperative_io_budget ==
+            cio::detail::kCooperativeIoBudget + 1;
+
+    cio::detail::t_cooperative_io_budget = 1;
+    co_await cio::detail::CooperativeIoCheckpoint{};
+    const bool second_inline =
+        cio::detail::SchedulerTestAccess::tick(
+            *scheduler, worker) == before &&
+        cio::detail::t_cooperative_io_budget ==
+            cio::detail::kCooperativeIoBudget + 1;
+    co_return first_inline && second_inline;
+}
+
+void test_cooperative_io_no_demand_renews_inline() {
+    cio::RuntimeOptions options;
+    options.worker_threads = 1;
+    cio::Runtime runtime(options);
+    CIO_CHECK(runtime.block_on(
+        cooperative_no_demand_renews_inline(
+            &runtime.scheduler())));
+
+    // A checkpoint is inactive on a foreign thread even though the process
+    // default scheduler exists.
+    cio::detail::t_cooperative_io_budget = 0;
+    cio::detail::CooperativeIoCheckpoint foreign;
+    CIO_CHECK(foreign.await_ready());
+    CIO_CHECK_EQ(
+        cio::detail::t_cooperative_io_budget,
+        UINT64_MAX);
+}
+
+cio::Task<bool> cooperative_local_demand_grace_body(
+    cio::detail::Scheduler* scheduler) {
+    const cio::detail::WorkerId worker =
+        cio::detail::current_worker_id(scheduler);
+    auto& reactor = scheduler->reactor_for(worker);
+    (void)reactor.take_owner_poll_request_ns();
+    CIO_CHECK(reactor.request_owner_poll_at(cio::now_ns()));
+
+    std::atomic<int> sequence{0};
+    std::atomic<int> observer_order{0};
+    cio::go(record_cooperative_order(
+        &sequence, &observer_order));
+
+    cio::detail::SchedulerTestAccess::set_tick(
+        *scheduler, worker, 0);
+    const std::int64_t poll_before =
+        reactor.last_poll_ns();
+    cio::detail::t_cooperative_io_budget = 1;
+    co_await cio::detail::CooperativeIoCheckpoint{};
+    const bool first_inline =
+        observer_order.load(std::memory_order_acquire) == 0 &&
+        reactor.owner_poll_request_ns() != 0 &&
+        reactor.last_poll_ns() == poll_before &&
+        cio::detail::t_cooperative_io_budget ==
+            cio::detail::kCooperativeIoBudget + 1;
+
+    cio::detail::t_cooperative_io_budget = 1;
+    co_await cio::detail::CooperativeIoCheckpoint{};
+    const int current_order =
+        sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+    const bool result =
+        first_inline &&
+        observer_order.load(std::memory_order_acquire) == 1 &&
+        current_order == 2 &&
+        reactor.owner_poll_request_ns() != 0 &&
+        reactor.last_poll_ns() == poll_before;
+    (void)reactor.take_owner_poll_request_ns();
+    co_return result;
+}
+
+void test_cooperative_io_local_demand_gets_one_grace_budget() {
+    cio::RuntimeOptions options;
+    options.worker_threads = 1;
+    cio::Runtime runtime(options);
+    CIO_CHECK(runtime.block_on(
+        cooperative_local_demand_grace_body(
+            &runtime.scheduler())));
+}
+
+cio::Task<> hold_local_checkpoint_owner(
+    std::atomic<bool>* parent_resumed,
+    std::atomic<bool>* parent_escaped,
+    std::atomic<bool>* done) {
+    const auto deadline =
+        cio::Clock::now() + 1s;
+    while (!parent_resumed->load(
+               std::memory_order_acquire) &&
+           cio::Clock::now() < deadline) {
+        std::atomic_signal_fence(
+            std::memory_order_seq_cst);
+    }
+    parent_escaped->store(
+        parent_resumed->load(
+            std::memory_order_acquire),
+        std::memory_order_release);
+    done->store(true, std::memory_order_release);
+    co_return;
+}
+
+cio::Task<bool>
+cooperative_local_hog_parent_escape_body(
+    cio::detail::Scheduler* scheduler) {
+    const auto idle_deadline =
+        cio::Clock::now() + 1s;
+    while (!cio::detail::SchedulerTestAccess::
+                any_idle(*scheduler) &&
+           cio::Clock::now() < idle_deadline) {
+        co_await cio::yield();
+    }
+    if (!cio::detail::SchedulerTestAccess::
+             any_idle(*scheduler)) {
+        co_return false;
+    }
+
+    std::atomic<bool> parent_resumed{false};
+    std::atomic<bool> parent_escaped{false};
+    std::atomic<bool> hog_done{false};
+    const cio::detail::WorkerId before =
+        cio::detail::current_worker_id(
+            scheduler);
+
+    void* const hog = release_detached_frame(
+        hold_local_checkpoint_owner(
+            &parent_resumed, &parent_escaped,
+            &hog_done));
+    if (hog == nullptr) co_return false;
+    cio::detail::SchedulerTestAccess::
+        push_next_private(
+            *scheduler, before, hog);
+
+    // The first local-only boundary consumes the throughput grace. The second
+    // must publish this parent because the other worker is idle.
+    cio::detail::t_cooperative_io_budget = 1;
+    co_await cio::detail::CooperativeIoCheckpoint{};
+    cio::detail::t_cooperative_io_budget = 1;
+    co_await cio::detail::CooperativeIoCheckpoint{};
+
+    const cio::detail::WorkerId after =
+        cio::detail::current_worker_id(
+            scheduler);
+    parent_resumed.store(
+        true, std::memory_order_release);
+
+    const auto done_deadline =
+        cio::Clock::now() + 1s;
+    while (!hog_done.load(
+               std::memory_order_acquire) &&
+           cio::Clock::now() < done_deadline) {
+        co_await cio::yield();
+    }
+    co_return
+        hog_done.load(std::memory_order_acquire) &&
+        parent_escaped.load(
+            std::memory_order_acquire) &&
+        before != after;
+}
+
+void test_cooperative_io_local_hog_publishes_parent() {
+    cio::RuntimeOptions options;
+    options.worker_threads = 2;
+    cio::Runtime runtime(options);
+    CIO_CHECK(runtime.block_on(
+        cooperative_local_hog_parent_escape_body(
+            &runtime.scheduler())));
+}
+
+cio::Task<bool> cooperative_hard_debt_order_body(
+    cio::detail::Scheduler* scheduler) {
+    const cio::detail::WorkerId worker =
+        cio::detail::current_worker_id(scheduler);
+    std::atomic<int> sequence{0};
+    std::atomic<int> local_order{0};
+    std::atomic<int> inbox_order{0};
+    std::atomic<int> global_order{0};
+
+    void* const local = release_detached_frame(
+        record_cooperative_order(&sequence, &local_order));
+    void* const global = release_detached_frame(
+        record_cooperative_order(&sequence, &global_order));
+    void* const inbox = release_detached_frame(
+        record_cooperative_order(&sequence, &inbox_order));
+    if (local == nullptr || global == nullptr || inbox == nullptr) {
+        co_return false;
+    }
+
+    cio::detail::SchedulerTestAccess::stage_runnext(
+        *scheduler, worker, local);
+    cio::detail::SchedulerTestAccess::stage_global(
+        *scheduler, global);
+    cio::detail::SchedulerTestAccess::stage_inbox(
+        *scheduler, worker, inbox);
+    cio::detail::SchedulerTestAccess::set_tick(
+        *scheduler, worker, 0);
+
+    const std::uint8_t expected =
+        cio::detail::kCooperativeIoDebtLocal |
+        cio::detail::kCooperativeIoDebtInbox |
+        cio::detail::kCooperativeIoDebtGlobal;
+    const std::uint8_t debt =
+        scheduler->prepare_cooperative_io_checkpoint();
+    const bool exact_debt = debt == expected;
+
+    // OR the expected mask for failure cleanup: every detached marker must be
+    // drained before this coroutine's stack state goes out of scope.
+    co_await SuspendWithCooperativeIoDebt{
+        scheduler,
+        static_cast<std::uint8_t>(debt | expected)};
+    const int current_order =
+        sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+    co_return exact_debt &&
+              inbox_order.load(std::memory_order_acquire) == 1 &&
+              local_order.load(std::memory_order_acquire) == 2 &&
+              global_order.load(std::memory_order_acquire) == 3 &&
+              current_order == 4;
+}
+
+void test_cooperative_io_stages_hard_debt_before_self() {
+    cio::RuntimeOptions options;
+    options.worker_threads = 1;
+    cio::Runtime runtime(options);
+    CIO_CHECK(runtime.block_on(
+        cooperative_hard_debt_order_body(
+            &runtime.scheduler())));
+}
+
+cio::Task<> cooperative_nonlocal_hog(
+    std::atomic<bool>* started,
+    std::atomic<bool>* release,
+    std::atomic<bool>* finished) {
+    started->store(true, std::memory_order_release);
+    while (!release->load(std::memory_order_acquire)) {
+        cio::cpu_relax();
+    }
+    finished->store(true, std::memory_order_release);
+    co_return;
+}
+
+cio::Task<bool> cooperative_nonlocal_publication_body(
+    cio::detail::Scheduler* scheduler,
+    std::atomic<bool>* hog_started,
+    std::atomic<bool>* release_hog,
+    std::atomic<bool>* hog_finished,
+    std::atomic<bool>* continuation_resumed) {
+    co_await SwitchToSchedulerWorker{scheduler, 0};
+
+    void* const hog = release_detached_frame(
+        cooperative_nonlocal_hog(
+            hog_started, release_hog, hog_finished));
+    if (hog == nullptr) co_return false;
+    cio::detail::SchedulerTestAccess::stage_inbox(
+        *scheduler, 0, hog);
+    const std::uint8_t debt =
+        scheduler->prepare_cooperative_io_checkpoint();
+
+    co_await SuspendWithCooperativeIoDebt{
+        scheduler,
+        static_cast<std::uint8_t>(
+            debt | cio::detail::kCooperativeIoDebtInbox)};
+    const cio::detail::WorkerId resumed_on =
+        cio::detail::current_worker_id(scheduler);
+    continuation_resumed->store(
+        true, std::memory_order_release);
+    release_hog->store(true, std::memory_order_release);
+
+    while (!hog_finished->load(std::memory_order_acquire)) {
+        co_await cio::yield();
+    }
+    co_return
+        (debt & cio::detail::kCooperativeIoDebtInbox) != 0 &&
+        resumed_on == 1;
+}
+
+void test_cooperative_io_nonlocal_stage_publishes_self() {
+    cio::RuntimeOptions options;
+    options.worker_threads = 2;
+    cio::Runtime runtime(options);
+
+    std::atomic<bool> hog_started{false};
+    std::atomic<bool> release_hog{false};
+    std::atomic<bool> hog_finished{false};
+    std::atomic<bool> continuation_resumed{false};
+    std::atomic<bool> watchdog_fired{false};
+    std::thread watchdog([&] {
+        const auto start_deadline =
+            cio::Clock::now() + 1s;
+        while (!hog_started.load(std::memory_order_acquire) &&
+               cio::Clock::now() < start_deadline) {
+            std::this_thread::yield();
+        }
+        const auto escape_deadline =
+            cio::Clock::now() + 250ms;
+        while (!continuation_resumed.load(
+                   std::memory_order_acquire) &&
+               cio::Clock::now() < escape_deadline) {
+            std::this_thread::yield();
+        }
+        if (!continuation_resumed.load(
+                std::memory_order_acquire)) {
+            watchdog_fired.store(
+                true, std::memory_order_release);
+            release_hog.store(true, std::memory_order_release);
+        }
+    });
+
+    const bool escaped = runtime.block_on(
+        cooperative_nonlocal_publication_body(
+            &runtime.scheduler(), &hog_started, &release_hog,
+            &hog_finished, &continuation_resumed));
+    release_hog.store(true, std::memory_order_release);
+    watchdog.join();
+
+    CIO_CHECK(escaped);
+    CIO_CHECK(!watchdog_fired.load(std::memory_order_acquire));
+    CIO_CHECK(hog_finished.load(std::memory_order_acquire));
+}
+
+struct CooperativeTicketResult {
+    std::atomic<bool> done{false};
+    std::atomic<bool> ok{false};
+};
+
+cio::Task<> cooperative_empty_ticket_controller(
+    cio::detail::Scheduler* scheduler,
+    int fd,
+    CooperativeTicketResult* result) {
+    auto& reactor = scheduler->reactor_for(0);
+    auto attached = reactor.attach(fd);
+    if (!attached) {
+        result->done.store(true, std::memory_order_release);
+        co_return;
+    }
+
+    cio::detail::IoDesc* const desc = *attached;
+    (void)reactor.take_owner_poll_request_ns();
+    const bool requested =
+        reactor.request_owner_poll_at(cio::now_ns());
+    const std::uint32_t tick_before =
+        cio::detail::SchedulerTestAccess::tick(
+            *scheduler, 0);
+    const std::int64_t poll_before =
+        reactor.last_poll_ns();
+
+    cio::detail::t_cooperative_io_budget = 1;
+    co_await cio::detail::CooperativeIoCheckpoint{};
+
+    const bool ok =
+        requested &&
+        reactor.owner_poll_request_ns() == 0 &&
+        reactor.last_poll_ns() > poll_before &&
+        cio::detail::SchedulerTestAccess::tick(
+            *scheduler, 0) == tick_before &&
+        cio::detail::t_cooperative_io_budget ==
+            cio::detail::kCooperativeIoBudget + 1;
+    reactor.detach(desc);
+    result->ok.store(ok, std::memory_order_release);
+    result->done.store(true, std::memory_order_release);
+}
+
+void test_cooperative_io_empty_ticket_poll_renews_inline() {
+    int pipe_fds[2] = {-1, -1};
+    CIO_CHECK_EQ(
+        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    if (pipe_fds[0] < 0) return;
+
+    cio::detail::Scheduler scheduler(1, 1);
+    cio::detail::SchedulerTestAccess::
+        start_workers_without_monitor(scheduler);
+    CooperativeTicketResult result;
+    schedule_detached_to(
+        &scheduler,
+        cooperative_empty_ticket_controller(
+            &scheduler, pipe_fds[0], &result),
+        0);
+
+    const auto deadline = cio::Clock::now() + 1s;
+    while (!result.done.load(std::memory_order_acquire) &&
+           cio::Clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    CIO_CHECK(result.done.load(std::memory_order_acquire));
+    CIO_CHECK(result.ok.load(std::memory_order_acquire));
+    scheduler.shutdown();
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+}
+
+cio::Task<> cooperative_ticket_waiter(
+    cio::detail::IoDesc* desc,
+    std::atomic<int>* sequence,
+    std::atomic<int>* waiter_order,
+    std::atomic<bool>* done) {
+    const auto ready = co_await cio::detail::IoAwaiter{
+        desc, cio::detail::Dir::kRead,
+        desc->generation.load(std::memory_order_acquire)};
+    if (ready) {
+        waiter_order->store(
+            sequence->fetch_add(
+                1, std::memory_order_acq_rel) + 1,
+            std::memory_order_release);
+    }
+    done->store(true, std::memory_order_release);
+}
+
+cio::Task<> cooperative_productive_ticket_controller(
+    cio::detail::Scheduler* scheduler,
+    int read_fd,
+    int write_fd,
+    CooperativeTicketResult* result) {
+    auto& reactor = scheduler->reactor_for(0);
+    auto attached = reactor.attach(read_fd);
+    if (!attached) {
+        result->done.store(true, std::memory_order_release);
+        co_return;
+    }
+    cio::detail::IoDesc* const desc = *attached;
+    (void)reactor.take_owner_poll_request_ns();
+
+    std::atomic<int> sequence{0};
+    std::atomic<int> waiter_order{0};
+    std::atomic<bool> waiter_done{false};
+    schedule_detached_to(
+        scheduler,
+        cooperative_ticket_waiter(
+            desc, &sequence, &waiter_order, &waiter_done),
+        0);
+    co_await cio::yield();
+
+    const char byte = 'C';
+    const bool wrote =
+        ::write(write_fd, &byte, sizeof(byte)) ==
+        static_cast<ssize_t>(sizeof(byte));
+    const bool requested =
+        reactor.request_owner_poll_at(cio::now_ns());
+    cio::detail::t_cooperative_io_budget = 1;
+    co_await cio::detail::CooperativeIoCheckpoint{};
+    const int controller_order =
+        sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+    const bool ok =
+        wrote && requested &&
+        waiter_done.load(std::memory_order_acquire) &&
+        waiter_order.load(std::memory_order_acquire) == 1 &&
+        controller_order == 2 &&
+        reactor.owner_poll_request_ns() == 0;
+    reactor.detach(desc);
+    result->ok.store(ok, std::memory_order_release);
+    result->done.store(true, std::memory_order_release);
+}
+
+void test_cooperative_io_productive_ticket_yields() {
+    int pipe_fds[2] = {-1, -1};
+    CIO_CHECK_EQ(
+        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    if (pipe_fds[0] < 0) return;
+
+    cio::detail::Scheduler scheduler(1, 1);
+    cio::detail::SchedulerTestAccess::
+        start_workers_without_monitor(scheduler);
+    CooperativeTicketResult result;
+    schedule_detached_to(
+        &scheduler,
+        cooperative_productive_ticket_controller(
+            &scheduler, pipe_fds[0], pipe_fds[1], &result),
+        0);
+
+    const auto deadline = cio::Clock::now() + 1s;
+    while (!result.done.load(std::memory_order_acquire) &&
+           cio::Clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    CIO_CHECK(result.done.load(std::memory_order_acquire));
+    CIO_CHECK(result.ok.load(std::memory_order_acquire));
+    scheduler.shutdown();
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+}
+
+cio::Task<bool> cooperative_budget_reset_body() {
+    cio::detail::t_cooperative_io_budget = 7;
+    co_await cio::yield();
+    co_return
+        cio::detail::t_cooperative_io_budget ==
+        cio::detail::kCooperativeIoBudget + 1;
+}
+
+void test_cooperative_io_top_level_resume_resets_budget() {
+    cio::RuntimeOptions options;
+    options.worker_threads = 1;
+    CIO_CHECK(cio::run(
+        cooperative_budget_reset_body(), options));
+}
+
+cio::Task<> await_driver_polled_pipe(
+    cio::detail::Scheduler* scheduler,
+    cio::detail::IoDesc* desc,
+    std::atomic<bool>* done,
+    std::atomic<bool>* result_ok,
+    std::atomic<cio::detail::WorkerId>* resumed_on) {
+    co_await SwitchToSchedulerWorker{scheduler, 0};
+    const auto ready = co_await cio::detail::IoAwaiter{
+        desc, cio::detail::Dir::kRead,
+        desc->generation.load(std::memory_order_acquire)};
+    resumed_on->store(
+        cio::detail::current_worker_id(scheduler),
+        std::memory_order_release);
+    result_ok->store(
+        ready.has_value(), std::memory_order_release);
+    done->store(true, std::memory_order_release);
+}
+
+cio::Task<> run_queued_driver_from_worker_one(
+    cio::detail::Scheduler* scheduler,
+    std::atomic<bool>* started,
+    std::atomic<bool>* run,
+    void* expected_waiter,
+    std::atomic<bool>* resumed_driver,
+    std::atomic<bool>* completion_was_local) {
+    co_await SwitchToSchedulerWorker{scheduler, 1};
+    started->store(true, std::memory_order_release);
+    while (!run->load(std::memory_order_acquire)) {
+        cio::cpu_relax();
+    }
+
+    void* const frame =
+        cio::detail::SchedulerTestAccess::pop_global(*scheduler);
+    if (frame != nullptr) {
+        std::coroutine_handle<>::from_address(frame).resume();
+        resumed_driver->store(true, std::memory_order_release);
+        completion_was_local->store(
+            cio::detail::SchedulerTestAccess::runnext(
+                *scheduler, 1) == expected_waiter &&
+                cio::detail::SchedulerTestAccess::global_empty(
+                    *scheduler),
+            std::memory_order_release);
+    }
+}
+
+void test_worker_driver_polls_and_places_completion_locally() {
+    cio::detail::Scheduler scheduler(2, 1);
+    auto& reactor = scheduler.reactor_for(0);
+    int pipe_fds[2] = {-1, -1};
+    CIO_CHECK_EQ(
+        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    if (pipe_fds[0] < 0) return;
+
+    auto attached = reactor.attach(pipe_fds[0]);
+    CIO_CHECK(attached.has_value());
+    if (!attached) {
+        ::close(pipe_fds[0]);
+        ::close(pipe_fds[1]);
+        return;
+    }
+
+    cio::detail::SchedulerTestAccess::
+        start_workers_without_monitor(scheduler);
+
+    std::atomic<bool> waiter_done{false};
+    std::atomic<bool> waiter_ok{false};
+    std::atomic<cio::detail::WorkerId> resumed_on{
+        cio::detail::kInvalidWorkerId};
+    schedule_detached_to(
+        &scheduler,
+        await_driver_polled_pipe(
+            &scheduler, *attached, &waiter_done,
+            &waiter_ok, &resumed_on),
+        0);
+
+    const auto setup_deadline = cio::Clock::now() + 2s;
+    const auto waiter_parked = [&] {
+        void* const slot =
+            (*attached)->slot[
+                static_cast<unsigned>(cio::detail::Dir::kRead)]
+                .load(std::memory_order_acquire);
+        return slot != nullptr && slot != cio::detail::kIoReady;
+    };
+    while (!waiter_parked() &&
+           cio::Clock::now() < setup_deadline) {
+        std::this_thread::yield();
+    }
+    CIO_CHECK(waiter_parked());
+    void* expected_waiter = nullptr;
+    if (waiter_parked()) {
+        void* const slot =
+            (*attached)->slot[
+                static_cast<unsigned>(cio::detail::Dir::kRead)]
+                .load(std::memory_order_acquire);
+        expected_waiter =
+            static_cast<cio::detail::IoWait*>(slot)
+                ->handle.address();
+    }
+    CIO_CHECK(expected_waiter != nullptr);
+
+    std::atomic<bool> hog_started{false};
+    std::atomic<bool> release_hog{false};
+    std::atomic<bool> hog_finished{false};
+    schedule_detached_to(
+        &scheduler,
+        io_completion_cpu_hog(
+            &hog_started, &release_hog, &hog_finished),
+        0);
+    while (!hog_started.load(std::memory_order_acquire) &&
+           cio::Clock::now() < setup_deadline) {
+        std::this_thread::yield();
+    }
+    CIO_CHECK(hog_started.load(std::memory_order_acquire));
+
+    std::atomic<bool> coordinator_started{false};
+    std::atomic<bool> run_driver{false};
+    std::atomic<bool> resumed_driver{false};
+    std::atomic<bool> completion_was_local{false};
+    schedule_detached_to(
+        &scheduler,
+        run_queued_driver_from_worker_one(
+            &scheduler, &coordinator_started,
+            &run_driver, expected_waiter,
+            &resumed_driver, &completion_was_local),
+        1);
+    while (!coordinator_started.load(std::memory_order_acquire) &&
+           cio::Clock::now() < setup_deadline) {
+        std::this_thread::yield();
+    }
+    CIO_CHECK(
+        coordinator_started.load(std::memory_order_acquire));
+
+    (void)reactor.take_owner_poll_request_ns();
+    const std::int64_t before_poll = reactor.last_poll_ns();
+    const char byte = 'd';
+    CIO_CHECK_EQ(::write(pipe_fds[1], &byte, 1), 1);
+    const std::int64_t stale_now =
+        before_poll + 1'000'000;
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, stale_now);
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, stale_now + 50'000);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_phase(
+            scheduler, 0),
+        2);
+
+    run_driver.store(true, std::memory_order_release);
+    const auto completion_deadline = cio::Clock::now() + 2s;
+    while (!waiter_done.load(std::memory_order_acquire) &&
+           cio::Clock::now() < completion_deadline) {
+        std::this_thread::yield();
+    }
+
+    const bool completed_before_backstop =
+        waiter_done.load(std::memory_order_acquire);
+    release_hog.store(true, std::memory_order_release);
+    while (!hog_finished.load(std::memory_order_acquire) &&
+           cio::Clock::now() < completion_deadline) {
+        std::this_thread::yield();
+    }
+
+    if (!waiter_done.load(std::memory_order_acquire)) {
+        reactor.detach(*attached);
+        const auto close_deadline = cio::Clock::now() + 1s;
+        while (!waiter_done.load(std::memory_order_acquire) &&
+               cio::Clock::now() < close_deadline) {
+            std::this_thread::yield();
+        }
+    } else {
+        reactor.detach(*attached);
+    }
+    scheduler.shutdown();
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+
+    CIO_CHECK(completed_before_backstop);
+    CIO_CHECK(resumed_driver.load(std::memory_order_acquire));
+    CIO_CHECK(
+        completion_was_local.load(std::memory_order_acquire));
+    CIO_CHECK(waiter_ok.load(std::memory_order_acquire));
+    CIO_CHECK_EQ(
+        resumed_on.load(std::memory_order_acquire),
+        cio::detail::WorkerId{1});
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_attempted_epoch(
+            scheduler, 0),
+        1u);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(
+            scheduler, 0),
+        1u);
 }
 
 cio::Task<> mark_foreign_submission_ran(
@@ -1516,6 +2397,597 @@ void test_global_fairness_publishes_bypassed_local_work() {
          stolen[1] == &runnext_frame));
 }
 
+void test_attach_arms_owner_poll_ticket() {
+    cio::detail::Scheduler scheduler(1, 1);
+    auto& reactor = scheduler.reactor_for(0);
+    int pipe_fds[2] = {-1, -1};
+    CIO_CHECK_EQ(
+        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    if (pipe_fds[0] < 0) return;
+
+    CIO_CHECK_EQ(reactor.take_owner_poll_request_ns(), 0);
+    auto attached = reactor.attach(pipe_fds[0]);
+    CIO_CHECK(attached.has_value());
+    if (attached) {
+        CIO_CHECK(reactor.take_owner_poll_request_ns() > 0);
+        CIO_CHECK_EQ(reactor.take_owner_poll_request_ns(), 0);
+        reactor.detach(*attached);
+    }
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+}
+
+void test_owner_poll_ticket_runs_at_fairness_checkpoint() {
+    cio::detail::Scheduler scheduler(1, 1);
+    auto& reactor = scheduler.reactor_for(0);
+    int pipe_fds[2] = {-1, -1};
+    CIO_CHECK_EQ(
+        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    if (pipe_fds[0] < 0) return;
+
+    auto attached = reactor.attach(pipe_fds[0]);
+    CIO_CHECK(attached.has_value());
+    if (!attached) {
+        ::close(pipe_fds[0]);
+        ::close(pipe_fds[1]);
+        return;
+    }
+
+    const std::int64_t before_poll = reactor.last_poll_ns();
+    while (cio::now_ns() <= before_poll) {
+        std::this_thread::yield();
+    }
+
+    int runnext_frame = 1;
+    cio::detail::SchedulerTestAccess::stage_runnext(
+        scheduler, 0, &runnext_frame);
+    cio::detail::SchedulerTestAccess::set_tick(
+        scheduler, 0, 31);
+    CIO_CHECK(
+        cio::detail::SchedulerTestAccess::select_round(
+            scheduler, 0) == &runnext_frame);
+    CIO_CHECK(reactor.last_poll_ns() > before_poll);
+    CIO_CHECK_EQ(reactor.take_owner_poll_request_ns(), 0);
+
+    reactor.detach(*attached);
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+}
+
+void test_owner_checkpoint_polls_without_ticket() {
+    cio::detail::Scheduler scheduler(1, 1);
+    auto& reactor = scheduler.reactor_for(0);
+    int pipe_fds[2] = {-1, -1};
+    CIO_CHECK_EQ(
+        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    if (pipe_fds[0] < 0) return;
+
+    auto attached = reactor.attach(pipe_fds[0]);
+    CIO_CHECK(attached.has_value());
+    if (!attached) {
+        ::close(pipe_fds[0]);
+        ::close(pipe_fds[1]);
+        return;
+    }
+
+    CIO_CHECK(reactor.take_owner_poll_request());
+    const std::int64_t before_poll = reactor.last_poll_ns();
+    while (cio::now_ns() <= before_poll) {
+        std::this_thread::yield();
+    }
+
+    int runnext_frame = 1;
+    cio::detail::SchedulerTestAccess::stage_runnext(
+        scheduler, 0, &runnext_frame);
+    cio::detail::SchedulerTestAccess::set_tick(
+        scheduler, 0, 31);
+    CIO_CHECK(
+        cio::detail::SchedulerTestAccess::select_round(
+            scheduler, 0) == &runnext_frame);
+    CIO_CHECK(reactor.last_poll_ns() > before_poll);
+    CIO_CHECK_EQ(reactor.owner_poll_request_ns(), 0);
+
+    reactor.detach(*attached);
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+}
+
+void test_stale_monitor_arms_owner_before_foreign_poll() {
+    cio::detail::Scheduler scheduler(1, 1);
+    auto& reactor = scheduler.reactor_for(0);
+    int pipe_fds[2] = {-1, -1};
+    CIO_CHECK_EQ(
+        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    if (pipe_fds[0] < 0) return;
+
+    auto attached = reactor.attach(pipe_fds[0]);
+    CIO_CHECK(attached.has_value());
+    if (!attached) {
+        ::close(pipe_fds[0]);
+        ::close(pipe_fds[1]);
+        return;
+    }
+    (void)reactor.take_owner_poll_request_ns();
+
+    const char byte = 'm';
+    CIO_CHECK_EQ(::write(pipe_fds[1], &byte, 1), 1);
+    const std::int64_t before_poll = reactor.last_poll_ns();
+    const std::int64_t stale_now =
+        before_poll + 1'000'000;
+
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, stale_now);
+    CIO_CHECK(reactor.owner_poll_request_ns() != 0);
+    CIO_CHECK_EQ(reactor.last_poll_ns(), before_poll);
+
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, stale_now + 100'000);
+    CIO_CHECK(reactor.last_poll_ns() > before_poll);
+    CIO_CHECK(reactor.owner_poll_request_ns() != 0);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_requested_epoch(
+            scheduler, 0),
+        0u);
+    CIO_CHECK(
+        cio::detail::SchedulerTestAccess::global_empty(
+            scheduler));
+
+    reactor.detach(*attached);
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+}
+
+void test_stale_monitor_queues_one_reusable_worker_driver() {
+    cio::detail::Scheduler scheduler(2, 1);
+    auto& reactor = scheduler.reactor_for(0);
+    int pipe_fds[2] = {-1, -1};
+    CIO_CHECK_EQ(
+        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    if (pipe_fds[0] < 0) return;
+
+    auto attached = reactor.attach(pipe_fds[0]);
+    CIO_CHECK(attached.has_value());
+    if (!attached) {
+        ::close(pipe_fds[0]);
+        ::close(pipe_fds[1]);
+        return;
+    }
+    (void)reactor.take_owner_poll_request_ns();
+
+    const std::int64_t before_poll = reactor.last_poll_ns();
+    const std::int64_t stale_now =
+        before_poll + 1'000'000;
+
+    // The first stale pass gives the shard owner its existing bounded ticket.
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, stale_now);
+    CIO_CHECK(reactor.owner_poll_request_ns() != 0);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_requested_epoch(
+            scheduler, 0),
+        0u);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_phase(
+            scheduler, 0),
+        1);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::pop_global(scheduler),
+        nullptr);
+
+    // The second pass queues one stable control frame globally. Repeated
+    // monitor passes before it runs coalesce onto that same generation.
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, stale_now + 50'000);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_requested_epoch(
+            scheduler, 0),
+        1u);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_requested_at(
+            scheduler, 0),
+        stale_now + 50'000);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_phase(
+            scheduler, 0),
+        2);
+
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, stale_now + 100'000);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_requested_epoch(
+            scheduler, 0),
+        1u);
+
+    void* const first_driver =
+        cio::detail::SchedulerTestAccess::pop_global(scheduler);
+    CIO_CHECK(first_driver != nullptr);
+    if (first_driver != nullptr) {
+        std::coroutine_handle<>::from_address(first_driver).resume();
+    }
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_phase(
+            scheduler, 0),
+        1);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_attempted_epoch(
+            scheduler, 0),
+        1u);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(
+            scheduler, 0),
+        1u);
+    CIO_CHECK(reactor.last_poll_ns() > before_poll);
+
+    // A later stale generation reuses the exact same suspended frame.
+    const std::int64_t later_stale =
+        reactor.last_poll_ns() + 1'000'000;
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, later_stale);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_requested_epoch(
+            scheduler, 0),
+        2u);
+    void* const second_driver =
+        cio::detail::SchedulerTestAccess::pop_global(scheduler);
+    CIO_CHECK_EQ(second_driver, first_driver);
+    if (second_driver != nullptr) {
+        std::coroutine_handle<>::from_address(second_driver).resume();
+    }
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_attempted_epoch(
+            scheduler, 0),
+        2u);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(
+            scheduler, 0),
+        2u);
+
+    reactor.detach(*attached);
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+}
+
+void test_worker_driver_has_absolute_direct_backstop() {
+    cio::detail::Scheduler scheduler(2, 1);
+    auto& reactor = scheduler.reactor_for(0);
+    int pipe_fds[2] = {-1, -1};
+    CIO_CHECK_EQ(
+        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    if (pipe_fds[0] < 0) return;
+
+    auto attached = reactor.attach(pipe_fds[0]);
+    CIO_CHECK(attached.has_value());
+    if (!attached) {
+        ::close(pipe_fds[0]);
+        ::close(pipe_fds[1]);
+        return;
+    }
+    (void)reactor.take_owner_poll_request_ns();
+
+    const std::int64_t before_poll = reactor.last_poll_ns();
+    const std::int64_t stale_now =
+        before_poll + 1'000'000;
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, stale_now);
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, stale_now + 50'000);
+
+    const std::int64_t requested_at =
+        cio::detail::SchedulerTestAccess::driver_requested_at(
+            scheduler, 0);
+    CIO_CHECK(requested_at != 0);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_phase(
+            scheduler, 0),
+        2);
+
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, requested_at + 199'999);
+    CIO_CHECK_EQ(reactor.last_poll_ns(), before_poll);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(
+            scheduler, 0),
+        0u);
+
+    // A queued control frame cannot postpone liveness indefinitely. At the
+    // absolute grace deadline, the monitor competes for polling_ directly.
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, requested_at + 200'000);
+    CIO_CHECK(reactor.last_poll_ns() > before_poll);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(
+            scheduler, 0),
+        1u);
+    const std::int64_t after_backstop = reactor.last_poll_ns();
+
+    // The already-queued frame remains safe: it observes coverage, performs a
+    // no-op, and returns to its reusable suspended state.
+    void* const late_driver =
+        cio::detail::SchedulerTestAccess::pop_global(scheduler);
+    CIO_CHECK(late_driver != nullptr);
+    if (late_driver != nullptr) {
+        std::coroutine_handle<>::from_address(late_driver).resume();
+    }
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_phase(
+            scheduler, 0),
+        1);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_attempted_epoch(
+            scheduler, 0),
+        1u);
+    CIO_CHECK_EQ(reactor.last_poll_ns(), after_backstop);
+
+    reactor.detach(*attached);
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+}
+
+void test_late_worker_driver_adopts_newer_generation() {
+    cio::detail::Scheduler scheduler(2, 1);
+    auto& reactor = scheduler.reactor_for(0);
+    int pipe_fds[2] = {-1, -1};
+    CIO_CHECK_EQ(
+        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    if (pipe_fds[0] < 0) return;
+
+    auto attached = reactor.attach(pipe_fds[0]);
+    CIO_CHECK(attached.has_value());
+    if (!attached) {
+        ::close(pipe_fds[0]);
+        ::close(pipe_fds[1]);
+        return;
+    }
+    (void)reactor.take_owner_poll_request_ns();
+
+    const std::int64_t stale_now =
+        reactor.last_poll_ns() + 1'000'000;
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, stale_now);
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, stale_now + 50'000);
+    const std::int64_t first_requested_at =
+        cio::detail::SchedulerTestAccess::driver_requested_at(
+            scheduler, 0);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_phase(
+            scheduler, 0),
+        2);
+
+    // Cover generation 1 through the hard backstop, but leave its one carrier
+    // in global_. A later stale episode may advance the generation while that
+    // same stable frame is still queued.
+    cio::detail::SchedulerTestAccess::monitor_pass(
+        scheduler, first_requested_at + 200'000);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(
+            scheduler, 0),
+        1u);
+    const bool requested_second =
+        cio::detail::SchedulerTestAccess::request_driver(
+            scheduler, 0, reactor.last_poll_ns() + 1);
+    CIO_CHECK(requested_second);
+    CIO_CHECK(
+        !cio::detail::SchedulerTestAccess::queue_driver(
+            scheduler, 0));
+
+    void* const only_driver =
+        cio::detail::SchedulerTestAccess::pop_global(scheduler);
+    CIO_CHECK(only_driver != nullptr);
+    CIO_CHECK(
+        cio::detail::SchedulerTestAccess::global_empty(
+            scheduler));
+    if (only_driver != nullptr) {
+        std::coroutine_handle<>::from_address(
+            only_driver).resume();
+    }
+
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_phase(
+            scheduler, 0),
+        1);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_requested_epoch(
+            scheduler, 0),
+        2u);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_attempted_epoch(
+            scheduler, 0),
+        2u);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(
+            scheduler, 0),
+        2u);
+
+    reactor.detach(*attached);
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+}
+
+void test_queued_worker_driver_is_owned_through_shutdown() {
+    cio::detail::Scheduler scheduler(2, 1);
+    auto& reactor = scheduler.reactor_for(0);
+    int pipe_fds[2] = {-1, -1};
+    CIO_CHECK_EQ(
+        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    if (pipe_fds[0] < 0) return;
+
+    auto attached = reactor.attach(pipe_fds[0]);
+    CIO_CHECK(attached.has_value());
+    if (attached) {
+        (void)reactor.take_owner_poll_request_ns();
+        const std::int64_t stale_now =
+            reactor.last_poll_ns() + 1'000'000;
+        cio::detail::SchedulerTestAccess::monitor_pass(
+            scheduler, stale_now);
+        cio::detail::SchedulerTestAccess::monitor_pass(
+            scheduler, stale_now + 50'000);
+        CIO_CHECK_EQ(
+            cio::detail::SchedulerTestAccess::driver_phase(
+                scheduler, 0),
+            2);
+        CIO_CHECK(
+            !cio::detail::SchedulerTestAccess::global_empty(
+                scheduler));
+        // Deliberately leave the frame in global_. Reactor owns it and destroys
+        // it after the raw queue has lost all consumers during teardown.
+        reactor.detach(*attached);
+    }
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+}
+
+void test_reusable_worker_driver_rearm_race() {
+    constexpr std::uint64_t kIterations = 2'000;
+
+    cio::detail::Scheduler scheduler(2, 1);
+    cio::detail::SchedulerTestAccess::
+        start_workers_without_monitor(scheduler);
+    auto& reactor = scheduler.reactor_for(0);
+
+    // Keep shard 0's owner out of its blocking reactor poll. Every queued
+    // control frame is then consumed by worker 1, making rapid
+    // SUSPENDED->QUEUED rearm deterministic instead of depending on which idle
+    // worker happened to leave park first.
+    std::atomic<bool> hog_started{false};
+    std::atomic<bool> release_hog{false};
+    std::atomic<bool> hog_finished{false};
+    schedule_detached_to(
+        &scheduler,
+        io_completion_cpu_hog(
+            &hog_started, &release_hog, &hog_finished),
+        0);
+    const auto setup_deadline = cio::Clock::now() + 2s;
+    while (!hog_started.load(std::memory_order_acquire) &&
+           cio::Clock::now() < setup_deadline) {
+        std::this_thread::yield();
+    }
+    CIO_CHECK(hog_started.load(std::memory_order_acquire));
+
+    const std::int64_t requested_base =
+        reactor.last_poll_ns() + 60'000'000'000;
+    const auto deadline = cio::Clock::now() + 5s;
+
+    std::uint64_t completed = 0;
+    for (std::uint64_t i = 0; i < kIterations; ++i) {
+        const bool requested =
+            cio::detail::SchedulerTestAccess::request_driver(
+                scheduler, 0,
+                requested_base + static_cast<std::int64_t>(i));
+        bool queued = false;
+        while (requested && !queued &&
+               cio::Clock::now() < deadline) {
+            queued =
+                cio::detail::SchedulerTestAccess::queue_driver(
+                    scheduler, 0);
+            if (!queued) std::this_thread::yield();
+        }
+        if (!queued) break;
+
+        const std::uint64_t epoch = i + 1;
+        // Coverage is published inside run_driver_once(), before
+        // DriverSuspend publishes SUSPENDED. Start the next generation as soon
+        // as coverage appears so queue_driver's CAS races that final release
+        // instead of serializing every reuse after suspension.
+        while (cio::detail::SchedulerTestAccess::
+                   driver_covered_epoch(scheduler, 0) < epoch &&
+               cio::Clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        if (cio::detail::SchedulerTestAccess::
+                driver_covered_epoch(scheduler, 0) < epoch) {
+            break;
+        }
+        completed = epoch;
+    }
+
+    release_hog.store(true, std::memory_order_release);
+    const auto cleanup_deadline = cio::Clock::now() + 2s;
+    while (!hog_finished.load(std::memory_order_acquire) &&
+           cio::Clock::now() < cleanup_deadline) {
+        std::this_thread::yield();
+    }
+    scheduler.shutdown();
+    CIO_CHECK(hog_finished.load(std::memory_order_acquire));
+    CIO_CHECK_EQ(completed, kIterations);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_attempted_epoch(
+            scheduler, 0),
+        kIterations);
+    CIO_CHECK_EQ(
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(
+            scheduler, 0),
+        kIterations);
+}
+
+void test_monitor_batch_only_replaces_default_policy() {
+    CIO_CHECK(
+        cio::detail::SchedulerTestAccess::
+            should_use_batch_monitor_policy(SCHED_OTHER));
+    CIO_CHECK(
+        !cio::detail::SchedulerTestAccess::
+            should_use_batch_monitor_policy(SCHED_FIFO));
+    CIO_CHECK(
+        !cio::detail::SchedulerTestAccess::
+            should_use_batch_monitor_policy(SCHED_RR));
+#if defined(SCHED_BATCH)
+    CIO_CHECK(
+        !cio::detail::SchedulerTestAccess::
+            should_use_batch_monitor_policy(SCHED_BATCH));
+#endif
+#if defined(SCHED_IDLE)
+    CIO_CHECK(
+        !cio::detail::SchedulerTestAccess::
+            should_use_batch_monitor_policy(SCHED_IDLE));
+#endif
+}
+
+void test_owner_poll_ticket_timestamp_coalesces() {
+    cio::detail::Scheduler scheduler(1, 1);
+    auto& reactor = scheduler.reactor_for(0);
+
+    CIO_CHECK(reactor.request_owner_poll_at(100));
+    CIO_CHECK(!reactor.request_owner_poll_at(200));
+    CIO_CHECK_EQ(reactor.owner_poll_request_ns(), 100);
+    CIO_CHECK_EQ(reactor.take_owner_poll_request_ns(), 100);
+    CIO_CHECK_EQ(reactor.take_owner_poll_request_ns(), 0);
+}
+
+void test_reactor_poll_does_not_consume_owner_ticket() {
+    cio::detail::Scheduler scheduler(1, 1);
+    auto& reactor = scheduler.reactor_for(0);
+
+    CIO_CHECK(reactor.request_owner_poll_at(100));
+    CIO_CHECK_EQ(reactor.poll(0), 0);
+    CIO_CHECK_EQ(reactor.take_owner_poll_request_ns(), 100);
+}
+
+void test_completed_poll_refreshes_last_poll_after_wait() {
+    cio::detail::Scheduler scheduler(1, 1);
+    auto& reactor = scheduler.reactor_for(0);
+    std::atomic<int> poll_result{-2};
+    std::thread poller([&] {
+        poll_result.store(
+            reactor.poll(cio::to_ns(1s)),
+            std::memory_order_release);
+    });
+
+    const auto polling_deadline = cio::Clock::now() + 1s;
+    while (!reactor.polling() &&
+           cio::Clock::now() < polling_deadline) {
+        std::this_thread::yield();
+    }
+    CIO_CHECK(reactor.polling());
+    std::this_thread::sleep_for(1ms);
+    const std::int64_t wake_ns = cio::now_ns();
+    reactor.wake();
+    poller.join();
+
+    CIO_CHECK(
+        poll_result.load(std::memory_order_acquire) >= 0);
+    CIO_CHECK(reactor.last_poll_ns() >= wake_ns);
+}
+
 void test_foreign_timer_batch_uses_shared_fallback() {
     // run_expired() is also called by the foreign monitor thread. Its target
     // worker is only a soft affinity hint: an owner-only inbox would strand
@@ -2108,6 +3580,7 @@ int main() {
     RUN_TEST(test_runnext_handoff_does_not_starve_remote_inbox);
     RUN_TEST(test_foreign_poller_preserves_directed_wake_for_owner);
     RUN_TEST(test_same_runtime_io_completion_follows_active_poller);
+    RUN_TEST(test_worker_driver_polls_and_places_completion_locally);
     RUN_TEST(test_foreign_submission_escapes_arbitrary_busy_worker);
     RUN_TEST(test_blocking_queue_rejects_overload);
     RUN_TEST(test_blocking_pool_rejects_failed_first_thread_launch);
@@ -2116,11 +3589,32 @@ int main() {
     RUN_TEST(test_cross_runtime_join_completion_escapes_busy_preference);
     RUN_TEST(test_foreign_wait_group_wake_escapes_busy_preference);
     RUN_TEST(test_foreign_channel_close_escapes_busy_preference);
+    RUN_TEST(test_cooperative_io_no_demand_renews_inline);
+    RUN_TEST(test_cooperative_io_local_demand_gets_one_grace_budget);
+    RUN_TEST(test_cooperative_io_local_hog_publishes_parent);
+    RUN_TEST(test_cooperative_io_stages_hard_debt_before_self);
+    RUN_TEST(test_cooperative_io_nonlocal_stage_publishes_self);
+    RUN_TEST(test_cooperative_io_empty_ticket_poll_renews_inline);
+    RUN_TEST(test_cooperative_io_productive_ticket_yields);
+    RUN_TEST(test_cooperative_io_top_level_resume_resets_budget);
     RUN_TEST(test_io_completion_behind_runnext_is_published);
     RUN_TEST(test_singleton_generic_batch_is_published);
     RUN_TEST(test_fairness_preselection_publishes_displaced_runnext);
     RUN_TEST(test_fairness_preselection_publishes_private_fifo);
     RUN_TEST(test_global_fairness_publishes_bypassed_local_work);
+    RUN_TEST(test_attach_arms_owner_poll_ticket);
+    RUN_TEST(test_owner_poll_ticket_runs_at_fairness_checkpoint);
+    RUN_TEST(test_owner_checkpoint_polls_without_ticket);
+    RUN_TEST(test_stale_monitor_arms_owner_before_foreign_poll);
+    RUN_TEST(test_stale_monitor_queues_one_reusable_worker_driver);
+    RUN_TEST(test_worker_driver_has_absolute_direct_backstop);
+    RUN_TEST(test_late_worker_driver_adopts_newer_generation);
+    RUN_TEST(test_queued_worker_driver_is_owned_through_shutdown);
+    RUN_TEST(test_reusable_worker_driver_rearm_race);
+    RUN_TEST(test_monitor_batch_only_replaces_default_policy);
+    RUN_TEST(test_owner_poll_ticket_timestamp_coalesces);
+    RUN_TEST(test_reactor_poll_does_not_consume_owner_ticket);
+    RUN_TEST(test_completed_poll_refreshes_last_poll_after_wait);
     RUN_TEST(test_foreign_timer_batch_uses_shared_fallback);
     RUN_TEST(test_foreign_direct_handoff_uses_shared_fallback);
     RUN_TEST(test_many_tasks_across_workers);

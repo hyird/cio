@@ -55,6 +55,9 @@ target_include_directories(cio PUBLIC
   $<INSTALL_INTERFACE:include>)
 target_compile_features(cio PUBLIC cxx_std_20)
 target_link_libraries(cio PUBLIC Threads::Threads)
+# Select the library-only hidden alias of the default-visible cooperative-I/O
+# TLS counter. Consumers keep the compiler's normal TLS model with libcio.so.
+target_compile_definitions(cio PRIVATE CIO_BUILDING_LIBRARY=1)
 target_compile_options(cio PRIVATE
   -Wall -Wextra -Wpedantic -Wshadow
   # GCC-only; clang reports it as an unknown warning once per TU.

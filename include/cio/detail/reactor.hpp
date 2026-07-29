@@ -38,6 +38,7 @@ namespace cio::detail {
 
 class Scheduler;
 class Reactor;
+struct SchedulerTestAccess;
 
 enum class Dir : unsigned { kRead = 0, kWrite = 1 };
 inline constexpr unsigned kDirCount = 2;
@@ -376,6 +377,30 @@ public:
     std::int64_t last_poll_ns() const noexcept {
         return last_poll_ns_.load(std::memory_order_relaxed);
     }
+    // Monitor-to-owner ticket latch. The monitor writes its already-sampled
+    // timestamp; the owner consumes the coalesced request at its bounded
+    // service checkpoint.
+    bool request_owner_poll_at(std::int64_t requested_ns) noexcept {
+        std::int64_t expected = 0;
+        return owner_poll_requested_ns_.compare_exchange_strong(
+            expected, requested_ns, std::memory_order_release,
+            std::memory_order_relaxed);
+    }
+    bool request_owner_poll() noexcept {
+        return request_owner_poll_at(now_ns());
+    }
+    std::int64_t take_owner_poll_request_ns() noexcept {
+        return owner_poll_requested_ns_.load(std::memory_order_acquire) == 0
+                   ? 0
+                   : owner_poll_requested_ns_.exchange(
+                         0, std::memory_order_acquire);
+    }
+    bool take_owner_poll_request() noexcept {
+        return take_owner_poll_request_ns() != 0;
+    }
+    std::int64_t owner_poll_request_ns() const noexcept {
+        return owner_poll_requested_ns_.load(std::memory_order_acquire);
+    }
     void nudge(std::int64_t deadline_ns) noexcept;
 
     // Wakes the task parked on (desc, dir), or records readiness if none.
@@ -389,11 +414,35 @@ public:
 
 private:
     friend class IoAwaiter;
+    friend class Scheduler;
+    friend struct SchedulerTestAccess;
 
     struct ReadyBatch {
         std::uint32_t total = 0;
         std::uint32_t unpublished_local_fifo = 0;
     };
+
+    // One scheduler-owned control frame per shard. The monitor may queue this
+    // frame globally when an owner poll ticket remains unserviced; whichever
+    // ordinary worker resumes it drives poll(0), so same-runtime completions
+    // retain the existing worker-local batch placement.
+    struct DriverCoroutine;
+    struct DriverSuspend;
+    enum class DriverPhase : std::uint8_t {
+        kUnavailable,
+        kSuspended,
+        kQueued,
+        kRunning,
+    };
+
+    void initialize_driver();
+    void destroy_driver() noexcept;
+    DriverCoroutine driver_loop();
+    void run_driver_once() noexcept;
+    void observe_driver_coverage() noexcept;
+    bool request_driver_at(std::int64_t requested_ns) noexcept;
+    bool queue_driver() noexcept;
+    void cover_driver_epoch(std::uint64_t epoch) noexcept;
 
     static std::coroutine_handle<> on_deadline(Timer* timer) noexcept;
 
@@ -422,10 +471,26 @@ private:
     int wake_write_fd_ = -1;
     std::atomic<bool> wake_pending_{false};
     CIO_CACHE_ALIGNED std::atomic<bool> polling_{false};
+    CIO_CACHE_ALIGNED std::atomic<std::int64_t>
+        owner_poll_requested_ns_{0};
     std::atomic<std::int64_t> last_poll_ns_{0};
     std::atomic<std::int64_t> poller_deadline_ns_{INT64_MAX};
 
-    std::atomic<IoDesc*> chunks_[kMaxChunks]{};
+    // Cold stale-reactor control state. requested_at is written before the
+    // release publication of requested_epoch; readers double-check the epoch
+    // when they need a coherent pair. covered/attempted are monotonic so a
+    // late control frame can never erase a newer request.
+    CIO_CACHE_ALIGNED std::coroutine_handle<> driver_handle_{};
+    std::atomic<DriverPhase> driver_phase_{
+        DriverPhase::kUnavailable};
+    std::atomic<std::uint64_t> driver_requested_epoch_{0};
+    std::atomic<std::uint64_t> driver_attempted_epoch_{0};
+    std::atomic<std::uint64_t> driver_covered_epoch_{0};
+    std::atomic<std::int64_t> driver_requested_at_ns_{0};
+
+    // Keep monitor-written driver generations away from the descriptor chunk
+    // pointers read for every delivered epoll event.
+    CIO_CACHE_ALIGNED std::atomic<IoDesc*> chunks_[kMaxChunks]{};
     std::atomic<std::uint32_t> chunk_count_{0};
     std::atomic<std::uint32_t> registered_{0};
     std::mutex slab_mutex_;

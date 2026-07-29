@@ -50,9 +50,45 @@ RuntimeMetrics runtime_metrics() noexcept {
     return out;
 }
 
+detail::CooperativeIoMetrics
+detail::cooperative_io_metrics() noexcept {
+    const Metrics& m = metrics();
+    CooperativeIoMetrics out;
+    out.exhaustions =
+        m.cooperative_io_exhaustions.load();
+    out.renew_no_demand =
+        m.cooperative_io_renew_no_demand.load();
+    out.deferred_local_only =
+        m.cooperative_io_deferred_local_only.load();
+    out.forced_yields =
+        m.cooperative_io_forced_yields.load();
+    out.yield_local_only =
+        m.cooperative_io_yield_local_only.load();
+    out.yield_inbox =
+        m.cooperative_io_yield_inbox.load();
+    out.yield_global =
+        m.cooperative_io_yield_global.load();
+    out.ticket_polls =
+        m.cooperative_io_ticket_polls.load();
+    out.ticket_polls_empty =
+        m.cooperative_io_ticket_polls_empty.load();
+    out.ticket_polls_productive =
+        m.cooperative_io_ticket_polls_productive.load();
+    out.timer_checks =
+        m.cooperative_io_timer_checks.load();
+    out.timer_productive =
+        m.cooperative_io_timer_productive.load();
+    return out;
+}
+
 #else
 
 RuntimeMetrics runtime_metrics() noexcept { return RuntimeMetrics{}; }
+
+detail::CooperativeIoMetrics
+detail::cooperative_io_metrics() noexcept {
+    return {};
+}
 
 #endif  // CIO_METRICS
 

@@ -18,6 +18,7 @@
 #include <type_traits>
 
 #include "cio/blocking.hpp"
+#include "cio/dns.hpp"
 #include "cio/detail/scheduler.hpp"
 #include "cio/select.hpp"
 #include "cio/spawn.hpp"
@@ -618,6 +619,14 @@ Task<std::invoke_result_t<Work&>> cancellable_blocking(Work work,
 
 Task<Result<std::vector<SocketAddr>>> Resolver::lookup_host(
     std::string host, std::uint16_t port, CancelToken cancel) const {
+    if (options_.prefer_builtin) {
+        dns::Config config;
+        config.ipv4 = options_.family != AddressFamily::ipv6;
+        config.ipv6 = options_.family != AddressFamily::ipv4;
+        co_return co_await dns::Resolver{std::move(config)}.lookup(
+            std::move(host), port, std::move(cancel));
+    }
+
     const int family = af_of(options_.family);
     co_return co_await cancellable_blocking(
         [host = std::move(host), port, family] {
@@ -1078,7 +1087,10 @@ Task<Result<TcpStream>> Dialer::dial_tcp(std::string host, std::uint16_t port,
     if (auto literal = SocketAddr::parse(host, port); literal) {
         targets.push_back(*literal);
     } else {
-        Resolver resolver{LookupOptions{options_.family}};
+        LookupOptions lookup;
+        lookup.family = options_.family;
+        lookup.prefer_builtin = options_.prefer_builtin_resolver;
+        Resolver resolver{lookup};
         auto addresses =
             co_await resolver.lookup_host(std::move(host), port, cancel);
         if (!addresses) co_return addresses.error();

@@ -74,6 +74,18 @@ enum class AddressFamily {
 
 struct LookupOptions {
     AddressFamily family = AddressFamily::any;
+    // Use cio's built-in DNS resolver instead of the system one, mirroring
+    // Go's Resolver.PreferGo.
+    //
+    // The built-in resolver speaks DNS over the runtime's own sockets and
+    // honours /etc/hosts: a lookup is cancellable mid-flight and occupies no
+    // blocking-pool thread. It does not consult NSS, so a machine resolving
+    // names through LDAP, NIS or mDNS needs the system resolver.
+    //
+    // Go defaults this on for Unix; cio defaults it off, because flipping the
+    // resolution backend under an existing program is not something a minor
+    // release should do silently.
+    bool prefer_builtin = false;
 };
 
 // Name resolution runs on the blocking pool: getaddrinfo has no async form, and
@@ -266,6 +278,9 @@ struct DialOptions {
     Duration fallback_delay{};
     bool nodelay = true;
     AddressFamily family = AddressFamily::any;
+    // Resolution backend for this dialer, mirroring Go's Dialer.Resolver.
+    // See LookupOptions::prefer_builtin.
+    bool prefer_builtin_resolver = false;
 };
 
 // Name resolution and address selection live here, not on TcpStream.

@@ -33,9 +33,21 @@ namespace cio {
 // The applied deadline never loosens an outer one: an inner scope asking for
 // longer than the enclosing budget keeps the enclosing budget, so a nested
 // timeout cannot silently extend its parent.
-// Templated rather than taking net::Socket&, because the per-direction
-// deadline setters live on the concrete types; this also lets it work on
-// PollableFd and on any future type with the same surface.
+// Templated rather than taking net::Socket&, because the deadline setters live
+// on the concrete types.
+//
+// Both shapes are supported, matching Go: TCPConn and UDPConn carry
+// SetDeadline plus SetReadDeadline and SetWriteDeadline, while TCPListener
+// carries only SetDeadline, because accept has one direction. A type with only
+// the combined setter is scoped as a single direction.
+template <typename S>
+concept HasDirectionalDeadlines = requires(S& s, TimePoint t) {
+    s.set_read_deadline(t);
+    s.set_write_deadline(t);
+    s.clear_read_deadline();
+    s.clear_write_deadline();
+};
+
 template <typename S>
 class [[nodiscard]] Timeout {
 public:
@@ -45,13 +57,21 @@ public:
     Timeout(S& socket, TimePoint deadline, bool read = true,
             bool write = true)
         : socket_(&socket), read_(read), write_(write) {
-        if (read_) {
+        if constexpr (HasDirectionalDeadlines<S>) {
+            if (read_) {
+                saved_read_ = socket.deadline(/*write_direction=*/false);
+                socket.set_read_deadline(tightest(saved_read_, deadline));
+            }
+            if (write_) {
+                saved_write_ = socket.deadline(/*write_direction=*/true);
+                socket.set_write_deadline(tightest(saved_write_, deadline));
+            }
+        } else {
+            // One direction only, so the read/write selectors do not apply.
+            read_ = true;
+            write_ = false;
             saved_read_ = socket.deadline(/*write_direction=*/false);
-            socket.set_read_deadline(tightest(saved_read_, deadline));
-        }
-        if (write_) {
-            saved_write_ = socket.deadline(/*write_direction=*/true);
-            socket.set_write_deadline(tightest(saved_write_, deadline));
+            socket.set_deadline(tightest(saved_read_, deadline));
         }
     }
 
@@ -90,18 +110,26 @@ private:
     void restore() {
         S* const socket = std::exchange(socket_, nullptr);
         if (socket == nullptr) return;
-        if (read_) {
-            if (saved_read_ == TimePoint{}) {
-                socket->clear_read_deadline();
-            } else {
-                socket->set_read_deadline(saved_read_);
+        if constexpr (HasDirectionalDeadlines<S>) {
+            if (read_) {
+                if (saved_read_ == TimePoint{}) {
+                    socket->clear_read_deadline();
+                } else {
+                    socket->set_read_deadline(saved_read_);
+                }
             }
-        }
-        if (write_) {
-            if (saved_write_ == TimePoint{}) {
-                socket->clear_write_deadline();
+            if (write_) {
+                if (saved_write_ == TimePoint{}) {
+                    socket->clear_write_deadline();
+                } else {
+                    socket->set_write_deadline(saved_write_);
+                }
+            }
+        } else {
+            if (saved_read_ == TimePoint{}) {
+                socket->clear_deadline();
             } else {
-                socket->set_write_deadline(saved_write_);
+                socket->set_deadline(saved_read_);
             }
         }
     }

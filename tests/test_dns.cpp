@@ -299,6 +299,64 @@ void test_lookup_is_cancellable_mid_flight() {
     CIO_CHECK(cio::run(body()));
 }
 
+// net::Resolver is the front door and selects its backend with a flag, the
+// shape Go uses. Both paths must answer the same question.
+void test_resolver_backend_selection() {
+    auto body = []() -> cio::Task<bool> {
+        // The system backend, which is the default.
+        net::Resolver system{};
+        auto via_system = co_await system.lookup_host("localhost", 80);
+        CIO_CHECK(via_system.has_value());
+        CIO_CHECK(!via_system->empty());
+
+        // The built-in backend resolves localhost from /etc/hosts without
+        // sending a query, so it works even with no reachable nameserver.
+        net::LookupOptions options;
+        options.prefer_builtin = true;
+        net::Resolver builtin{options};
+        auto via_builtin = co_await builtin.lookup_host("localhost", 80);
+        CIO_CHECK(via_builtin.has_value());
+        CIO_CHECK(!via_builtin->empty());
+
+        // A literal goes through either backend unchanged.
+        auto literal = co_await builtin.lookup_host("127.0.0.1", 8080);
+        CIO_CHECK(literal.has_value());
+        CIO_CHECK_EQ(literal->front().to_string(), std::string("127.0.0.1:8080"));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// /etc/hosts must be consulted before the wire, so the resolver agrees with
+// the rest of the machine.
+void test_hosts_file_precedes_the_network() {
+    auto body = []() -> cio::Task<bool> {
+        // Point at a black hole: any answer must have come from /etc/hosts.
+        auto sink = net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+        CIO_CHECK(sink.has_value());
+
+        dns::Config config;
+        config.servers = {sink->local_addr().value()};
+        config.timeout = 50ms;
+        config.attempts = 1;
+        dns::Resolver resolver{config};
+
+        auto localhost = co_await resolver.lookup("localhost", 80);
+        CIO_CHECK(localhost.has_value());
+        CIO_CHECK(!localhost->empty());
+
+        // With the hosts file disabled the same lookup must fail against the
+        // black hole, proving the answer above really came from the file.
+        dns::Config no_hosts = config;
+        no_hosts.use_hosts_file = false;
+        dns::Resolver strict{no_hosts};
+        auto without = co_await strict.lookup("localhost", 80);
+        CIO_CHECK(!without.has_value());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 void test_system_servers_parsing() {
     // Environment-dependent: only the shape is guaranteed.
     const auto servers = dns::system_servers();
@@ -318,6 +376,8 @@ int main() {
     RUN_TEST(test_lookup_against_a_stub_server);
     RUN_TEST(test_lookup_times_out_without_a_server);
     RUN_TEST(test_lookup_is_cancellable_mid_flight);
+    RUN_TEST(test_resolver_backend_selection);
+    RUN_TEST(test_hosts_file_precedes_the_network);
     RUN_TEST(test_system_servers_parsing);
     return cio_test::summary();
 }

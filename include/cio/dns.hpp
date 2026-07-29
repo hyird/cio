@@ -10,17 +10,23 @@
 //                  nsswitch.conf, mDNS and every other NSS module, which is
 //                  what most programs actually want. Costs a pool thread per
 //                  concurrent lookup and cannot be interrupted once started.
-//   dns::Resolver  DNS/UDP over the runtime's own sockets. Fully asynchronous,
-//                  cancellable mid-flight, and costs no pool thread. Sees only
-//                  DNS: no /etc/hosts, no NSS, no mDNS.
+//   dns::Resolver  DNS/UDP over the runtime's own sockets, plus /etc/hosts.
+//                  Fully asynchronous, cancellable mid-flight, and costs no
+//                  pool thread. Does not consult NSS, so no LDAP, NIS or mDNS.
 //
-// A program that resolves public names at high concurrency wants this one. A
-// program that must agree with `getent hosts` wants the other.
+// This is the same split Go makes, and for the same stated reason: a blocked
+// DNS query costs one task, while a blocked getaddrinfo() costs an OS thread.
+// Select between them with net::LookupOptions::prefer_builtin rather than by
+// naming this type directly.
+//
+// /etc/hosts is honoured, as Go's built-in resolver does. nsswitch.conf
+// ordering, NIS and mDNS are not.
 //
 // NOT IMPLEMENTED, deliberately: no cache (a cache needs an explicit TTL,
 // negative-caching and invalidation policy, and belongs in a wrapper), no
 // DNSSEC validation, no recursive resolution — this is a stub resolver that
-// talks to the configured recursive servers.
+// talks to the configured recursive servers. The resolv.conf search list and
+// ndots are also not implemented, so names are queried as given.
 #pragma once
 
 #include <chrono>
@@ -52,6 +58,10 @@ struct Config {
     // Which families to query. Both are queried concurrently when set.
     bool ipv4 = true;
     bool ipv6 = true;
+    // Consult /etc/hosts before querying, as Go's built-in resolver does.
+    // Turning this off makes lookups disagree with the rest of the machine for
+    // exactly the names an operator is most likely to have overridden.
+    bool use_hosts_file = true;
 };
 
 // Parses the nameserver lines of /etc/resolv.conf. Returns an empty vector

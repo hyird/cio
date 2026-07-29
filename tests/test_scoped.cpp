@@ -242,6 +242,39 @@ void test_timeout_scope_clears_when_none_was_set() {
     CIO_CHECK(cio::run(body()));
 }
 
+// A listener carries only a combined deadline, as Go's TCPListener does, so
+// Timeout must scope it through set_deadline() rather than per-direction
+// setters. This is a compile-time path as much as a runtime one.
+void test_timeout_scope_on_a_listener() {
+    auto body = []() -> cio::Task<bool> {
+        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        CIO_CHECK(listener.has_value());
+
+        const auto outer = cio::Clock::now() + 10s;
+        listener->set_deadline(outer);
+        {
+            cio::Timeout inner(*listener, 30ms);
+            auto timed_out = co_await listener->accept();
+            CIO_CHECK(!timed_out.has_value());
+            CIO_CHECK(timed_out.error().is(cio::Errc::timed_out));
+        }
+        CIO_CHECK(listener->deadline(/*write_direction=*/false) == outer);
+
+        // The restored deadline has not elapsed, so accept works again.
+        const auto addr = listener->local_addr().value();
+        auto connecting = cio::spawn([](net::SocketAddr target)
+                                         -> cio::Task<bool> {
+            auto conn = co_await net::TcpStream::connect(target);
+            co_return conn.has_value();
+        }(addr));
+        auto accepted = co_await listener->accept();
+        CIO_CHECK(accepted.has_value());
+        CIO_CHECK(co_await connecting);
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 // --------------------------------------------------------- PollableFd ---
 
 // The escape hatch: a descriptor the runtime did not create, driven by the
@@ -313,6 +346,7 @@ int main() {
     RUN_TEST(test_timeout_scope_restores_outer_deadline);
     RUN_TEST(test_timeout_scope_never_loosens);
     RUN_TEST(test_timeout_scope_clears_when_none_was_set);
+    RUN_TEST(test_timeout_scope_on_a_listener);
     RUN_TEST(test_pollable_fd_readiness);
     RUN_TEST(test_pollable_fd_deadline_and_cancel);
     return cio_test::summary();

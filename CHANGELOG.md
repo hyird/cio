@@ -53,11 +53,12 @@ API-additive: every 0.0.1 program still compiles unchanged.
   `cio::PollableFd`, which adopts a foreign non-blocking descriptor (eventfd,
   timerfd, inotify, a C library's fd) and exposes readiness, deadlines and
   cancellation over the worker-local reactor.
-- `cio/dns.hpp`: `cio::dns::Resolver`, a DNS/UDP resolver built on the runtime's
-  own sockets. Fully asynchronous, cancellable mid-flight, consumes no
-  blocking-pool thread, queries A and AAAA concurrently, reads
-  `/etc/resolv.conf`. Kept alongside `net::Resolver` rather than replacing it:
-  it sees only DNS, with no `/etc/hosts` or NSS.
+- `cio/dns.hpp`: a built-in DNS/UDP resolver on the runtime's own sockets.
+  Cancellable mid-flight, consumes no blocking-pool thread, queries A and AAAA
+  concurrently, reads `/etc/resolv.conf` and `/etc/hosts`. Selected through
+  `net::LookupOptions::prefer_builtin` and `DialOptions::prefer_builtin_resolver`,
+  mirroring Go's `Resolver.PreferGo` and `Dialer.Resolver`; the system backend
+  remains the default.
 
 ### Notes
 

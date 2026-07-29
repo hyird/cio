@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <strings.h>
 #include <fstream>
 #include <span>
 #include <string_view>
@@ -190,6 +191,60 @@ Result<Answer> parse_response(std::span<const std::byte> message,
 
 }  // namespace detail
 
+namespace {
+
+// Go's built-in resolver reads /etc/hosts before querying, and a resolver that
+// skipped it would answer differently from every other program on the machine
+// for exactly the names an operator is most likely to have overridden.
+//
+// Only the hosts file is honoured here; nsswitch.conf ordering, NIS and mDNS
+// are not, which is the documented boundary of this resolver.
+std::vector<net::SocketAddr> hosts_file_lookup(std::string_view name,
+                                               std::uint16_t port) {
+    std::vector<net::SocketAddr> found;
+    std::ifstream file("/etc/hosts");
+    if (!file) return found;
+
+    std::string line;
+    while (std::getline(file, line)) {
+        const std::size_t hash = line.find('#');
+        if (hash != std::string::npos) line.resize(hash);
+
+        std::size_t at = line.find_first_not_of(" \t");
+        if (at == std::string::npos) continue;
+        const std::size_t address_end = line.find_first_of(" \t", at);
+        if (address_end == std::string::npos) continue;
+        const std::string address = line.substr(at, address_end - at);
+
+        // Every remaining field is a name for that address.
+        bool matched = false;
+        std::size_t field = address_end;
+        for (;;) {
+            field = line.find_first_not_of(" \t", field);
+            if (field == std::string::npos) break;
+            const std::size_t end = line.find_first_of(" \t", field);
+            const std::size_t length =
+                end == std::string::npos ? line.size() - field : end - field;
+            // Host names are case-insensitive.
+            if (length == name.size() &&
+                ::strncasecmp(line.data() + field, name.data(), length) == 0) {
+                matched = true;
+                break;
+            }
+            if (end == std::string::npos) break;
+            field = end;
+        }
+        if (!matched) continue;
+
+        if (auto parsed = net::SocketAddr::parse(address, port); parsed) {
+            found.push_back(*parsed);
+        }
+    }
+    return found;
+}
+
+}  // namespace
+
 std::vector<net::SocketAddr> system_servers(std::uint16_t port) {
     std::vector<net::SocketAddr> servers;
     std::ifstream file("/etc/resolv.conf");
@@ -307,6 +362,15 @@ Task<Result<std::vector<net::SocketAddr>>> Resolver::lookup_type(
     if (auto literal = net::SocketAddr::parse(host, port); literal) {
         co_return std::vector<net::SocketAddr>{*literal};
     }
+    if (config_.use_hosts_file) {
+        const int want =
+            type == RecordType::aaaa ? AF_INET6 : AF_INET;
+        std::vector<net::SocketAddr> from_hosts;
+        for (auto& entry : hosts_file_lookup(host, port)) {
+            if (entry.family() == want) from_hosts.push_back(entry);
+        }
+        if (!from_hosts.empty()) co_return from_hosts;
+    }
     co_return co_await resolve_type(config_, std::move(host), port, type,
                                     std::move(cancel));
 }
@@ -315,6 +379,12 @@ Task<Result<std::vector<net::SocketAddr>>> Resolver::lookup(
     std::string host, std::uint16_t port, CancelToken cancel) const {
     if (auto literal = net::SocketAddr::parse(host, port); literal) {
         co_return std::vector<net::SocketAddr>{*literal};
+    }
+    // The hosts file wins over the network, as it does for every other
+    // resolver on the machine.
+    if (config_.use_hosts_file) {
+        auto from_hosts = hosts_file_lookup(host, port);
+        if (!from_hosts.empty()) co_return from_hosts;
     }
     if (!config_.ipv4 && !config_.ipv6) co_return Error{EINVAL};
     if (!config_.ipv6) {

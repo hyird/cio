@@ -118,7 +118,7 @@ Long coroutine soaks should not run under ASan or TSan; see
 | `cio::blocking(fn)` | Run blocking work outside scheduler workers |
 | `cio::net::TcpListener` / `TcpStream` / `UdpSocket` | Non-blocking sockets with deadlines |
 | `cio::net::Resolver` / `resolve()` | System name resolution on the blocking pool |
-| `cio::dns::Resolver` | DNS over the runtime's own sockets; no pool thread, cancellable |
+| `cio::dns::Resolver` | Built-in DNS backend; selected via `prefer_builtin` |
 | `cio::Timeout` | Scoped, nestable deadline that restores the enclosing one |
 | `cio::PollableFd` | Adopt a foreign fd (eventfd, timerfd, inotify, a C library) |
 | `cio::net::Dialer` / `dial_tcp()` | Resolution plus raced address selection and timeouts |
@@ -145,12 +145,20 @@ fires, including one already parked, which is woken. That is why `read()`,
 cancellation lives on the connection. `TcpStream::connect()` and the resolver
 and dialer entry points additionally accept a token directly.
 
-A cancelled `net::Resolver` lookup resumes the caller immediately while
-`getaddrinfo()` finishes in the background, because a system lookup in progress
-cannot be interrupted. `cio::dns::Resolver` has no such limitation: it speaks
-DNS over the runtime's own sockets, so a lookup is interrupted mid-flight and
-occupies no pool thread. It sees only DNS — no `/etc/hosts`, no NSS — so the
-two resolvers are kept side by side rather than one replacing the other.
+`net::Resolver` is the one entry point for name resolution and picks its
+backend with `LookupOptions::prefer_builtin`, mirroring Go's
+`Resolver.PreferGo`; `Dialer` selects the same way through
+`DialOptions::prefer_builtin_resolver`.
+
+The default backend calls `getaddrinfo()` on the blocking pool: it honours
+every NSS module, but occupies a pool thread and cannot be interrupted once
+started, so a cancelled lookup resumes its caller while the call finishes in
+the background. The built-in backend speaks DNS over the runtime's own sockets
+and reads `/etc/hosts`: a lookup is cancellable mid-flight and costs no pool
+thread, but it does not consult NSS, so LDAP, NIS and mDNS are invisible to it.
+Go makes the same split for the same reason, and defaults the other way; cio
+keeps the system backend as the default because a minor release should not
+silently change how names resolve.
 
 `cio::blocking(fn)` uses a lazily grown thread pool. `RuntimeOptions` bounds
 its worker count (`max_blocking_threads`, default 512), its FIFO wait queue
@@ -337,10 +345,11 @@ Name resolution:
 - `net::Resolver` uses the system resolver. A cancelled lookup resumes its
   caller immediately, but `getaddrinfo()` cannot be interrupted and runs to
   completion; its late result is discarded.
-- `dns::Resolver` speaks DNS itself and has neither limitation, but sees only
-  DNS: no `/etc/hosts`, no NSS modules, no mDNS. It also has no cache, no
-  DNSSEC validation, and no TCP fallback — a truncated answer with no usable
-  records is reported rather than retried over TCP.
+- The built-in backend reads `/etc/hosts` but not NSS, so LDAP, NIS and mDNS
+  are invisible to it. It also has no cache, no DNSSEC validation, no TCP
+  fallback — a truncated answer with no usable records is reported rather than
+  retried over TCP — and does not implement the `resolv.conf` search list or
+  `ndots`, so names are queried as given.
 
 Signals:
 

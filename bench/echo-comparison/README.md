@@ -2,33 +2,12 @@
 
 An 8-thread TCP echo server, the same workload against four implementations.
 
-> Except for the frozen A/B section immediately below, the recorded results and
-> architecture discussion are the pre-runtime-v2 baseline. Current cio uses
-> worker-local reactor shards and directed inboxes; see
-> [the runtime-v2 design](../../docs/scheduler-v2.md).
+> The analysis below was collected against the shared-reactor scheduler that
+> preceded worker-local shards. The workload comparison and methodology still
+> apply; the absolute cio numbers are a snapshot. Current scheduler results are
+> in [the benchmark record](../../docs/scheduler-results.md).
 
-## Runtime v2 frozen A/B
-
-The retained v2 server was measured against the exact pre-v2 server at 1024
-held-open connections and a 128-byte payload. Seven warmed, alternating A/B
-pairs pinned the server to CPUs 0-7 and the unchanged load generator to 8-23.
-
-| | pre-v2 A | retained v2 B |
-|---|---:|---:|
-| mean requests/second | 725,717 | 779,580 |
-| median p50 | 1351 us | 1121 us |
-| median p99 | 3072 us | 3968 us |
-| mean server CPU / 8 s window | 61.57 s | 63.10 s |
-
-Paired geometric throughput improved by **7.43%**; all seven pairs favoured B.
-The same frozen load-generator binary had SHA-256
-`3752a0f3cb67ef7da0fc7fc4ac62fb730c818ceebd43b16c814ca770310b9ba7`.
-Server hashes were
-`5e35c72fb962f7e0fe64d8a1807c3e5b78e6888093d24bae9be3370b7c5cbdb6`
-(A) and
-`3916905609c9807dead082bb83fddb109e034c8056304be0007fec1496405d7e`
-(B). Throughput and p50 improved at the cost of 2.48% more server CPU and a
-higher p99; neither trade-off is hidden from the result.
+## Run
 
 ```
 export GOROOT=/path/to/go          # optional; the Go server is skipped without it
@@ -40,7 +19,7 @@ cmake --build ../../build -j       # the comparison links against libcio.a
 
 | | architecture |
 |---|---|
-| **cio (measured snapshot)** | work-stealing M:N, one shared reactor, one task per connection |
+| **cio** | work-stealing M:N, worker-local epoll shards, one task per connection |
 | **asio-callback** | shared-nothing: one `io_context` + one `SO_REUSEPORT` acceptor per thread, callbacks |
 | **asio-coro** | the same shared-nothing server written with `asio::awaitable` |
 | **go** | goroutine per connection, `GOMAXPROCS=8` |

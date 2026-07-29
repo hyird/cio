@@ -1,11 +1,16 @@
 # I/O infrastructure
 
-Status: deferred until the runtime v2 refactor is stable. Nothing in this
-document is part of the current implementation milestone.
+Status: **partially implemented.** The resolver, dialer and generic stream
+algorithms exist; files, TLS and signals do not. Per-stage state is in
+[roadmap.md](roadmap.md#planned-io-infrastructure), and implemented behaviour
+that diverges from this document is flagged inline.
 
-This is a later additive design. The current milestone changes no feature or
-public API; see [scheduler-v2.md](scheduler-v2.md). When this work resumes, its
-fixed directions remain Go-style public APIs, epoll for readiness, and no
+The runtime v2 refactor that this was deferred behind is complete (see
+[scheduler-v2.md](scheduler-v2.md)), so these stages are unblocked. Scheduling
+is tracked in [roadmap.md](roadmap.md#planned-io-infrastructure); nothing here
+is a commitment to build.
+
+The fixed directions remain Go-style public APIs, epoll for readiness, and no
 io_uring.
 
 This document defines the public shape and backend rules for cio's network,
@@ -231,6 +236,12 @@ are staggered across IPv6 and IPv4 rather than waiting for every address in one
 family to fail before trying the other. The first successful stream wins; all
 losing attempts are closed and joined before the dial task returns.
 
+> **As implemented:** families are interleaved and each attempt is bounded by
+> `fallback_delay`, but attempts run one at a time rather than being raced
+> concurrently. Losing attempts are cancelled — which closes their socket — and
+> joined before the dial returns. `DialOptions` also carries a `family` field
+> that this sketch omits.
+
 UDP keeps its concrete `UdpSocket` API. It gains the same combined/clear
 deadline operations as `TcpStream`, but it does not gain a generic protocol
 string or a runtime-polymorphic `Conn` base class.
@@ -391,6 +402,12 @@ protects coroutine-frame memory during a sustained overload. Per-class
 admission below that global bound remains an additive facility for File and
 resolver APIs.
 
+> **Implemented in v0.0.1:** the global FIFO bound (`max_blocking_queue`,
+> default 1024), `Errc::overloaded` rejection and the guarantee that a rejected
+> callable is never run. **Not implemented:** `max_file_operations`,
+> `max_resolver_operations` and the class-aware wait queues below, which arrive
+> with the File and resolver APIs that need them.
+
 The last two values limit admitted operations, not threads. A task waiting for
 admission is parked without consuming an executor thread. Class-aware wait
 queues prevent file admissions from sitting in front of every resolver
@@ -449,13 +466,13 @@ Runtime v2 has moved the scheduler from the former shared reactor to an
 internal affinity-sharded design independently of these stages. Neither backend
 changes the following public API plan.
 
-1. **Blocking admission**
+1. **Blocking admission** — *partially done; the global bound shipped in v0.0.1*
    - add per-class admission, fair queue selection and shutdown rejection to
      the existing blocking executor;
    - preserve `cio::blocking()` and the meaning of `max_blocking_threads`;
    - with one scheduler worker, verify that blocking work does not delay
      channels, timers or network readiness.
-2. **Resolver and dialer**
+2. **Resolver and dialer** — *done, except concurrent attempt racing*
    - retain `resolve()` and both existing `TcpStream::connect()` overloads;
    - add `Resolver`, `Dialer`, connect cancellation and combined deadlines;
    - test cancel-before-submit, cancel-during-lookup, timeout races, IPv4/IPv6
@@ -465,7 +482,7 @@ changes the following public API plan.
    - add `cio::fs::File`, offset and positioned I/O, sync, stat and truncate;
    - test every open flag, EOF, short I/O, concurrent positioned I/O, descriptor
      cleanup, admission saturation and shutdown.
-4. **Generic stream algorithms**
+4. **Generic stream algorithms** — *done, in `cio/io.hpp`*
    - extract `read_exact()`, `write_all()` and `copy()` without changing the
      concrete socket fast path.
 5. **Optional TLS and signal modules**

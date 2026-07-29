@@ -19,11 +19,14 @@ remain part of the compatibility surface.
 
 - `include/cio/`: public, mostly template-facing API
 - `include/cio/detail/`: private scheduler/reactor/timer/queue contracts
-- `src/`: non-template runtime implementation
+- `src/`: non-template runtime implementation; `src/tls.cpp` builds only with
+  `-DCIO_TLS=ON` and is the sole file with an external dependency
 - `tests/`: test executables discovered automatically by CMake
 - `examples/`: public API compile and usage examples
 - `bench/`: C++ microbenchmarks and isolated Go/HTTP/echo comparisons
-- `docs/scheduler-v2.md`: implemented scheduler design and release evidence
+- `docs/scheduler-v2.md`: implemented scheduler design and its invariants
+- `docs/scheduler-results.md`: benchmark record, rejected variants, hashes
+- `docs/roadmap.md`: open evidence gaps and deferred work
 - `docs/io-infrastructure.md`: future additive design, not implemented API
 
 Do not commit generated build trees, benchmark executables, sanitizer output,
@@ -201,8 +204,14 @@ faster. State the direction explicitly.
   `tests/test_api_surface.cpp` when changing header-visible code.
 - Add regression tests for the exact race or lifetime failure being fixed, not
   only a broad stress test.
-- Update the relevant design or benchmark document when an invariant,
-  methodology or retained performance result changes.
+- Update the relevant document when something changes, and keep the split:
+  invariants go in `docs/scheduler-v2.md`, measurements and rejected variants in
+  `docs/scheduler-results.md`, deferred work and open questions in
+  `docs/roadmap.md`, and released behaviour in `CHANGELOG.md`. Do not reintroduce
+  a benchmark log into a design document.
+- A rejected variant is recorded, not deleted. Add a row to the rejected-designs
+  table with its baseline, headline delta, rejection reason, candidate hash and
+  local run directory.
 - Preserve unrelated work in a dirty tree. Do not reset, overwrite or delete
   user changes.
 - Do not commit or push unless the user explicitly requests it.

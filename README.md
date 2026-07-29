@@ -81,9 +81,18 @@ cmake --build build-tsan -j
 ctest --test-dir build-tsan --output-on-failure
 ```
 
-Ten test executables cover the public API, scheduler, worker bitmaps, directed
-MPSC inbox, channels, `select`, networking, synchronization, timers and soak
-behaviour. For a longer non-sanitized network soak:
+Fourteen test executables cover the public API, scheduler, worker bitmaps,
+directed MPSC inbox, channels, `select`, networking, DNS, files, signals,
+scoped deadlines and descriptor adoption, synchronization, timers and soak
+behaviour. The optional TLS module adds a fifteenth:
+
+```sh
+cmake -S . -B build-tls -DCMAKE_BUILD_TYPE=Release -DCIO_TLS=ON
+cmake --build build-tls -j
+ctest --test-dir build-tls --output-on-failure
+```
+
+For a longer non-sanitized network soak:
 
 ```sh
 ./build/test_soak 90
@@ -108,15 +117,49 @@ Long coroutine soaks should not run under ASan or TSan; see
 | `cio::sleep(duration)` | Runtime timer |
 | `cio::blocking(fn)` | Run blocking work outside scheduler workers |
 | `cio::net::TcpListener` / `TcpStream` / `UdpSocket` | Non-blocking sockets with deadlines |
+| `cio::net::Resolver` / `resolve()` | System name resolution on the blocking pool |
+| `cio::dns::Resolver` | DNS over the runtime's own sockets; no pool thread, cancellable |
+| `cio::Timeout` | Scoped, nestable deadline that restores the enclosing one |
+| `cio::PollableFd` | Adopt a foreign fd (eventfd, timerfd, inotify, a C library) |
+| `cio::net::Dialer` / `dial_tcp()` | Resolution plus raced address selection and timeouts |
+| `cio::fs::File` / `open()` / `stat()` | Regular-file I/O on the blocking pool |
+| `cio::signal::SignalSet` | `signalfd`-backed signal delivery |
+| `cio::tls::TlsStream` | Optional TLS (`-DCIO_TLS=ON`, links OpenSSL) |
+| `cio::read_exact` / `write_all` / `copy` | Generic algorithms over `AsyncReader`/`AsyncWriter` |
 | `cio::Runtime` / `cio::run(task)` / `CIO_MAIN` | Runtime ownership and entry points |
 
 Receiving from a closed and drained channel returns `std::nullopt`. Sending to a
 closed channel returns `false`. `select` returns the winning case index and case
 values remain available through `selected.get<I>()`.
 
+Socket deadlines are per-direction and persist until reset; the unsuffixed
+`set_deadline()`, `set_timeout()` and `clear_deadline()` apply to both
+directions at once. `cio::Timeout` applies one for a scope and restores the
+enclosing deadline afterwards, so timeouts nest without manual save/restore;
+an inner scope can only tighten an outer one, never extend it.
+
+Cancellation binds to a socket rather than to a call: `set_cancel(token)` makes
+every operation in either direction fail with `Errc::cancelled` once the token
+fires, including one already parked, which is woken. That is why `read()`,
+`write()` and `accept()` take no cancel parameter — like deadlines,
+cancellation lives on the connection. `TcpStream::connect()` and the resolver
+and dialer entry points additionally accept a token directly.
+
+A cancelled `net::Resolver` lookup resumes the caller immediately while
+`getaddrinfo()` finishes in the background, because a system lookup in progress
+cannot be interrupted. `cio::dns::Resolver` has no such limitation: it speaks
+DNS over the runtime's own sockets, so a lookup is interrupted mid-flight and
+occupies no pool thread. It sees only DNS — no `/etc/hosts`, no NSS — so the
+two resolvers are kept side by side rather than one replacing the other.
+
 `cio::blocking(fn)` uses a lazily grown thread pool. `RuntimeOptions` bounds
-both its worker count (`max_blocking_threads`, default 512) and its FIFO wait
-queue (`max_blocking_queue`, default 1024). A submission to a full queue throws
+its worker count (`max_blocking_threads`, default 512), its FIFO wait queue
+(`max_blocking_queue`, default 1024), and the built-in operation classes
+(`max_file_operations`, default 32; `max_resolver_operations`, default 8).
+Class limits bound concurrently admitted operations, not threads: a task
+waiting for admission is parked and occupies no pool thread, and each class has
+its own wait queue so a burst of file work cannot sit in front of name
+resolution. A submission to a full queue throws
 `cio::SystemError` carrying `Errc::overloaded`. The same error is returned if
 the pool has no service thread and the operating system refuses to create its
 first one; a rejected callable is never run.
@@ -148,8 +191,9 @@ lifecycle pins and syscall leases make stale epoll events safe while close,
 deadline and cancellation race. Delayed cross-runtime completions use stable
 process-lifetime endpoint identities with counted foreign leases.
 
-The detailed invariants, rejected alternatives and frozen release gates live in
-[the runtime v2 design](docs/scheduler-v2.md).
+The detailed invariants live in [the runtime v2 design](docs/scheduler-v2.md);
+the frozen gates and every rejected alternative are in
+[the benchmark record](docs/scheduler-results.md).
 
 ## Repository layout
 
@@ -161,8 +205,9 @@ The detailed invariants, rejected alternatives and frozen release gates live in
 | `tests/` | Unit, concurrency, API-surface and soak tests |
 | `examples/` | Small buildable programs |
 | `bench/` | Core, I/O, echo, Go and HTTP/`wrk` benchmarks |
-| `docs/scheduler-v2.md` | Implemented runtime-v2 design and final gates |
-| `docs/io-infrastructure.md` | Later additive I/O design; not current API |
+| `docs/` | Design, benchmark record and roadmap; start at [docs/README.md](docs/README.md) |
+| `include/cio/tls.hpp` | Optional TLS module; built only with `-DCIO_TLS=ON` |
+| `CHANGELOG.md` | Released versions and their known limitations |
 | `AGENTS.md` | Repository-specific development and verification rules |
 
 Build directories, sanitizer artifacts, benchmark binaries, Python caches and
@@ -206,50 +251,36 @@ taskset -c 23 python3 bench/http-comparison/matrix_wrk.py \
 Frozen local binaries are generated artifacts and are not committed. Record
 their hashes and the `wrk` hash with every result.
 
-### Runtime v2 frozen result
+### Measured throughput
 
-The retained v2 runtime at clean commit `5e0208b` was compared with a clean
-build of pre-v2 commit `899ccad` using warmed, pinned and alternating pairs.
-HTTP used ten pairs per cell and a client thread count that did not trigger the
-`wrk` saturation warning:
+A minimal HTTP/1.1 server on eight workers pinned to CPUs 0-7, driven by
+third-party `wrk` on CPUs 8-23. All five cells come from one ten-pair matrix
+against the published v0.0.1 runtime, so they are directly comparable:
 
-| Workload | Pre-v2 | Runtime v2 | Paired result |
-|---|---:|---:|---:|
-| HTTP/`wrk`, 1 connection | 14,242 req/s | 14,339 req/s | +0.67%, neutral |
-| HTTP/`wrk`, 8 connections | 80,645 req/s | 125,598 req/s | **+56.00%** |
-| HTTP/`wrk`, 64 connections | 729,546 req/s | 789,141 req/s | **+8.16%** |
-| HTTP/`wrk`, 256 connections | 773,023 req/s | 771,416 req/s | -0.22%, neutral |
-| HTTP/`wrk`, 1024 connections | 714,915 req/s | 781,518 req/s | **+9.34%** |
-| Echo, 1024 connections, 128 B | 725,717 req/s | 779,580 req/s | **+7.43%** |
-| `spawn()` + join, 8 workers | — | — | **16.86% faster** |
-| `spawn()` + join, 24 workers | — | — | **19.76% faster** |
-| Unbuffered channel, 24 workers | — | — | neutral, B/A ns/op +0.095% |
-
-Detached `go()` remained 6.52% slower at 8 workers and 6.71% slower at 24.
-HTTP c8 traded its gain for a 4.38-times median p99, c256 was throughput-neutral
-with a 3.02-times median p99, and c1024 improved p50 while raising p99 by about
-19%. These costs are part of the release record rather than being hidden behind
-headline throughput. Full intervals, CPU data, hashes and methodology are in
-[the HTTP comparison](bench/http-comparison/README.md).
-
-The
-[v0.0.1 retag work-aware scheduler result](bench/http-comparison/README.md#v001-retag-work-aware-scheduler-result)
-improves mixed-load fairness substantially. Its frozen screens are diagnostic
-mechanism evidence rather than exact-final performance evidence, and standard
-c1024 throughput parity has not been demonstrated.
-
-An older pre-v2 `wrk` comparison against Go is retained only as historical
-context:
-
-| Connections | cio snapshot | Go | cio/Go |
+| Connections | req/s | median p50 | median p99 |
 |---:|---:|---:|---:|
-| 8 | 75,483 | 72,714 | +3.8% |
-| 64 | 636,751 | 629,971 | +1.1% |
-| 256 | 770,606 | 716,889 | +7.5% |
-| 1024 | 770,628 | 721,637 | +6.8% |
+| 1 | 14,339 | 68 us | 110 us |
+| 8 | 125,598 | 52 us | 644 us |
+| 64 | 789,141 | 70 us | 501 us |
+| 256 | 771,416 | 306 us | 2765 us |
+| 1024 | 781,518 | 1125 us | 4635 us |
 
-This Go table was not collected in the final v2 A/B run and must not be combined
-with it as if all columns were paired. Full methodology and historical results:
+A later monitor-balance round measured c1024 at 859,820 req/s with median p99
+of 2060 us. That is a separate confirmation against a different baseline and is
+not paired with the table above; do not read the two together as one sweep.
+
+Absolute numbers are host-specific and are useful mainly as a shape: throughput
+saturates near 64 connections, and tail latency is the axis that moves.
+
+What this scheduler costs, stated rather than omitted: detached `go()` is about
+6.5% slower than the shared-reactor design it replaced, p99 at 8 and 256
+connections is several times higher than that design's, and 1024-connection
+throughput parity for the final work-aware build was not demonstrated. See
+[the benchmark record](docs/scheduler-results.md) for baselines, intervals,
+CPU data and artifact hashes, and [the roadmap](docs/roadmap.md) for what is
+still open.
+
+Comparisons against Boost.Asio and Go, with their methodology and caveats:
 
 - [HTTP comparison driven by wrk](bench/http-comparison/README.md)
 - [Echo comparison](bench/echo-comparison/README.md)
@@ -260,6 +291,8 @@ Optional runtime counters are enabled with `-DCIO_METRICS=ON`.
 when instrumentation is disabled.
 
 ## Known limits
+
+Runtime:
 
 - Linux/epoll only; no kqueue, IOCP or io_uring backend is claimed.
 - Scheduling is cooperative. A task that never suspends holds its worker.
@@ -274,9 +307,66 @@ when instrumentation is disabled.
 - Symmetric coroutine transfer relies on tail calls. CMake propagates GCC's
   required `-foptimize-sibling-calls`; sanitizer instrumentation can still turn
   long non-suspending coroutine chains into deep native stacks.
+- `cio::blocking()` itself has no admission limit; only the built-in file and
+  resolver classes are bounded. A flood of user blocking work is held only by
+  the global queue bound and the thread ceiling.
+
+Performance, measured rather than asserted:
+
+- 64-connection tail latency regressed against the previous release: p99 up
+  26-57% and Max up 14-31%, reproducing in both AB and BA order. It is the price
+  of the 1024-connection gains.
+- The p99.99 and beyond are worse on rare foreign-monitor dispatch. Four designs
+  aimed at that path were measured and all four rejected.
+- Accepted connections are distributed round-robin, but weight is a property of
+  the traffic a connection later carries, so heavy connections cluster by chance
+  and skewed workloads land unevenly across reactor shards.
+
+Files:
+
+- No cancellation and no deadlines, by design: a cancelled read would let a pool
+  thread keep writing into a caller-owned span after it was destroyed.
+- `read()` and `write()` share the file offset and must not run concurrently on
+  the same `File`; `read_at()`/`write_at()` may, with distinct buffers.
+- `close()` is synchronous. On a filesystem where it can block for an unbounded
+  time, call it from `cio::blocking()`.
+- No directory traversal, path mutation or whole-file helpers yet.
+
+Name resolution:
+
+- `net::Resolver` uses the system resolver. A cancelled lookup resumes its
+  caller immediately, but `getaddrinfo()` cannot be interrupted and runs to
+  completion; its late result is discarded.
+- `dns::Resolver` speaks DNS itself and has neither limitation, but sees only
+  DNS: no `/etc/hosts`, no NSS modules, no mDNS. It also has no cache, no
+  DNSSEC validation, and no TCP fallback — a truncated answer with no usable
+  records is reported rather than retried over TCP.
+
+Signals:
+
+- `cio::signal::block()` must be called before the runtime starts any thread.
+  `subscribe()` reports `Errc::broken` for a signal that is not blocked, rather
+  than returning a set that could never fire.
+- Identical signals arriving faster than they are consumed may be coalesced by
+  the kernel. Use it for lifecycle events, not as a counter.
+
+TLS (optional):
+
+- Requires `-DCIO_TLS=ON` and links OpenSSL; the core library stays
+  dependency-free.
+- TLS 1.2 is the floor. No ALPN, no session resumption and no client
+  certificates.
+
+Open items that are not inherent — including work blocked on hardware or on
+evidence — are tracked in [the roadmap](docs/roadmap.md).
 
 ## Development
 
 Read [AGENTS.md](AGENTS.md) before changing runtime ownership, waiter lifetime,
 shutdown or benchmark methodology. Public API and observable semantics should
 remain stable unless an API change is explicitly requested and documented.
+
+[docs/README.md](docs/README.md) indexes the design, the benchmark record and
+the roadmap. Before proposing a scheduler mechanism, check the
+[rejected designs](docs/scheduler-results.md#rejected-designs): more than
+twenty implemented variants have already been measured and removed.

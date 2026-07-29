@@ -3,73 +3,9 @@
 A minimal HTTP/1.1 server on each of the three runtimes, under a load generator
 that none of them is built on.
 
-> Historical results and architecture discussion are the pre-runtime-v2
-> baseline. Sections explicitly marked runtime v2 or v0.0.1 retag, plus the
-> current runners, describe later work. See
-> [the runtime-v2 design](../../docs/scheduler-v2.md).
-
-## Runtime v2 frozen A/B matrix
-
-The publishable confirmation compared a clean build of pre-v2 commit `899ccad`
-with a clean build of retained-v2 commit `5e0208b`. It used ten warmed, paired
-runs per cell, five in AB order and five in BA order. The server used eight
-workers pinned to CPUs 0-7; the same third-party `wrk` binary was pinned to
-CPUs 8-23. Each side had a 5-second warm-up and a separate 15-second measured
-window.
-
-| connections | wrk threads | pre-v2 A req/s | retained v2 B req/s | paired geometric B/A (95% CI) | median p50 A/B | median p99 A/B | server cores A/B |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 1 | 14,242 | 14,339 | +0.67% (-3.88% to +5.42%), neutral | 67/68 us | 109.5/110 us | 0.37/0.37 |
-| 8 | 4 | 80,645 | 125,598 | **+56.00%** (+49.52% to +62.77%) | 92/52 us | 147/644 us | 2.64/2.75 |
-| 64 | 16 | 729,546 | 789,141 | **+8.16%** (+6.84% to +9.50%) | 76/70 us | 518/501 us | 7.89/7.97 |
-| 256 | 16 | 773,023 | 771,416 | -0.22% (-1.63% to +1.21%), neutral | 303.5/306 us | 915/2765 us | 7.91/7.92 |
-| 1024 | 16 | 714,915 | 781,518 | **+9.34%** (+7.22% to +11.49%) | 1355/1125 us | 3900/4635 us | 7.64/7.90 |
-
-Positive B/A throughput means B is faster. The intervals are per-cell paired
-log-ratio Student-t intervals and are not adjusted for cross-cell claims.
-Every one of the 100 measured sides had zero socket errors, zero non-2xx
-responses, a successful `wrk` exit and a live server. Input hashes were
-unchanged at the end.
-
-The result is not a single throughput headline. At eight connections B gains
-throughput and median latency, but its median p99 is 4.38 times A. At 64
-connections throughput and both reported latency percentiles improve. At 256
-connections throughput is neutral while median p99 is 3.02 times A. At 1024
-connections B gains 9.34% and lowers p50, but median p99 rises by about 19%.
-
-This is a gate for the complete retained runtime-v2 build, not an estimate of
-the MPSC inbox's isolated causal effect: A and B differ in more than that one
-component. An MPSC-only claim requires the same matrix over two otherwise
-identical frozen builds.
-
-An earlier complete screen used two `wrk` threads at c8 and eight at the three
-larger cells. It passed correctness gates but reached at least 95% of the
-configured client-thread capacity, so it is not the published result.
-No number from that screen is combined with the clean-source confirmation.
-A load-generator saturation warning makes a run a capacity screen, not release
-evidence.
-
-The exact executable hashes were
-`5650865ce18c6d029fbd0546b0ee9a6d7758da5087038f8f8db15664f78750e8`
-(A),
-`c9c978fb4b4c2aae98eecd886825fcf4206b7343f0cdae0a5f09c925189c1adf`
-(B), and
-`3722bf8b31651d8b029b4856af9239dfb491ca93e92447368a4e183e8863b588`
-(`wrk`).
-
-A's static library hash is
-`d58b29801a3691af204652208c6a1397edefa2ec81eb4c3aff0693d8923e5570`;
-B's is
-`6a27bb4da89479c1718b220d5df954d8dbef3fc952926e7d51eafdf33a2ae8f9`.
-Independent clean builds reproduced the A library, and a clean B rebuild
-reproduced both retained B hashes.
-
-An earlier matrix used A executable
-`1970c98716225a93d66a9b662ece04d0d93629ecd71c5b1c6356c9c7b97bf3e5`,
-which was itself byte-reproducible but combined a dirty 09:45 UTC library with
-the 09:57 header state. The provenance audit rejected it because it did not
-correspond to one clean frozen source revision. It is retained only as a
-historical diagnostic; none of its values appears in the table above.
+> This document covers the harnesses and the three-runtime comparison. Scheduler
+> A/B results live in [the benchmark record](../../docs/scheduler-results.md);
+> the architecture discussion below predates worker-local reactor shards.
 
 ## Frozen A/B matrix runner
 
@@ -186,41 +122,16 @@ than 10,000 or 100,000 requests are available, p99.99 or p99.999 respectively
 is marked unresolved; those fields often collapse to one extreme sample or
 Max and are not independent distribution claims.
 
-## v0.0.1 retag: work-aware scheduler result
+## Quick three-runtime comparison
 
-The 2026-07-29 experimental round used `/usr/bin/wrk`, servers on CPUs 0-7,
-clients on 8-21 and the harness on 23. The publication-ready ten-pair standard
-confirmation of the first work-aware quota build was neutral at c64
-(-0.34%, 95% CI -2.21% to +1.57%), but lost 2.52% throughput at c1024
-(-3.79% to -1.24%); paired p50 and p90 rose 3.47% and 2.33%. Its separate
-four-pair mixed confirmation kept pipelined bulk throughput neutral at -0.07%,
-while the ordinary probe gained 100.61% throughput and reduced p50, p90 and
-p99 by 49.47%, 38.53% and 30.57%.
-
-A GCC follow-up removed the TCP success flag and relaxed the completion counter
-to one direct TLS decrement plus branch. Its four-pair screens kept mixed bulk
-neutral at -0.22%, improved probe p50/p90/p99 by 47.19%/37.02%/31.73%, and
-moved standard c64 throughput +0.91%. Standard c1024 did not establish parity:
-the paired summary was -5.07% with a wide -16.24% to +7.60% interval, including
-one valid -15.61% pair alongside three pairs from -0.50% to -1.95%.
-
-The screen binary was
-`cc5b9945e734c0e17589af92bb98700b8e940a51803f0c5992597b763c109bed`.
-The final shared-safe dual-symbol TLS refinement changed the server hash to
-`aa9834d2167a6436fb451a274abc5b8cdcb09aca05ea8239519d581cded43af4`
-while preserving the screen binary's entire `.text` section byte for byte.
-Consequently these screens are diagnostic mechanism evidence, not exact-final
-performance evidence for the retag. The round demonstrates a strong mixed-load
-latency/fairness gain with nearly neutral bulk capacity, but it does not
-demonstrate ordinary c1024 throughput parity; that limitation is part of the
-v0.0.1 retag record.
-
-For a quick three-runtime comparison using locally built `cio`, Asio and Go
-servers:
+Using locally built `cio`, Asio and Go servers:
 
 ```
 ./run_wrk.sh [connections] [duration_s] [repeats] [threads]
 ```
+
+This is a smoke comparison, not a gate. Publishable A/B evidence uses
+`matrix_wrk.py` above.
 
 ## Why this exists
 
@@ -245,7 +156,7 @@ point of it being here.
 
 | | architecture |
 |---|---|
-| **cio (measured snapshot)** | work-stealing M:N, one shared reactor, one task per connection |
+| **cio** | work-stealing M:N, worker-local epoll shards, one task per connection |
 | **asio** | shared-nothing: one `io_context` + one `SO_REUSEPORT` acceptor per thread, callbacks |
 | **go** | goroutine per connection, `GOMAXPROCS` set to the thread count |
 

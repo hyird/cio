@@ -199,7 +199,7 @@ private:
     // Reuses the descriptor lifecycle, readiness, deadline and cancellation
     // machinery that already exists. The socket surface is private because a
     // timerfd has no peer address.
-    class Descriptor : public net::TcpStream {
+    class Descriptor : public net::TcpConn {
     public:
         Result<void> adopt_foreign(int fd, bool already_nonblocking) {
             return adopt(fd, already_nonblocking);

@@ -49,7 +49,7 @@ FileInfo info_from_stat(const struct ::stat& st) noexcept {
 }  // namespace
 
 bool FileInfo::is_regular() const noexcept { return S_ISREG(mode); }
-bool FileInfo::is_directory() const noexcept { return S_ISDIR(mode); }
+bool FileInfo::is_dir() const noexcept { return S_ISDIR(mode); }
 
 void File::close() {
     if (fd_ < 0) return;

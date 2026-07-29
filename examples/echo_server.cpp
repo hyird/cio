@@ -13,10 +13,10 @@
 using namespace std::chrono_literals;
 namespace net = cio::net;
 
-cio::Task<> serve(net::TcpStream stream) {
+cio::Task<> serve(net::TcpConn stream) {
     // One task per connection, exactly like one goroutine per connection. At
     // 100k connections this costs 100k coroutine frames, not 100k stacks.
-    const auto peer = stream.peer_addr();
+    const auto peer = stream.remote_addr();
     std::byte buffer[16 * 1024];
 
     for (;;) {
@@ -39,7 +39,7 @@ CIO_MAIN_ARGS(argc, argv) {
     const std::uint16_t port =
         argc > 1 ? static_cast<std::uint16_t>(std::atoi(argv[1])) : 9000;
 
-    auto listener = net::TcpListener::bind(net::SocketAddr::any_v4(port));
+    auto listener = net::TcpListener::listen(net::SocketAddr::any_v4(port));
     if (!listener) {
         std::fprintf(stderr, "bind failed: %s\n", listener.error().message().c_str());
         co_return 1;

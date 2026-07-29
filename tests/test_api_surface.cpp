@@ -230,43 +230,43 @@ static_assert(std::same_as<
               decltype(std::declval<const cio::net::Socket&>().native_handle()),
               int>);
 static_assert(std::same_as<
-              decltype(cio::net::TcpStream::connect(
+              decltype(cio::net::TcpConn::dial(
                   std::declval<cio::net::SocketAddr>())),
-              cio::Task<cio::Result<cio::net::TcpStream>>>);
+              cio::Task<cio::Result<cio::net::TcpConn>>>);
 static_assert(std::same_as<
-              decltype(cio::net::TcpStream::connect(
+              decltype(cio::net::TcpConn::dial(
                   std::declval<std::string>(), std::uint16_t{})),
-              cio::Task<cio::Result<cio::net::TcpStream>>>);
+              cio::Task<cio::Result<cio::net::TcpConn>>>);
 static_assert(std::same_as<
-              decltype(std::declval<cio::net::TcpStream&>().read(
+              decltype(std::declval<cio::net::TcpConn&>().read(
                   std::declval<MutableBytes>())),
               cio::Task<cio::Result<std::size_t>>>);
 static_assert(std::same_as<
-              decltype(std::declval<cio::net::TcpStream&>().write(
+              decltype(std::declval<cio::net::TcpConn&>().write(
                   std::declval<ConstBytes>())),
               cio::Task<cio::Result<std::size_t>>>);
 static_assert(std::same_as<
-              decltype(std::declval<cio::net::TcpStream&>().write_all(
+              decltype(std::declval<cio::net::TcpConn&>().write_all(
                   std::declval<ConstBytes>())),
               cio::Task<cio::Result<void>>>);
 static_assert(std::same_as<
-              decltype(cio::net::TcpListener::bind(
+              decltype(cio::net::TcpListener::listen(
                   std::declval<cio::net::SocketAddr>(), 16)),
               cio::Result<cio::net::TcpListener>>);
 static_assert(std::same_as<
               decltype(std::declval<cio::net::TcpListener&>().accept()),
-              cio::Task<cio::Result<cio::net::TcpStream>>>);
+              cio::Task<cio::Result<cio::net::TcpConn>>>);
 static_assert(std::same_as<
-              decltype(cio::net::UdpSocket::bind(
+              decltype(cio::net::UdpConn::listen(
                   std::declval<cio::net::SocketAddr>())),
-              cio::Result<cio::net::UdpSocket>>);
+              cio::Result<cio::net::UdpConn>>);
 static_assert(std::same_as<
-              decltype(std::declval<cio::net::UdpSocket&>().recv_from(
+              decltype(std::declval<cio::net::UdpConn&>().read_from(
                   std::declval<MutableBytes>(),
                   std::declval<cio::net::SocketAddr&>())),
               cio::Task<cio::Result<std::size_t>>>);
 static_assert(std::same_as<
-              decltype(std::declval<cio::net::UdpSocket&>().send_to(
+              decltype(std::declval<cio::net::UdpConn&>().write_to(
                   std::declval<ConstBytes>(),
                   std::declval<const cio::net::SocketAddr&>())),
               cio::Task<cio::Result<std::size_t>>>);
@@ -384,8 +384,8 @@ cio::Task<int> exercise_concurrency_surface() {
 // This is intentionally compile-only: it represents downstream socket code
 // without performing network I/O in the API fixture.
 [[maybe_unused]] cio::Task<void> downstream_net_usage(
-    cio::net::TcpStream& stream, cio::net::TcpListener& listener,
-    cio::net::UdpSocket& datagram, cio::net::SocketAddr peer,
+    cio::net::TcpConn& stream, cio::net::TcpListener& listener,
+    cio::net::UdpConn& datagram, cio::net::SocketAddr peer,
     MutableBytes input, ConstBytes output) {
     stream.set_read_timeout(1s);
     stream.set_write_deadline(cio::Clock::now() + 1s);
@@ -410,14 +410,14 @@ cio::Task<int> exercise_concurrency_surface() {
     listener.clear_deadline();
 
     cio::net::SocketAddr from;
-    const auto received = co_await datagram.recv_from(input, from);
-    const auto sent = co_await datagram.send_to(output, peer);
+    const auto received = co_await datagram.read_from(input, from);
+    const auto sent = co_await datagram.write_to(output, peer);
     (void)received;
     (void)sent;
 
     // Generic stream algorithms apply to the concrete socket types.
-    static_assert(cio::AsyncReader<cio::net::TcpStream>);
-    static_assert(cio::AsyncWriter<cio::net::TcpStream>);
+    static_assert(cio::AsyncReader<cio::net::TcpConn>);
+    static_assert(cio::AsyncWriter<cio::net::TcpConn>);
     const auto exact = co_await cio::read_exact(stream, input);
     (void)exact;
     const auto all_written = co_await cio::write_all(stream, output);
@@ -450,10 +450,10 @@ cio::Task<int> exercise_concurrency_surface() {
     const auto dialed_free = co_await cio::net::dial_tcp("localhost", 80);
     (void)dialed_free;
 
-    const auto connected = co_await cio::net::TcpStream::connect(peer, stop.token());
+    const auto connected = co_await cio::net::TcpConn::dial(peer, stop.token());
     (void)connected;
     const auto connected_by_name =
-        co_await cio::net::TcpStream::connect("localhost", 80, stop.token());
+        co_await cio::net::TcpConn::dial("localhost", 80, stop.token());
     (void)connected_by_name;
 
     datagram.set_read_timeout(1s);
@@ -512,7 +512,7 @@ void test_net_and_result_construction() {
     CIO_CHECK_EQ(parsed->port(), std::uint16_t{8080});
 
     auto connect_task =
-        cio::net::TcpStream::connect(cio::net::SocketAddr::loopback_v4(9));
+        cio::net::TcpConn::dial(cio::net::SocketAddr::loopback_v4(9));
     CIO_CHECK(connect_task.valid());
     CIO_CHECK(!connect_task.done());
 

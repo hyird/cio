@@ -39,7 +39,7 @@ std::span<const std::byte> bytes_of(std::string_view s) {
     return {reinterpret_cast<const std::byte*>(s.data()), s.size()};
 }
 
-class InspectableTcpStream final : public net::TcpStream {
+class InspectableTcpConn final : public net::TcpConn {
 public:
     cio::Result<void> adopt_for_test(int fd) {
         return adopt(fd, /*already_nonblocking=*/true);
@@ -48,7 +48,7 @@ public:
     cio::detail::IoDesc* descriptor() const noexcept { return desc_; }
 };
 
-class InspectableUdpSocket final : public net::UdpSocket {
+class InspectableUdpConn final : public net::UdpConn {
 public:
     cio::Result<void> adopt_for_test(int fd) {
         return adopt(fd, /*already_nonblocking=*/true);
@@ -378,7 +378,7 @@ bool force_socket_pair_fd_reuse(int target_fd, int& reused_fd,
     return true;
 }
 
-cio::Result<InspectableUdpSocket> bind_inspectable_udp() {
+cio::Result<InspectableUdpConn> bind_inspectable_udp() {
     const int fd =
         ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) return cio::Error::from_errno();
@@ -394,7 +394,7 @@ cio::Result<InspectableUdpSocket> bind_inspectable_udp() {
         return error;
     }
 
-    InspectableUdpSocket socket;
+    InspectableUdpConn socket;
     if (auto adopted = socket.adopt_for_test(fd); !adopted) {
         return adopted.error();
     }
@@ -414,11 +414,11 @@ struct SwitchToWorker {
     void await_resume() const noexcept {}
 };
 
-using TcpPair = std::pair<net::TcpStream, net::TcpStream>;
+using TcpPair = std::pair<net::TcpConn, net::TcpConn>;
 
 cio::Task<cio::Result<TcpPair>> open_tcp_pair(
     net::TcpListener& listener, net::SocketAddr addr) {
-    auto connecting = cio::spawn(net::TcpStream::connect(addr));
+    auto connecting = cio::spawn(net::TcpConn::dial(addr));
     auto accepted = co_await listener.accept();
     auto client = co_await connecting;
     if (!accepted) co_return accepted.error();
@@ -426,7 +426,7 @@ cio::Task<cio::Result<TcpPair>> open_tcp_pair(
     co_return TcpPair{std::move(*client), std::move(*accepted)};
 }
 
-cio::Task<bool> observe_read_timeout(net::TcpStream& stream) {
+cio::Task<bool> observe_read_timeout(net::TcpConn& stream) {
     // A ready edge may have been recorded before the deadline fired. Consume
     // at most that hint, then the persistent descriptor state must win.
     for (int attempt = 0; attempt < 4; ++attempt) {
@@ -439,7 +439,7 @@ cio::Task<bool> observe_read_timeout(net::TcpStream& stream) {
     co_return false;
 }
 
-cio::Task<bool> observe_write_timeout(net::TcpStream& stream) {
+cio::Task<bool> observe_write_timeout(net::TcpConn& stream) {
     for (int attempt = 0; attempt < 4; ++attempt) {
         auto ready = co_await stream.writable();
         if (!ready) {
@@ -450,7 +450,7 @@ cio::Task<bool> observe_write_timeout(net::TcpStream& stream) {
     co_return false;
 }
 
-cio::Task<> echo_connection(net::TcpStream stream) {
+cio::Task<> echo_connection(net::TcpConn stream) {
     std::byte buffer[4096];
     for (;;) {
         auto n = co_await stream.read(buffer);
@@ -482,14 +482,14 @@ cio::Task<> echo_server(net::TcpListener listener, cio::CancelToken stop) {
 
 void test_echo_round_trip() {
     auto body = []() -> cio::Task<std::string> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->local_addr().value();
 
         cio::CancelSource stop;
         auto server = cio::spawn(echo_server(std::move(*listener), stop.token()));
 
-        auto client = co_await net::TcpStream::connect(addr);
+        auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
         if (!client) co_return "";
 
@@ -521,16 +521,16 @@ void test_echo_round_trip() {
 // admission, so a write refuses before it can succeed into a large send buffer.
 void test_combined_deadline_covers_both_directions() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->local_addr().value();
 
-        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpStream> {
+        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
             auto conn = co_await l.accept();
             co_return std::move(conn.value());
         }(std::move(*listener)));
 
-        auto client = co_await net::TcpStream::connect(addr);
+        auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
         auto server_side = co_await accepted;
 
@@ -571,39 +571,39 @@ void test_combined_deadline_covers_both_directions() {
     CIO_CHECK(cio::run(body()));
 }
 
-// UdpSocket gained the same surface; it previously had no clear at all, so a
+// UdpConn gained the same surface; it previously had no clear at all, so a
 // deadline set on it could never be released.
 void test_udp_combined_deadline_and_clear() {
     auto body = []() -> cio::Task<bool> {
-        auto socket = net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+        auto socket = net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(socket.has_value());
         const auto addr = socket->local_addr().value();
-        auto sender = net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+        auto sender = net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(sender.has_value());
 
         socket->set_timeout(30ms);
 
         std::byte buffer[16];
         net::SocketAddr from;
-        auto timed_out = co_await socket->recv_from(buffer, from);
+        auto timed_out = co_await socket->read_from(buffer, from);
         CIO_CHECK(!timed_out.has_value());
         CIO_CHECK(timed_out.error().is(cio::Errc::timed_out));
 
         // The write direction carries the same elapsed deadline.
-        auto send_refused = co_await socket->send_to(bytes_of("x"), addr);
+        auto send_refused = co_await socket->write_to(bytes_of("x"), addr);
         CIO_CHECK(!send_refused.has_value());
         CIO_CHECK(send_refused.error().is(cio::Errc::timed_out));
 
         socket->clear_deadline();
         socket->set_read_timeout(2s);
-        auto sent = co_await sender->send_to(bytes_of("hi"), addr);
+        auto sent = co_await sender->write_to(bytes_of("hi"), addr);
         CIO_CHECK(sent.has_value());
-        auto received = co_await socket->recv_from(buffer, from);
+        auto received = co_await socket->read_from(buffer, from);
         CIO_CHECK(received.has_value());
         CIO_CHECK_EQ(*received, std::size_t{2});
 
         // The cleared write direction works again as well.
-        auto sent_back = co_await socket->send_to(bytes_of("yo"), addr);
+        auto sent_back = co_await socket->write_to(bytes_of("yo"), addr);
         CIO_CHECK(sent_back.has_value());
         co_return true;
     };
@@ -612,17 +612,17 @@ void test_udp_combined_deadline_and_clear() {
 
 void test_read_deadline() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->local_addr().value();
 
         // A server that accepts and then stays silent.
-        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpStream> {
+        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
             auto conn = co_await l.accept();
             co_return std::move(conn.value());
         }(std::move(*listener)));
 
-        auto client = co_await net::TcpStream::connect(addr);
+        auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
         auto server_side = co_await accepted;
 
@@ -661,13 +661,13 @@ void test_immediate_deadline_remains_persistent_during_waiter_publication() {
 
     auto body = []() -> cio::Task<bool> {
         auto listener =
-            net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         if (!listener) co_return false;
         const auto addr = listener->local_addr().value();
 
         for (int i = 0; i < kIterations; ++i) {
-            auto connecting = cio::spawn(net::TcpStream::connect(addr));
+            auto connecting = cio::spawn(net::TcpConn::dial(addr));
             auto accepted = co_await listener->accept();
             auto client = co_await connecting;
             CIO_CHECK(accepted.has_value());
@@ -693,7 +693,7 @@ void test_immediate_deadline_remains_persistent_during_waiter_publication() {
 void test_expired_deadline_precedes_ready_data_write_and_eof() {
     auto body = []() -> cio::Task<bool> {
         auto listener =
-            net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         if (!listener) co_return false;
         const auto addr = listener->local_addr().value();
@@ -725,7 +725,7 @@ void test_expired_deadline_precedes_ready_data_write_and_eof() {
         CIO_CHECK(eof_pair.has_value());
         if (!eof_pair) co_return false;
         auto& [eof_client, eof_peer] = *eof_pair;
-        auto shutdown = eof_peer.shutdown_write();
+        auto shutdown = eof_peer.close_write();
         CIO_CHECK(shutdown.has_value());
         if (!shutdown) co_return false;
         eof_client.set_read_deadline(cio::Clock::now());
@@ -764,14 +764,14 @@ void test_expired_deadline_precedes_ready_data_write_and_eof() {
 void test_expired_deadline_precedes_ready_accept_and_udp() {
     auto body = []() -> cio::Task<bool> {
         auto listener =
-            net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         if (!listener) co_return false;
 
         // Complete the handshake without accepting it, leaving a connection
         // ready in the listener backlog.
         auto client =
-            co_await net::TcpStream::connect(listener->local_addr().value());
+            co_await net::TcpConn::dial(listener->local_addr().value());
         CIO_CHECK(client.has_value());
         if (!client) co_return false;
         listener->set_deadline(cio::Clock::now());
@@ -785,9 +785,9 @@ void test_expired_deadline_precedes_ready_accept_and_udp() {
         }
 
         auto receiver =
-            net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+            net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
         auto sender =
-            net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+            net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(receiver.has_value());
         CIO_CHECK(sender.has_value());
         if (!receiver || !sender) co_return false;
@@ -795,7 +795,7 @@ void test_expired_deadline_precedes_ready_accept_and_udp() {
         CIO_CHECK(target.has_value());
         if (!target) co_return false;
 
-        auto primed = co_await sender->send_to(bytes_of("x"), *target);
+        auto primed = co_await sender->write_to(bytes_of("x"), *target);
         CIO_CHECK(primed.has_value());
         if (!primed) co_return false;
 
@@ -803,7 +803,7 @@ void test_expired_deadline_precedes_ready_accept_and_udp() {
         co_await cio::sleep(2ms);
         std::byte byte{};
         net::SocketAddr from;
-        auto received = co_await receiver->recv_from(
+        auto received = co_await receiver->read_from(
             std::span<std::byte>{&byte, 1}, from);
         CIO_CHECK(!received);
         CIO_CHECK(received.error().is(cio::Errc::timed_out));
@@ -814,7 +814,7 @@ void test_expired_deadline_precedes_ready_accept_and_udp() {
 
         sender->set_write_deadline(cio::Clock::now());
         co_await cio::sleep(2ms);
-        auto sent = co_await sender->send_to(bytes_of("y"), *target);
+        auto sent = co_await sender->write_to(bytes_of("y"), *target);
         CIO_CHECK(!sent);
         CIO_CHECK(sent.error().is(cio::Errc::timed_out));
         co_return !sent &&
@@ -829,11 +829,11 @@ void test_connect_refused() {
         // Bind and immediately drop, so the port is almost certainly closed.
         std::uint16_t port = 0;
         {
-            auto probe = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+            auto probe = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
             CIO_CHECK(probe.has_value());
             port = probe->local_addr().value().port();
         }
-        auto result = co_await net::TcpStream::connect(net::SocketAddr::loopback_v4(port));
+        auto result = co_await net::TcpConn::dial(net::SocketAddr::loopback_v4(port));
         CIO_CHECK(!result.has_value());
         co_return !result.has_value();
     };
@@ -845,7 +845,7 @@ void test_connect_completion_survives_descriptor_reuse() {
 
     auto body = []() -> cio::Task<bool> {
         auto listener =
-            net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         if (!listener) co_return false;
         const auto addr = listener->local_addr().value();
@@ -860,8 +860,8 @@ void test_connect_completion_survives_descriptor_reuse() {
             if (!pair) co_return false;
 
             auto& [client, accepted] = *pair;
-            auto client_peer = client.peer_addr();
-            auto accepted_peer = accepted.peer_addr();
+            auto client_peer = client.remote_addr();
+            auto accepted_peer = accepted.remote_addr();
             CIO_CHECK(client_peer.has_value());
             CIO_CHECK(accepted_peer.has_value());
             if (!client_peer || !accepted_peer) co_return false;
@@ -885,7 +885,7 @@ void test_many_concurrent_connections() {
     static constexpr int kRoundTrips = 20;
 
     auto body = []() -> cio::Task<int> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->local_addr().value();
 
@@ -897,7 +897,7 @@ void test_many_concurrent_connections() {
 
         for (int i = 0; i < kClients; ++i) {
             clients.spawn([](net::SocketAddr target, cio::Chan<int> out) -> cio::Task<> {
-                auto stream = co_await net::TcpStream::connect(target);
+                auto stream = co_await net::TcpConn::dial(target);
                 if (!stream) {
                     co_await out.send(0);
                     co_return;
@@ -940,14 +940,14 @@ void test_accept_distributes_new_streams_across_workers() {
 
     auto body = []() -> cio::Task<std::vector<bool>> {
         auto listener =
-            net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         if (!listener) co_return {};
         const auto addr = listener->local_addr().value();
 
         std::vector<bool> seen(kWorkers, false);
         for (int i = 0; i < kConnections; ++i) {
-            auto client = cio::spawn(net::TcpStream::connect(addr));
+            auto client = cio::spawn(net::TcpConn::dial(addr));
             auto accepted = co_await listener->accept();
             CIO_CHECK(accepted.has_value());
             if (!accepted) co_return seen;
@@ -974,21 +974,21 @@ void test_accept_distributes_new_streams_across_workers() {
 
 void test_close_wakes_a_parked_reader() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->local_addr().value();
 
-        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpStream> {
+        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
             auto conn = co_await l.accept();
             co_return std::move(conn.value());
         }(std::move(*listener)));
 
-        auto client = co_await net::TcpStream::connect(addr);
+        auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
         auto server_side = co_await accepted;
 
         // Server hangs up; the parked client read must observe EOF, not hang.
-        cio::go([](net::TcpStream s) -> cio::Task<> {
+        cio::go([](net::TcpConn s) -> cio::Task<> {
             co_await cio::sleep(20ms);
             s.close();
         }(std::move(server_side)));
@@ -1004,20 +1004,20 @@ void test_close_wakes_a_parked_reader() {
 
 void test_local_close_wakes_a_parked_reader() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->local_addr().value();
 
-        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpStream> {
+        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
             auto conn = co_await l.accept();
             co_return std::move(conn.value());
         }(std::move(*listener)));
 
-        auto client = co_await net::TcpStream::connect(addr);
+        auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
         auto server_side = co_await accepted;
 
-        auto reader = cio::spawn([](net::TcpStream& stream) -> cio::Task<cio::Error> {
+        auto reader = cio::spawn([](net::TcpConn& stream) -> cio::Task<cio::Error> {
             std::byte buffer[16];
             auto result = co_await stream.read(buffer);
             co_return result.error();
@@ -1052,7 +1052,7 @@ cio::Task<bool> run_ready_hint_completion_case(bool successful) {
     CIO_CHECK(open_nonblocking_socket_pair(fds));
     if (fds[0] < 0 || fds[1] < 0) co_return false;
 
-    InspectableTcpStream stream;
+    InspectableTcpConn stream;
     auto adopted = stream.adopt_for_test(fds[0]);
     CIO_CHECK(adopted.has_value());
     if (!adopted) {
@@ -1143,7 +1143,7 @@ void test_fd_use_guard_delays_physical_close() {
         CIO_CHECK(open_nonblocking_socket_pair(fds));
         if (fds[0] < 0 || fds[1] < 0) co_return false;
 
-        InspectableTcpStream stream;
+        InspectableTcpConn stream;
         auto adopted = stream.adopt_for_test(fds[0]);
         CIO_CHECK(adopted.has_value());
         if (!adopted) {
@@ -1234,7 +1234,7 @@ void test_readiness_then_close_cannot_read_reused_fd() {
         CIO_CHECK(open_nonblocking_socket_pair(original));
         if (original[0] < 0 || original[1] < 0) co_return false;
 
-        InspectableTcpStream stream;
+        InspectableTcpConn stream;
         auto adopted = stream.adopt_for_test(original[0]);
         CIO_CHECK(adopted.has_value());
         if (!adopted) {
@@ -1245,7 +1245,7 @@ void test_readiness_then_close_cannot_read_reused_fd() {
         cio::detail::IoDesc* const desc = stream.descriptor();
         const int original_fd = stream.native_handle();
         auto reader = cio::spawn(
-            [](InspectableTcpStream* socket)
+            [](InspectableTcpConn* socket)
                 -> cio::Task<cio::Result<std::size_t>> {
                 std::byte byte{};
                 co_return co_await socket->read(
@@ -1333,11 +1333,11 @@ struct BusyIoObservation {
 };
 
 cio::Task<BusyIoObservation> receive_during_runnext_chain(
-    InspectableUdpSocket* receiver, cio::Chan<> left, cio::Chan<> right,
+    InspectableUdpConn* receiver, cio::Chan<> left, cio::Chan<> right,
     std::atomic<bool>* done) {
     std::byte byte{};
     net::SocketAddr from;
-    auto received = co_await receiver->recv_from(
+    auto received = co_await receiver->read_from(
         std::span<std::byte>{&byte, 1}, from);
 
     BusyIoObservation observation;
@@ -1496,14 +1496,14 @@ struct MonitorCompletionState {
 };
 
 cio::Task<> read_udp_on_worker(
-    InspectableUdpSocket* receiver, cio::detail::Scheduler* scheduler,
+    InspectableUdpConn* receiver, cio::detail::Scheduler* scheduler,
     cio::detail::WorkerId worker, bool expect_timeout,
     MonitorCompletionState* state) {
     co_await SwitchToWorker{scheduler, worker};
 
     std::byte byte{};
     net::SocketAddr from;
-    auto received = co_await receiver->recv_from(
+    auto received = co_await receiver->read_from(
         std::span<std::byte>{&byte, 1}, from);
 
     const bool ok =
@@ -1533,7 +1533,7 @@ cio::Task<> occupy_worker_without_suspending(
     finished->store(true, std::memory_order_release);
 }
 
-bool io_waiter_is_parked(const InspectableUdpSocket& socket) {
+bool io_waiter_is_parked(const InspectableUdpConn& socket) {
     cio::detail::IoDesc* const desc = socket.descriptor();
     void* const slot =
         desc->slot[static_cast<unsigned>(cio::detail::Dir::kRead)]
@@ -1550,7 +1550,7 @@ void test_monitor_completions_escape_cpu_bound_owner() {
     auto* const scheduler = &runtime.scheduler();
 
     auto bind_on_busy_worker =
-        [scheduler]() -> cio::Task<cio::Result<InspectableUdpSocket>> {
+        [scheduler]() -> cio::Task<cio::Result<InspectableUdpConn>> {
         co_await SwitchToWorker{scheduler, kBusyWorker};
         co_return bind_inspectable_udp();
     };
@@ -1667,27 +1667,27 @@ void test_monitor_completions_escape_cpu_bound_owner() {
 
 void test_udp_round_trip() {
     auto body = []() -> cio::Task<std::string> {
-        auto server = net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+        auto server = net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(server.has_value());
         const auto server_addr = server->local_addr().value();
 
-        auto client = net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+        auto client = net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(client.has_value());
 
-        auto echo = cio::spawn([](net::UdpSocket s) -> cio::Task<std::string> {
+        auto echo = cio::spawn([](net::UdpConn s) -> cio::Task<std::string> {
             std::byte buffer[256];
             net::SocketAddr from;
-            auto n = co_await s.recv_from(buffer, from);
+            auto n = co_await s.read_from(buffer, from);
             if (!n) co_return "";
-            co_await s.send_to(std::span(buffer, *n), from);
+            co_await s.write_to(std::span(buffer, *n), from);
             co_return std::string(reinterpret_cast<const char*>(buffer), *n);
         }(std::move(*server)));
 
-        co_await client->send_to(bytes_of("udp hello"), server_addr);
+        co_await client->write_to(bytes_of("udp hello"), server_addr);
 
         std::byte buffer[256];
         net::SocketAddr from;
-        auto n = co_await client->recv_from(buffer, from);
+        auto n = co_await client->read_from(buffer, from);
         CIO_CHECK(n.has_value());
         co_await echo;
         co_return std::string(reinterpret_cast<const char*>(buffer), n.value_or(0));
@@ -1698,8 +1698,8 @@ void test_udp_round_trip() {
 constexpr auto kCrossRuntimeWatchdog = 300ms;
 constexpr auto kCrossRuntimePromptRead = 200ms;
 
-cio::Task<cio::Result<net::UdpSocket>> bind_loopback_udp() {
-    co_return net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+cio::Task<cio::Result<net::UdpConn>> bind_loopback_udp() {
+    co_return net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
 }
 
 cio::Task<> open_cross_runtime_send_gate(std::atomic<bool>* gate) {
@@ -1714,13 +1714,13 @@ cio::Task<bool> send_after_gate(std::atomic<bool>* gate, net::SocketAddr target)
 
     // Leave B ample time to return from the gate task to a blocking epoll wait.
     co_await cio::sleep(40ms);
-    auto sender = net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+    auto sender = net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
     if (!sender) co_return false;
-    auto sent = co_await sender->send_to(bytes_of("wake"), target);
+    auto sent = co_await sender->write_to(bytes_of("wake"), target);
     co_return sent.has_value() && *sent == 4;
 }
 
-cio::Task<bool> close_on_watchdog(net::UdpSocket* receiver,
+cio::Task<bool> close_on_watchdog(net::UdpConn* receiver,
                                   std::atomic<bool>* read_done) {
     co_await cio::sleep(kCrossRuntimeWatchdog);
     if (read_done->load(std::memory_order_acquire)) co_return false;
@@ -1740,17 +1740,17 @@ struct CrossRuntimeReadObservation {
 };
 
 cio::Task<CrossRuntimeReadObservation> read_a_socket_on_b(
-    net::UdpSocket* receiver, std::atomic<bool>* send_gate,
+    net::UdpConn* receiver, std::atomic<bool>* send_gate,
     std::atomic<bool>* read_done) {
     // Both helpers are B-local. FIFO scheduling starts the watchdog first,
-    // then the gate; neither can execute until recv_from has really suspended.
+    // then the gate; neither can execute until read_from has really suspended.
     auto watchdog = cio::spawn(close_on_watchdog(receiver, read_done));
     auto gate = cio::spawn(open_cross_runtime_send_gate(send_gate));
 
     std::byte buffer[16];
     net::SocketAddr from;
     const auto started = cio::Clock::now();
-    auto received = co_await receiver->recv_from(buffer, from);
+    auto received = co_await receiver->read_from(buffer, from);
     const auto elapsed = cio::Clock::now() - started;
     read_done->store(true, std::memory_order_release);
 
@@ -1768,7 +1768,7 @@ cio::Task<CrossRuntimeReadObservation> read_a_socket_on_b(
 }
 
 cio::Task<bool> join_sender_and_close(cio::JoinHandle<bool> sender,
-                                      net::UdpSocket* receiver) {
+                                      net::UdpConn* receiver) {
     const bool sent = co_await sender;
     receiver->close();
     co_return sent;
@@ -1810,7 +1810,7 @@ void test_foreign_reactor_readiness_wakes_awaiting_runtime() {
 
 cio::Task<net::TcpListener> return_open_listener() {
     auto listener =
-        net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
     CIO_CHECK(listener.has_value());
     co_return std::move(listener).value();
 }
@@ -1850,7 +1850,7 @@ void test_readiness_ignores_destroyed_target_runtime() {
     CIO_CHECK(open_nonblocking_socket_pair(fds));
     if (fds[0] < 0 || fds[1] < 0) return;
 
-    InspectableTcpStream stream;
+    InspectableTcpConn stream;
     const bool adopted = source.block_on(
         [&stream, fd = fds[0]]() -> cio::Task<bool> {
             co_return stream.adopt_for_test(fd).has_value();
@@ -1887,7 +1887,7 @@ void test_readiness_ignores_destroyed_target_runtime() {
 }
 
 cio::Task<> read_until_closed_while_source_stops(
-    InspectableTcpStream* stream,
+    InspectableTcpConn* stream,
     std::atomic<bool>* entered,
     std::atomic<bool>* resumed,
     std::atomic<int>* error) {
@@ -1922,7 +1922,7 @@ void test_parked_io_retains_source_reactor_after_socket_replacement() {
     CIO_CHECK(open_nonblocking_socket_pair(fds));
     if (fds[0] < 0 || fds[1] < 0) return;
 
-    InspectableTcpStream stream;
+    InspectableTcpConn stream;
     const bool adopted = source->block_on(
         [&stream, fd = fds[0]]() -> cio::Task<bool> {
             co_return stream.adopt_for_test(fd).has_value();
@@ -1978,7 +1978,7 @@ void test_parked_io_retains_source_reactor_after_socket_replacement() {
     // lifetime reference. IoAwaiter must independently retain the Reactor
     // until its destructor releases the descriptor reference.
     stream.close();
-    stream = InspectableTcpStream{};
+    stream = InspectableTcpConn{};
     CIO_CHECK(!read_resumed.load(std::memory_order_acquire));
 
     release_hog.store(true, std::memory_order_release);
@@ -1995,7 +1995,7 @@ void test_parked_io_retains_source_reactor_after_socket_replacement() {
 }
 
 cio::Task<> close_after_successful_read_checkpoint(
-    InspectableTcpStream* stream,
+    InspectableTcpConn* stream,
     cio::detail::IoDesc* desc,
     std::atomic<bool>* lease_was_released,
     std::atomic<bool>* closed) {
@@ -2014,7 +2014,7 @@ cio::Task<bool> successful_read_checkpoint_body(
     int fd,
     std::atomic<bool>* lease_was_released,
     std::atomic<bool>* closed) {
-    InspectableTcpStream stream;
+    InspectableTcpConn stream;
     auto adopted =
         stream.adopt_for_test(fd);
     if (!adopted) co_return false;
@@ -2100,7 +2100,7 @@ cio::Task<> hold_checkpoint_owner_until_parent_escapes(
 cio::Task<bool>
 successful_read_checkpoint_publication_body(
     int fd, int cycles) {
-    InspectableTcpStream stream;
+    InspectableTcpConn stream;
     auto adopted = stream.adopt_for_test(fd);
     if (!adopted) co_return false;
 
@@ -2226,6 +2226,17 @@ void test_resolver_cancelled_before_submit() {
         cio::CancelSource stop;
         stop.cancel();
 
+        // Both backends must refuse an already-cancelled token identically.
+        for (const bool builtin : {false, true}) {
+            net::LookupOptions options;
+            options.prefer_builtin = builtin;
+            net::Resolver backend{options};
+            auto refused =
+                co_await backend.lookup_host("localhost", 80, stop.token());
+            CIO_CHECK(!refused.has_value());
+            CIO_CHECK(refused.error().is(cio::Errc::cancelled));
+        }
+
         net::Resolver resolver;
         auto cancelled =
             co_await resolver.lookup_host("localhost", 80, stop.token());
@@ -2278,7 +2289,12 @@ void test_cancelled_lookup_leaves_nothing_at_shutdown() {
             co_await occupied.recv();
 
             cio::CancelSource stop;
-            net::Resolver resolver;
+            // Pinned to the system backend: this test is about its detached
+            // job and its admission queue, neither of which the built-in
+            // resolver has.
+            net::LookupOptions options;
+            options.prefer_builtin = false;
+            net::Resolver resolver{options};
             auto queued = cio::spawn(
                 [](net::Resolver r, cio::CancelToken token)
                     -> cio::Task<bool> {
@@ -2335,7 +2351,7 @@ void test_connect_cancellation_resumes_caller() {
 
         const auto started = cio::Clock::now();
         auto cancelled =
-            co_await net::TcpStream::connect(unreachable, stop.token());
+            co_await net::TcpConn::dial(unreachable, stop.token());
         const auto elapsed = cio::Clock::now() - started;
         co_await canceller;
 
@@ -2353,7 +2369,7 @@ void test_connect_cancelled_before_start() {
     auto body = []() -> cio::Task<bool> {
         cio::CancelSource stop;
         stop.cancel();
-        auto cancelled = co_await net::TcpStream::connect(
+        auto cancelled = co_await net::TcpConn::dial(
             net::SocketAddr::loopback_v4(9), stop.token());
         CIO_CHECK(!cancelled.has_value());
         CIO_CHECK(cancelled.error().is(cio::Errc::cancelled));
@@ -2366,7 +2382,7 @@ void test_connect_cancelled_before_start() {
 // its overall timeout when every address is silent.
 void test_dialer_connects_and_times_out() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->local_addr().value();
 
@@ -2402,7 +2418,7 @@ void test_dialer_connects_and_times_out() {
 // stagger rather than after the first address exhausts the kernel's retries.
 void test_dialer_races_past_a_silent_address() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->local_addr().value();
 
@@ -2508,8 +2524,8 @@ struct MemoryStream {
 
 static_assert(cio::AsyncReader<MemoryStream>);
 static_assert(cio::AsyncWriter<MemoryStream>);
-static_assert(cio::AsyncReader<net::TcpStream>);
-static_assert(cio::AsyncWriter<net::TcpStream>);
+static_assert(cio::AsyncReader<net::TcpConn>);
+static_assert(cio::AsyncWriter<net::TcpConn>);
 
 void test_stream_algorithms_over_short_io() {
     auto body = []() -> cio::Task<bool> {
@@ -2552,7 +2568,7 @@ void test_stream_algorithms_over_short_io() {
 // The same free functions over a real socket pair.
 void test_stream_algorithms_over_tcp() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->local_addr().value();
 
@@ -2567,7 +2583,7 @@ void test_stream_algorithms_over_tcp() {
                                   buffer.size());
         }(std::move(*listener)));
 
-        auto client = co_await net::TcpStream::connect(addr);
+        auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
         auto sent = co_await cio::write_all(*client, bytes_of("hello world"));
         CIO_CHECK(sent.has_value());
@@ -2610,7 +2626,7 @@ void test_invalid_socket_operations_return_ebadf() {
         std::byte buffer[16];
         net::SocketAddr from;
 
-        net::TcpStream stream;
+        net::TcpConn stream;
         auto read = co_await stream.read(buffer);
         auto write = co_await stream.write(bytes_of("x"));
         auto readable = co_await stream.readable();
@@ -2633,9 +2649,9 @@ void test_invalid_socket_operations_return_ebadf() {
         listener.set_deadline(cio::Clock::now());
         listener.clear_deadline();
 
-        net::UdpSocket udp;
-        auto received = co_await udp.recv_from(buffer, from);
-        auto sent = co_await udp.send_to(bytes_of("x"), net::SocketAddr::loopback_v4(9));
+        net::UdpConn udp;
+        auto received = co_await udp.read_from(buffer, from);
+        auto sent = co_await udp.write_to(bytes_of("x"), net::SocketAddr::loopback_v4(9));
         CIO_CHECK(!received && received.error().is(EBADF));
         CIO_CHECK(!sent && sent.error().is(EBADF));
         udp.set_read_deadline(cio::Clock::now());

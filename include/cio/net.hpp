@@ -1,6 +1,6 @@
 // Async TCP/UDP.
 //
-//     auto listener = cio::net::TcpListener::bind(cio::net::SocketAddr::any_v4(8080)).value();
+//     auto listener = cio::net::TcpListener::listen(cio::net::SocketAddr::any_v4(8080)).value();
 //     for (;;) {
 //         auto conn = co_await listener.accept();
 //         if (!conn) break;
@@ -74,18 +74,19 @@ enum class AddressFamily {
 
 struct LookupOptions {
     AddressFamily family = AddressFamily::any;
-    // Use cio's built-in DNS resolver instead of the system one, mirroring
-    // Go's Resolver.PreferGo.
+    // Use cio's built-in DNS resolver rather than getaddrinfo(), mirroring
+    // Go's Resolver.PreferGo — and defaulting the same way Go does on Unix,
+    // for the reason Go gives: a blocked DNS query costs one task, while a
+    // blocked C call costs an operating system thread.
     //
     // The built-in resolver speaks DNS over the runtime's own sockets and
-    // honours /etc/hosts: a lookup is cancellable mid-flight and occupies no
-    // blocking-pool thread. It does not consult NSS, so a machine resolving
-    // names through LDAP, NIS or mDNS needs the system resolver.
+    // honours /etc/hosts, so a lookup is cancellable mid-flight and occupies no
+    // blocking-pool thread.
     //
-    // Go defaults this on for Unix; cio defaults it off, because flipping the
-    // resolution backend under an existing program is not something a minor
-    // release should do silently.
-    bool prefer_builtin = false;
+    // Set this false on a machine that resolves names through NSS modules the
+    // built-in resolver cannot see — LDAP, NIS, mDNS — or whenever answers must
+    // agree with `getent hosts`.
+    bool prefer_builtin = true;
 };
 
 // Name resolution runs on the blocking pool: getaddrinfo has no async form, and
@@ -153,7 +154,7 @@ public:
     void close();
 
     Result<SocketAddr> local_addr() const;
-    Result<SocketAddr> peer_addr() const;
+    Result<SocketAddr> remote_addr() const;
 
     // Binds a cancellation signal to this socket.
     //
@@ -198,18 +199,18 @@ protected:
     CancelToken cancel_token_;
 };
 
-class TcpStream : public Socket {
+class TcpConn : public Socket {
 public:
-    TcpStream() = default;
+    TcpConn() = default;
 
     // Already-resolved connect. With a cancel token, a cancellation resumes the
     // caller with Errc::cancelled; the abandoned socket is closed once its
     // connect settles, so no descriptor is leaked.
-    static Task<Result<TcpStream>> connect(SocketAddr addr);
-    static Task<Result<TcpStream>> connect(SocketAddr addr, CancelToken cancel);
+    static Task<Result<TcpConn>> dial(SocketAddr addr);
+    static Task<Result<TcpConn>> dial(SocketAddr addr, CancelToken cancel);
     // Convenience: resolves through a default Dialer.
-    static Task<Result<TcpStream>> connect(std::string host, std::uint16_t port);
-    static Task<Result<TcpStream>> connect(std::string host, std::uint16_t port,
+    static Task<Result<TcpConn>> dial(std::string host, std::uint16_t port);
+    static Task<Result<TcpConn>> dial(std::string host, std::uint16_t port,
                                            CancelToken cancel);
 
     // Reads whatever is available. 0 means the peer closed cleanly (EOF).
@@ -244,7 +245,7 @@ public:
     void clear_write_deadline();
 
     Result<void> set_nodelay(bool on);
-    Result<void> shutdown_write();
+    Result<void> close_write();
 
 private:
     friend class TcpListener;
@@ -252,19 +253,19 @@ private:
     // Shared by both connect() overloads. begin_connect() creates, connects and
     // adopts the socket, reporting whether it completed without parking;
     // await_connect() runs the writability/SO_ERROR loop.
-    static Result<bool> begin_connect(SocketAddr addr, TcpStream& stream);
-    static Task<Result<void>> await_connect(TcpStream& stream);
+    static Result<bool> begin_connect(SocketAddr addr, TcpConn& stream);
+    static Task<Result<void>> await_connect(TcpConn& stream);
 };
 
 class TcpListener : public Socket {
 public:
     TcpListener() = default;
 
-    static Result<TcpListener> bind(SocketAddr addr, int backlog = 1024);
-    static Result<TcpListener> bind(std::string_view host, std::uint16_t port,
+    static Result<TcpListener> listen(SocketAddr addr, int backlog = 1024);
+    static Result<TcpListener> listen(std::string_view host, std::uint16_t port,
                                     int backlog = 1024);
 
-    Task<Result<TcpStream>> accept();
+    Task<Result<TcpConn>> accept();
 
     void set_deadline(TimePoint deadline);
     void clear_deadline();
@@ -280,10 +281,10 @@ struct DialOptions {
     AddressFamily family = AddressFamily::any;
     // Resolution backend for this dialer, mirroring Go's Dialer.Resolver.
     // See LookupOptions::prefer_builtin.
-    bool prefer_builtin_resolver = false;
+    bool prefer_builtin_resolver = true;
 };
 
-// Name resolution and address selection live here, not on TcpStream.
+// Name resolution and address selection live here, not on TcpConn.
 //
 // Addresses are tried with the families interleaved (v6, v4, v6, ...) rather
 // than exhausting one family before starting the other, so a host whose IPv6
@@ -295,7 +296,7 @@ public:
     Dialer() = default;
     explicit Dialer(DialOptions options) noexcept : options_(options) {}
 
-    Task<Result<TcpStream>> dial_tcp(std::string host, std::uint16_t port,
+    Task<Result<TcpConn>> dial_tcp(std::string host, std::uint16_t port,
                                      CancelToken cancel = {}) const;
 
     const DialOptions& options() const noexcept { return options_; }
@@ -305,20 +306,20 @@ private:
 };
 
 // Delegates to a default-constructed Dialer.
-Task<Result<TcpStream>> dial_tcp(std::string host, std::uint16_t port,
+Task<Result<TcpConn>> dial_tcp(std::string host, std::uint16_t port,
                                  CancelToken cancel = {});
 
-class UdpSocket : public Socket {
+class UdpConn : public Socket {
 public:
-    UdpSocket() = default;
+    UdpConn() = default;
 
-    static Result<UdpSocket> bind(SocketAddr addr);
+    static Result<UdpConn> listen(SocketAddr addr);
 
-    Task<Result<std::size_t>> recv_from(std::span<std::byte> buffer, SocketAddr& from);
-    Task<Result<std::size_t>> send_to(std::span<const std::byte> buffer,
+    Task<Result<std::size_t>> read_from(std::span<std::byte> buffer, SocketAddr& from);
+    Task<Result<std::size_t>> write_to(std::span<const std::byte> buffer,
                                       const SocketAddr& to);
 
-    // Same deadline rules as TcpStream.
+    // Same deadline rules as TcpConn.
     void set_deadline(TimePoint deadline);
     void set_read_deadline(TimePoint deadline);
     void set_write_deadline(TimePoint deadline);

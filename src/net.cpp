@@ -815,7 +815,7 @@ Result<SocketAddr> Socket::local_addr() const {
     return SocketAddr::from_raw(&storage, length);
 }
 
-Result<SocketAddr> Socket::peer_addr() const {
+Result<SocketAddr> Socket::remote_addr() const {
     if (fd_ < 0) return Error{EBADF};
     sockaddr_storage storage{};
     socklen_t length = sizeof(storage);
@@ -825,12 +825,12 @@ Result<SocketAddr> Socket::peer_addr() const {
     return SocketAddr::from_raw(&storage, length);
 }
 
-// ------------------------------------------------------------- TcpStream ---
+// ------------------------------------------------------------- TcpConn ---
 
 // The try_* forms always attempt the syscall — a caller asking to "try" wants
 // an attempt — but they keep the readiness hint coherent so that mixing them
 // with the awaiting forms does not confuse it.
-Result<std::size_t> TcpStream::try_read(std::span<std::byte> buffer) {
+Result<std::size_t> TcpConn::try_read(std::span<std::byte> buffer) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) return operation.error;
 
@@ -853,7 +853,7 @@ Result<std::size_t> TcpStream::try_read(std::span<std::byte> buffer) {
     return Error{syscall_error};
 }
 
-Result<std::size_t> TcpStream::try_write(std::span<const std::byte> buffer) {
+Result<std::size_t> TcpConn::try_write(std::span<const std::byte> buffer) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) return operation.error;
 
@@ -878,21 +878,21 @@ Result<std::size_t> TcpStream::try_write(std::span<const std::byte> buffer) {
     return Error{syscall_error};
 }
 
-Task<Result<std::size_t>> TcpStream::read(std::span<std::byte> buffer) {
+Task<Result<std::size_t>> TcpConn::read(std::span<std::byte> buffer) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
     co_return co_await tcp_read_some(
         operation.desc, operation.generation, buffer);
 }
 
-Task<Result<std::size_t>> TcpStream::write(std::span<const std::byte> buffer) {
+Task<Result<std::size_t>> TcpConn::write(std::span<const std::byte> buffer) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
     co_return co_await tcp_write_some(
         operation.desc, operation.generation, buffer);
 }
 
-Task<Result<void>> TcpStream::write_all(std::span<const std::byte> buffer) {
+Task<Result<void>> TcpConn::write_all(std::span<const std::byte> buffer) {
     // One immutable descriptor incarnation for the whole logical operation:
     // close() may update the Socket fields while this coroutine is parked, so
     // a partial write must not re-read them on its next chunk.
@@ -909,7 +909,7 @@ Task<Result<void>> TcpStream::write_all(std::span<const std::byte> buffer) {
     co_return ok();
 }
 
-Result<bool> TcpStream::begin_connect(SocketAddr addr, TcpStream& stream) {
+Result<bool> TcpConn::begin_connect(SocketAddr addr, TcpConn& stream) {
     if (!addr.valid()) return Error{EINVAL};
 
     const int fd = ::socket(addr.family(), SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -935,7 +935,7 @@ Result<bool> TcpStream::begin_connect(SocketAddr addr, TcpStream& stream) {
     return connect_result == 0;
 }
 
-Task<Result<void>> TcpStream::await_connect(TcpStream& stream) {
+Task<Result<void>> TcpConn::await_connect(TcpConn& stream) {
     const std::uint32_t generation =
         stream.desc_->generation.load(std::memory_order_acquire);
 
@@ -976,8 +976,8 @@ Task<Result<void>> TcpStream::await_connect(TcpStream& stream) {
     }
 }
 
-Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr) {
-    TcpStream stream;
+Task<Result<TcpConn>> TcpConn::dial(SocketAddr addr) {
+    TcpConn stream;
     auto started = begin_connect(addr, stream);
     if (!started) co_return started.error();
     if (*started) co_return std::move(stream);
@@ -988,8 +988,9 @@ Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr) {
     co_return std::move(stream);
 }
 
-Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr, CancelToken cancel) {
-    if (!cancel) co_return co_await connect(addr);
+Task<Result<TcpConn>> TcpConn::dial(SocketAddr addr, CancelToken cancel) {
+    // Qualified: an unqualified connect() now finds the ::connect syscall.
+    if (!cancel) co_return co_await TcpConn::dial(addr);
     if (cancel.cancelled()) co_return Error{Errc::cancelled};
 
     // Cancellation closes the socket rather than merely abandoning the wait.
@@ -1004,7 +1005,7 @@ Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr, CancelToken cancel) 
     // watcher and the connect both finish at cancellation time. The stream is
     // shared because the watcher runs concurrently with the connect; close() is
     // documented to be safe against a parked reader or writer.
-    auto stream = std::make_shared<TcpStream>();
+    auto stream = std::make_shared<TcpConn>();
     auto started = begin_connect(addr, *stream);
     if (!started) co_return started.error();
     if (*started) co_return std::move(*stream);
@@ -1012,7 +1013,7 @@ Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr, CancelToken cancel) 
     // Closed on every exit path to release the watcher when no cancellation
     // arrived; recv() on a closed channel completes rather than parking.
     auto settled = make_chan<Unit>(1);
-    auto watcher = spawn([](std::shared_ptr<TcpStream> target, CancelToken token,
+    auto watcher = spawn([](std::shared_ptr<TcpConn> target, CancelToken token,
                             Chan<Unit> done) -> Task<bool> {
         auto selected = cio::select(cio::recv(token.done()), cio::recv(done));
         const bool cancelled = (co_await selected) == 0;
@@ -1031,11 +1032,11 @@ Task<Result<TcpStream>> TcpStream::connect(SocketAddr addr, CancelToken cancel) 
     co_return std::move(*stream);
 }
 
-Task<Result<TcpStream>> TcpStream::connect(std::string host, std::uint16_t port) {
+Task<Result<TcpConn>> TcpConn::dial(std::string host, std::uint16_t port) {
     co_return co_await Dialer{}.dial_tcp(std::move(host), port);
 }
 
-Task<Result<TcpStream>> TcpStream::connect(std::string host, std::uint16_t port,
+Task<Result<TcpConn>> TcpConn::dial(std::string host, std::uint16_t port,
                                            CancelToken cancel) {
     co_return co_await Dialer{}.dial_tcp(std::move(host), port,
                                          std::move(cancel));
@@ -1075,7 +1076,7 @@ std::vector<SocketAddr> interleave_families(
 
 }  // namespace
 
-Task<Result<TcpStream>> Dialer::dial_tcp(std::string host, std::uint16_t port,
+Task<Result<TcpConn>> Dialer::dial_tcp(std::string host, std::uint16_t port,
                                          CancelToken cancel) const {
     if (cancel && cancel.cancelled()) co_return Error{Errc::cancelled};
 
@@ -1108,7 +1109,7 @@ Task<Result<TcpStream>> Dialer::dial_tcp(std::string host, std::uint16_t port,
     // is detached — an attempt outliving the dial would leak its frame if the
     // runtime shut down while it was parked on a socket.
     CancelSource stop;
-    auto results = make_chan<Result<TcpStream>>(targets.size());
+    auto results = make_chan<Result<TcpConn>>(targets.size());
 
     // One watcher maps the caller's token onto the shared attempt source, so
     // the racing loop never has to special-case an absent token.
@@ -1125,8 +1126,8 @@ Task<Result<TcpStream>> Dialer::dial_tcp(std::string host, std::uint16_t port,
     std::vector<JoinHandle<void>> attempts;
     attempts.reserve(targets.size());
 
-    Result<TcpStream> winner = Error{EHOSTUNREACH};
-    Result<TcpStream> last = Error{EHOSTUNREACH};
+    Result<TcpConn> winner = Error{EHOSTUNREACH};
+    Result<TcpConn> last = Error{EHOSTUNREACH};
     std::size_t started = 0;
     std::size_t finished = 0;
 
@@ -1134,8 +1135,8 @@ Task<Result<TcpStream>> Dialer::dial_tcp(std::string host, std::uint16_t port,
         if (started < targets.size()) {
             attempts.push_back(spawn(
                 [](SocketAddr target, CancelToken attempt_cancel,
-                   Chan<Result<TcpStream>> out) -> Task<void> {
-                    auto stream = co_await TcpStream::connect(
+                   Chan<Result<TcpConn>> out) -> Task<void> {
+                    auto stream = co_await TcpConn::dial(
                         target, std::move(attempt_cancel));
                     co_await out.send(std::move(stream));
                 }(targets[started], stop.token(), results)));
@@ -1144,7 +1145,7 @@ Task<Result<TcpStream>> Dialer::dial_tcp(std::string host, std::uint16_t port,
 
         // While addresses remain, a result and the stagger tick race; once all
         // are running only the overall deadline can end the wait early.
-        std::optional<Result<TcpStream>> received;
+        std::optional<Result<TcpConn>> received;
         if (started < targets.size()) {
             if (has_overall_timeout) {
                 auto selected = cio::select(cio::recv(results),
@@ -1202,49 +1203,49 @@ Task<Result<TcpStream>> Dialer::dial_tcp(std::string host, std::uint16_t port,
     co_return last;
 }
 
-Task<Result<TcpStream>> dial_tcp(std::string host, std::uint16_t port,
+Task<Result<TcpConn>> dial_tcp(std::string host, std::uint16_t port,
                                  CancelToken cancel) {
     co_return co_await Dialer{}.dial_tcp(std::move(host), port,
                                          std::move(cancel));
 }
 
-void TcpStream::set_deadline(TimePoint deadline) {
+void TcpConn::set_deadline(TimePoint deadline) {
     apply_deadline(fd_, desc_, true, true, absolute_ns(deadline));
 }
 
-void TcpStream::set_read_deadline(TimePoint deadline) {
+void TcpConn::set_read_deadline(TimePoint deadline) {
     apply_deadline(fd_, desc_, true, false, absolute_ns(deadline));
 }
 
-void TcpStream::set_write_deadline(TimePoint deadline) {
+void TcpConn::set_write_deadline(TimePoint deadline) {
     apply_deadline(fd_, desc_, false, true, absolute_ns(deadline));
 }
 
-void TcpStream::set_timeout(Duration timeout) {
+void TcpConn::set_timeout(Duration timeout) {
     apply_deadline(fd_, desc_, true, true, deadline_from_now(timeout));
 }
 
-void TcpStream::set_read_timeout(Duration timeout) {
+void TcpConn::set_read_timeout(Duration timeout) {
     apply_deadline(fd_, desc_, true, false, deadline_from_now(timeout));
 }
 
-void TcpStream::set_write_timeout(Duration timeout) {
+void TcpConn::set_write_timeout(Duration timeout) {
     apply_deadline(fd_, desc_, false, true, deadline_from_now(timeout));
 }
 
-void TcpStream::clear_deadline() {
+void TcpConn::clear_deadline() {
     apply_deadline(fd_, desc_, true, true, 0);
 }
 
-void TcpStream::clear_read_deadline() {
+void TcpConn::clear_read_deadline() {
     apply_deadline(fd_, desc_, true, false, 0);
 }
 
-void TcpStream::clear_write_deadline() {
+void TcpConn::clear_write_deadline() {
     apply_deadline(fd_, desc_, false, true, 0);
 }
 
-Result<void> TcpStream::set_nodelay(bool on) {
+Result<void> TcpConn::set_nodelay(bool on) {
     const int value = on ? 1 : 0;
     if (::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value)) != 0) {
         return Error::from_errno();
@@ -1252,14 +1253,14 @@ Result<void> TcpStream::set_nodelay(bool on) {
     return ok();
 }
 
-Result<void> TcpStream::shutdown_write() {
+Result<void> TcpConn::close_write() {
     if (::shutdown(fd_, SHUT_WR) != 0) return Error::from_errno();
     return ok();
 }
 
 // ----------------------------------------------------------- TcpListener ---
 
-Result<TcpListener> TcpListener::bind(SocketAddr addr, int backlog) {
+Result<TcpListener> TcpListener::listen(SocketAddr addr, int backlog) {
     if (!addr.valid()) return Error{EINVAL};
 
     const int fd = ::socket(addr.family(), SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -1286,13 +1287,13 @@ Result<TcpListener> TcpListener::bind(SocketAddr addr, int backlog) {
     return listener;
 }
 
-Result<TcpListener> TcpListener::bind(std::string_view host, std::uint16_t port, int backlog) {
+Result<TcpListener> TcpListener::listen(std::string_view host, std::uint16_t port, int backlog) {
     auto addr = SocketAddr::parse(host, port);
     if (!addr) return addr.error();
-    return bind(*addr, backlog);
+    return TcpListener::listen(*addr, backlog);
 }
 
-Task<Result<TcpStream>> TcpListener::accept() {
+Task<Result<TcpConn>> TcpListener::accept() {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
 
@@ -1339,7 +1340,7 @@ Task<Result<TcpStream>> TcpListener::accept() {
                 const detail::WorkerId target = sched->choose_worker();
                 co_await SwitchWorker{*sched, target};
 
-                TcpStream stream;
+                TcpConn stream;
                 if (auto adopted =
                         stream.adopt(accepted.release(),
                                      /*already_nonblocking=*/true);
@@ -1376,9 +1377,9 @@ void TcpListener::clear_deadline() {
         operation.desc, detail::Dir::kRead, operation.generation, 0);
 }
 
-// ------------------------------------------------------------- UdpSocket ---
+// ------------------------------------------------------------- UdpConn ---
 
-Result<UdpSocket> UdpSocket::bind(SocketAddr addr) {
+Result<UdpConn> UdpConn::listen(SocketAddr addr) {
     if (!addr.valid()) return Error{EINVAL};
 
     const int fd = ::socket(addr.family(), SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -1390,14 +1391,14 @@ Result<UdpSocket> UdpSocket::bind(SocketAddr addr) {
         return err;
     }
 
-    UdpSocket socket;
+    UdpConn socket;
     if (auto adopted = socket.adopt(fd, /*already_nonblocking=*/true); !adopted) {
         return adopted.error();
     }
     return socket;
 }
 
-Task<Result<std::size_t>> UdpSocket::recv_from(std::span<std::byte> buffer, SocketAddr& from) {
+Task<Result<std::size_t>> UdpConn::read_from(std::span<std::byte> buffer, SocketAddr& from) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
 
@@ -1447,7 +1448,7 @@ Task<Result<std::size_t>> UdpSocket::recv_from(std::span<std::byte> buffer, Sock
     }
 }
 
-Task<Result<std::size_t>> UdpSocket::send_to(std::span<const std::byte> buffer,
+Task<Result<std::size_t>> UdpConn::write_to(std::span<const std::byte> buffer,
                                              const SocketAddr& to) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
@@ -1493,39 +1494,39 @@ Task<Result<std::size_t>> UdpSocket::send_to(std::span<const std::byte> buffer,
     }
 }
 
-void UdpSocket::set_deadline(TimePoint deadline) {
+void UdpConn::set_deadline(TimePoint deadline) {
     apply_deadline(fd_, desc_, true, true, absolute_ns(deadline));
 }
 
-void UdpSocket::set_read_deadline(TimePoint deadline) {
+void UdpConn::set_read_deadline(TimePoint deadline) {
     apply_deadline(fd_, desc_, true, false, absolute_ns(deadline));
 }
 
-void UdpSocket::set_write_deadline(TimePoint deadline) {
+void UdpConn::set_write_deadline(TimePoint deadline) {
     apply_deadline(fd_, desc_, false, true, absolute_ns(deadline));
 }
 
-void UdpSocket::set_timeout(Duration timeout) {
+void UdpConn::set_timeout(Duration timeout) {
     apply_deadline(fd_, desc_, true, true, deadline_from_now(timeout));
 }
 
-void UdpSocket::set_read_timeout(Duration timeout) {
+void UdpConn::set_read_timeout(Duration timeout) {
     apply_deadline(fd_, desc_, true, false, deadline_from_now(timeout));
 }
 
-void UdpSocket::set_write_timeout(Duration timeout) {
+void UdpConn::set_write_timeout(Duration timeout) {
     apply_deadline(fd_, desc_, false, true, deadline_from_now(timeout));
 }
 
-void UdpSocket::clear_deadline() {
+void UdpConn::clear_deadline() {
     apply_deadline(fd_, desc_, true, true, 0);
 }
 
-void UdpSocket::clear_read_deadline() {
+void UdpConn::clear_read_deadline() {
     apply_deadline(fd_, desc_, true, false, 0);
 }
 
-void UdpSocket::clear_write_deadline() {
+void UdpConn::clear_write_deadline() {
     apply_deadline(fd_, desc_, false, true, 0);
 }
 

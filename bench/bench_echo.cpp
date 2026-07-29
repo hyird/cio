@@ -28,7 +28,7 @@ namespace {
 
 constexpr std::size_t kPayload = 128;
 
-cio::Task<> serve(net::TcpStream stream) {
+cio::Task<> serve(net::TcpConn stream) {
     std::byte buffer[4096];
     for (;;) {
         auto n = co_await stream.read(buffer);
@@ -47,7 +47,7 @@ cio::Task<> accept_loop(net::TcpListener listener, cio::CancelToken token) {
 }
 
 cio::Task<long> client(net::SocketAddr target, long requests) {
-    auto stream = co_await net::TcpStream::connect(target);
+    auto stream = co_await net::TcpConn::dial(target);
     if (!stream) co_return 0;
     stream->set_nodelay(true);
 
@@ -72,7 +72,7 @@ cio::Task<long> client(net::SocketAddr target, long requests) {
 }
 
 cio::Task<long> run_benchmark(int connections, long requests) {
-    auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+    auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
     if (!listener) {
         std::fprintf(stderr, "bind failed: %s\n", listener.error().message().c_str());
         co_return 0;
@@ -106,7 +106,7 @@ cio::Task<long> run_benchmark(int connections, long requests) {
 }
 
 cio::Task<int> run_server(std::uint16_t port) {
-    auto listener = net::TcpListener::bind(net::SocketAddr::any_v4(port));
+    auto listener = net::TcpListener::listen(net::SocketAddr::any_v4(port));
     if (!listener) {
         std::fprintf(stderr, "bind failed: %s\n", listener.error().message().c_str());
         co_return 1;

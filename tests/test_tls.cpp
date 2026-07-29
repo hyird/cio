@@ -112,7 +112,7 @@ void test_handshake_and_round_trip() {
     CIO_CHECK(certificate.ready);
 
     auto body = [&certificate]() -> cio::Task<bool> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->local_addr().value();
 
@@ -122,7 +122,7 @@ void test_handshake_and_round_trip() {
                 auto conn = co_await l.accept();
                 if (!conn) co_return std::string{"accept failed"};
 
-                cio::tls::ServerConfig config;
+                cio::tls::Config config;
                 config.certificate_file = std::move(cert);
                 config.private_key_file = std::move(key);
                 auto stream = cio::tls::server(std::move(*conn), config);
@@ -147,10 +147,10 @@ void test_handshake_and_round_trip() {
             }(std::move(*listener), certificate.cert.get(),
               certificate.key.get()));
 
-        auto tcp = co_await net::TcpStream::connect(addr);
+        auto tcp = co_await net::TcpConn::dial(addr);
         CIO_CHECK(tcp.has_value());
 
-        cio::tls::ClientConfig config;
+        cio::tls::Config config;
         config.server_name = "localhost";
         config.ca_file = certificate.cert.get();  // trust our own CA
         auto stream = cio::tls::client(std::move(*tcp), config);
@@ -187,7 +187,7 @@ void test_verification_rejects_untrusted_certificate() {
     CIO_CHECK(certificate.ready);
 
     auto body = [&certificate]() -> cio::Task<bool> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->local_addr().value();
 
@@ -196,7 +196,7 @@ void test_verification_rejects_untrusted_certificate() {
                std::string key) -> cio::Task<> {
                 auto conn = co_await l.accept();
                 if (!conn) co_return;
-                cio::tls::ServerConfig config;
+                cio::tls::Config config;
                 config.certificate_file = std::move(cert);
                 config.private_key_file = std::move(key);
                 auto stream = cio::tls::server(std::move(*conn), config);
@@ -205,10 +205,10 @@ void test_verification_rejects_untrusted_certificate() {
             }(std::move(*listener), certificate.cert.get(),
               certificate.key.get()));
 
-        auto tcp = co_await net::TcpStream::connect(addr);
+        auto tcp = co_await net::TcpConn::dial(addr);
         CIO_CHECK(tcp.has_value());
 
-        cio::tls::ClientConfig config;
+        cio::tls::Config config;
         config.server_name = "localhost";
         config.verify_peer = true;  // system trust store; our cert is not in it
         auto stream = cio::tls::client(std::move(*tcp), config);
@@ -230,7 +230,7 @@ void test_large_transfer_spans_records() {
     CIO_CHECK(certificate.ready);
 
     auto body = [&certificate]() -> cio::Task<bool> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->local_addr().value();
 
@@ -241,7 +241,7 @@ void test_large_transfer_spans_records() {
                std::string key) -> cio::Task<bool> {
                 auto conn = co_await l.accept();
                 if (!conn) co_return false;
-                cio::tls::ServerConfig config;
+                cio::tls::Config config;
                 config.certificate_file = std::move(cert);
                 config.private_key_file = std::move(key);
                 auto stream = cio::tls::server(std::move(*conn), config);
@@ -257,10 +257,10 @@ void test_large_transfer_spans_records() {
             }(std::move(*listener), certificate.cert.get(),
               certificate.key.get()));
 
-        auto tcp = co_await net::TcpStream::connect(addr);
+        auto tcp = co_await net::TcpConn::dial(addr);
         CIO_CHECK(tcp.has_value());
 
-        cio::tls::ClientConfig config;
+        cio::tls::Config config;
         config.server_name = "localhost";
         config.ca_file = certificate.cert.get();
         auto stream = cio::tls::client(std::move(*tcp), config);

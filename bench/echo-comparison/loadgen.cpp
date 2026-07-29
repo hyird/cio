@@ -116,7 +116,7 @@ cio::Task<> connection(net::SocketAddr target, std::size_t payload, Histogram* h
     std::vector<std::byte> response(payload);
 
     while (!g_stop.load(std::memory_order_relaxed)) {
-        auto stream = co_await net::TcpStream::connect(target);
+        auto stream = co_await net::TcpConn::dial(target);
         if (!stream) {
             g_failed.fetch_add(1, std::memory_order_relaxed);
             co_await cio::sleep(std::chrono::milliseconds(1));

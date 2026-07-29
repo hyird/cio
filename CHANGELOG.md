@@ -7,7 +7,32 @@ releases; each change is listed.
 
 ## [0.1.0] — unreleased
 
-API-additive: every 0.0.1 program still compiles unchanged.
+### Changed — breaking
+
+The public API is now named the way Go names the same things, so a reader who
+knows `net`, `os` and `crypto/tls` can predict cio's spelling.
+
+| 0.0.1 | 0.1.0 | Go |
+|---|---|---|
+| `net::TcpStream` | `net::TcpConn` | `net.TCPConn` |
+| `net::UdpSocket` | `net::UdpConn` | `net.UDPConn` |
+| `TcpListener::bind()` | `TcpListener::listen()` | `net.ListenTCP` |
+| `UdpSocket::bind()` | `UdpConn::listen()` | `net.ListenUDP` |
+| `TcpStream::connect()` | `TcpConn::dial()` | `net.DialTCP` |
+| `Socket::peer_addr()` | `Socket::remote_addr()` | `Conn.RemoteAddr` |
+| `UdpSocket::recv_from()` | `UdpConn::read_from()` | `PacketConn.ReadFrom` |
+| `UdpSocket::send_to()` | `UdpConn::write_to()` | `PacketConn.WriteTo` |
+| `TcpStream::shutdown_write()` | `TcpConn::close_write()` | `TCPConn.CloseWrite` |
+| `fs::FileInfo::is_directory()` | `is_dir()` | `FileInfo.IsDir` |
+| `tls::ClientConfig` + `ServerConfig` | one `tls::Config` | `tls.Config` |
+
+Name resolution now defaults to the built-in DNS resolver rather than
+`getaddrinfo()`, matching Go's default on Unix and for the reason Go documents:
+a blocked DNS query costs one task, a blocked C call costs an OS thread. Set
+`LookupOptions::prefer_builtin` or `DialOptions::prefer_builtin_resolver` to
+false to get the previous behaviour, which is required on a machine that
+resolves names through NSS modules the built-in resolver cannot see — LDAP, NIS
+or mDNS — or wherever answers must agree with `getent hosts`.
 
 ### Added
 
@@ -16,17 +41,17 @@ API-additive: every 0.0.1 program still compiles unchanged.
   `Resolver`.
 - `cio::net::Dialer` with `DialOptions` (overall timeout, per-address
   `fallback_delay`, `nodelay`, family), plus the free `dial_tcp()`.
-  `TcpStream::connect(host, port)` now delegates to a default `Dialer`, which
+  `TcpConn::dial(host, port)` now delegates to a default `Dialer`, which
   interleaves IPv6 and IPv4 addresses instead of exhausting one family first.
-- `CancelToken` overloads for `TcpStream::connect()` and every resolver and
+- `CancelToken` overloads for `TcpConn::dial()` and every resolver and
   dialer entry point.
 - Combined socket deadlines: `set_deadline()`, `set_timeout()` and
-  `clear_deadline()` on `TcpStream` and `UdpSocket`. `UdpSocket` also gained
+  `clear_deadline()` on `TcpConn` and `UdpConn`. `UdpConn` also gained
   `set_read_timeout()`, `set_write_timeout()`, `clear_read_deadline()` and
   `clear_write_deadline()`, which it previously lacked entirely.
 - `cio/io.hpp`: `AsyncReader` and `AsyncWriter` concepts with generic
   `read_exact()`, `write_all()` and `copy()` free functions. The existing
-  `TcpStream::write_all()` member is unchanged.
+  `TcpConn::write_all()` member is unchanged.
 - Per-class blocking admission: `RuntimeOptions::max_file_operations` (32) and
   `max_resolver_operations` (8). Limits bound admitted operations rather than
   threads; a task awaiting admission parks without occupying a pool thread, and

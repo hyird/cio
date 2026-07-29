@@ -467,7 +467,8 @@ command.
 
 ### Neutral: the 0.1.0 I/O modules against v0.0.1
 
-The post-v0.0.1 round refactored `TcpStream::connect()` into
+The post-v0.0.1 round refactored `TcpStream::connect()` (now
+`TcpConn::dial()`) into
 `begin_connect()`/`await_connect()` and routed the by-name overload through
 `Dialer`, so the connect path changed shape. Everything else it added is new
 surface. This matrix confirms the established-connection path did not move.

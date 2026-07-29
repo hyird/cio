@@ -65,7 +65,7 @@ void test_create_write_read_roundtrip() {
         CIO_CHECK(info.has_value());
         CIO_CHECK_EQ(info->size, std::uint64_t{10});
         CIO_CHECK(info->is_regular());
-        CIO_CHECK(!info->is_directory());
+        CIO_CHECK(!info->is_dir());
 
         // Positioned reads do not disturb the shared offset.
         std::vector<std::byte> buffer(10);

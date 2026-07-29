@@ -179,12 +179,12 @@ void test_response_parsing_rejects_bad_messages() {
 
 // A minimal authoritative-ish stub that answers every A query with one address,
 // so the resolver can be tested end to end without touching the network.
-cio::Task<> stub_server(net::UdpSocket socket, cio::CancelToken quit) {
+cio::Task<> stub_server(net::UdpConn socket, cio::CancelToken quit) {
     std::vector<std::byte> buffer(4096);
     socket.set_cancel(quit);
     for (;;) {
         net::SocketAddr from;
-        auto n = co_await socket.recv_from(buffer, from);
+        auto n = co_await socket.read_from(buffer, from);
         if (!n) co_return;
 
         const std::span<const std::byte> query{buffer.data(), *n};
@@ -201,13 +201,13 @@ cio::Task<> stub_server(net::UdpSocket socket, cio::CancelToken quit) {
             reply[6] = std::byte{0};
             reply[7] = std::byte{0};
         }
-        if (auto sent = co_await socket.send_to(reply, from); !sent) co_return;
+        if (auto sent = co_await socket.write_to(reply, from); !sent) co_return;
     }
 }
 
 void test_lookup_against_a_stub_server() {
     auto body = []() -> cio::Task<bool> {
-        auto server = net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+        auto server = net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(server.has_value());
         const auto server_addr = server->local_addr().value();
 
@@ -246,7 +246,7 @@ void test_lookup_against_a_stub_server() {
 void test_lookup_times_out_without_a_server() {
     auto body = []() -> cio::Task<bool> {
         // Bound but never read from, so queries are silently dropped.
-        auto sink = net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+        auto sink = net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(sink.has_value());
 
         dns::Config config;
@@ -270,7 +270,7 @@ void test_lookup_times_out_without_a_server() {
 // of implementing DNS rather than calling getaddrinfo.
 void test_lookup_is_cancellable_mid_flight() {
     auto body = []() -> cio::Task<bool> {
-        auto sink = net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+        auto sink = net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(sink.has_value());
 
         dns::Config config;
@@ -332,7 +332,7 @@ void test_resolver_backend_selection() {
 void test_hosts_file_precedes_the_network() {
     auto body = []() -> cio::Task<bool> {
         // Point at a black hole: any answer must have come from /etc/hosts.
-        auto sink = net::UdpSocket::bind(net::SocketAddr::loopback_v4(0));
+        auto sink = net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(sink.has_value());
 
         dns::Config config;

@@ -57,7 +57,7 @@ struct FileInfo {
     FileTime modified{};
 
     bool is_regular() const noexcept;
-    bool is_directory() const noexcept;
+    bool is_dir() const noexcept;
 };
 
 class File {

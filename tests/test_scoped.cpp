@@ -21,21 +21,21 @@ std::span<const std::byte> bytes_of(std::string_view s) {
 
 // A connected pair, so a test can park a read that nothing will satisfy.
 struct Pair {
-    net::TcpStream client;
-    net::TcpStream server;
+    net::TcpConn client;
+    net::TcpConn server;
 };
 
 cio::Task<cio::Result<Pair>> make_pair() {
-    auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+    auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
     if (!listener) co_return listener.error();
     const auto addr = listener->local_addr().value();
 
-    auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpStream> {
+    auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
         auto conn = co_await l.accept();
-        co_return conn ? std::move(*conn) : net::TcpStream{};
+        co_return conn ? std::move(*conn) : net::TcpConn{};
     }(std::move(*listener)));
 
-    auto client = co_await net::TcpStream::connect(addr);
+    auto client = co_await net::TcpConn::dial(addr);
     if (!client) co_return client.error();
     auto server = co_await accepted;
     co_return Pair{std::move(*client), std::move(server)};
@@ -143,7 +143,7 @@ void test_cancel_rebind_and_clear() {
 // Accept is covered by the same mechanism, with no signature change.
 void test_cancel_covers_accept() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
 
         cio::CancelSource stop;
@@ -247,7 +247,7 @@ void test_timeout_scope_clears_when_none_was_set() {
 // setters. This is a compile-time path as much as a runtime one.
 void test_timeout_scope_on_a_listener() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
 
         const auto outer = cio::Clock::now() + 10s;
@@ -264,7 +264,7 @@ void test_timeout_scope_on_a_listener() {
         const auto addr = listener->local_addr().value();
         auto connecting = cio::spawn([](net::SocketAddr target)
                                          -> cio::Task<bool> {
-            auto conn = co_await net::TcpStream::connect(target);
+            auto conn = co_await net::TcpConn::dial(target);
             co_return conn.has_value();
         }(addr));
         auto accepted = co_await listener->accept();

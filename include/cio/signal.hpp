@@ -74,7 +74,7 @@ private:
     // deadline machinery that already exist for pollable descriptors. A
     // signalfd is not a socket, so this base is private and none of the socket
     // surface is re-exported.
-    class Descriptor : public net::TcpStream {
+    class Descriptor : public net::TcpConn {
     public:
         Result<void> adopt_signalfd(int fd) {
             // signalfd() already returned a non-blocking descriptor.

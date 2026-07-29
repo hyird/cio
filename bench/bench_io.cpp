@@ -74,7 +74,7 @@ std::vector<Sample> samples;
 
 // Refills the reader's socket buffer on request, so the measured loop only ever
 // hits the already-has-data path — which is what a busy server actually does.
-cio::Task<> feeder(net::TcpStream writer, cio::Chan<int> request, cio::Chan<int> ack) {
+cio::Task<> feeder(net::TcpConn writer, cio::Chan<int> request, cio::Chan<int> ack) {
     std::vector<std::byte> blob(kBlob, std::byte{0x41});
     while (auto req = co_await request.recv()) {
         if (!(co_await writer.write_all(blob))) break;
@@ -82,7 +82,7 @@ cio::Task<> feeder(net::TcpStream writer, cio::Chan<int> request, cio::Chan<int>
     }
 }
 
-cio::Task<> measure_awaited_read(net::TcpStream& reader, cio::Chan<int> request,
+cio::Task<> measure_awaited_read(net::TcpConn& reader, cio::Chan<int> request,
                                  cio::Chan<int> ack, long rounds) {
     std::byte buffer[kChunk];
     long operations = 0;
@@ -110,7 +110,7 @@ cio::Task<> measure_awaited_read(net::TcpStream& reader, cio::Chan<int> request,
                        static_cast<double>(allocations) / static_cast<double>(operations)});
 }
 
-cio::Task<> measure_try_read(net::TcpStream& reader, cio::Chan<int> request, cio::Chan<int> ack,
+cio::Task<> measure_try_read(net::TcpConn& reader, cio::Chan<int> request, cio::Chan<int> ack,
                              long rounds) {
     std::byte buffer[kChunk];
     long operations = 0;
@@ -210,16 +210,16 @@ cio::Task<> measure_sequential_spawn_join(long count) {
 }
 
 cio::Task<int> run(long rounds) {
-    auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+    auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
     if (!listener) co_return 1;
     const auto addr = listener->local_addr().value();
 
-    auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpStream> {
+    auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
         auto conn = co_await l.accept();
         co_return std::move(conn.value());
     }(std::move(*listener)));
 
-    auto client = co_await net::TcpStream::connect(addr);
+    auto client = co_await net::TcpConn::dial(addr);
     if (!client) co_return 1;
     auto server = co_await accepted;
 

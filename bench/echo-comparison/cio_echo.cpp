@@ -83,7 +83,7 @@ inline void burn_microseconds(unsigned us) {
     }
 }
 
-cio::Task<> serve(net::TcpStream stream) {
+cio::Task<> serve(net::TcpConn stream) {
     // Read before the first suspension: this is the shard accept() placed us on.
     const unsigned shard = current_shard();
     ShardStats* const stats =
@@ -121,7 +121,7 @@ cio::Task<> accept_loop(net::TcpListener listener) {
 }
 
 cio::Task<int> run(std::uint16_t port) {
-    auto listener = net::TcpListener::bind(net::SocketAddr::any_v4(port));
+    auto listener = net::TcpListener::listen(net::SocketAddr::any_v4(port));
     if (!listener) {
         std::fprintf(stderr, "bind failed: %s\n", listener.error().message().c_str());
         co_return 1;

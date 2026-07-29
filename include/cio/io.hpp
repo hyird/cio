@@ -5,7 +5,7 @@
 //
 // These are constrained free functions, not members of a virtual Conn base
 // class: a protocol library can accept any type that reads and writes bytes —
-// a TcpStream, a TLS stream, a test double — without either side inheriting
+// a TcpConn, a TLS stream, a test double — without either side inheriting
 // from a common runtime-polymorphic type, and without the concrete socket fast
 // path paying for a vtable.
 //

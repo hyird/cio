@@ -113,7 +113,7 @@ releasable and must be taken in order.
 | 1. Blocking admission | Global FIFO bound, `Errc::overloaded` rejection, shutdown rejection | **Done.** Per-class admission with independent wait queues; a task waiting for admission parks without occupying a pool thread, and admission waiters are completed with `Errc::shutdown` when the pool stops. |
 | 2. Resolver and dialer | `Resolver`, `Dialer`, connect cancellation, combined deadlines | **Done**, including concurrent attempt racing. |
 | 3. Files | `cio::fs::File`, positioned I/O, sync, stat, truncate, file-class admission | **Done.** `cio/fs.hpp`; no cancellation or deadline, by design. |
-| 4. Generic stream algorithms | `AsyncReader`/`AsyncWriter` concepts, `read_exact()`, `copy()` | **Done.** `cio/io.hpp`; the `TcpStream::write_all()` member is retained alongside the free function. |
+| 4. Generic stream algorithms | `AsyncReader`/`AsyncWriter` concepts, `read_exact()`, `copy()` | **Done.** `cio/io.hpp`; the `TcpConn::write_all()` member is retained alongside the free function. |
 | 5. Optional TLS and signal modules | `cio::tls` on OpenSSL; `signalfd`-based signals with a startup contract | **Done.** Signals ship in the core (`cio/signal.hpp`, no new dependency); TLS is the optional `cio::tls` target behind `-DCIO_TLS=ON`. |
 
 Every stage is now implemented. What remains within this plan is breadth rather

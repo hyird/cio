@@ -1,6 +1,6 @@
 // TLS over an existing stream.
 //
-//     auto tcp = co_await cio::net::TcpStream::connect("example.com", 443);
+//     auto tcp = co_await cio::net::TcpConn::dial("example.com", 443);
 //     auto stream = cio::tls::client(std::move(*tcp), {.server_name = "example.com"});
 //     co_await stream.handshake();
 //     co_await cio::write_all(stream, request);
@@ -10,7 +10,7 @@
 //
 // TlsStream satisfies the AsyncReader/AsyncWriter concepts, so read_exact(),
 // write_all() and copy() work on it unchanged. OpenSSL's WANT_READ/WANT_WRITE
-// are translated into waits on the underlying TcpStream; the record layer means
+// are translated into waits on the underlying TcpConn; the record layer means
 // one application-level read may drive several socket reads and vice versa.
 //
 // OWNERSHIP: move-only, and the same one-reader/one-writer rule as the
@@ -31,20 +31,24 @@
 
 namespace cio::tls {
 
-struct ClientConfig {
+// One configuration for both roles, as Go's tls.Config is. Which fields matter
+// depends on the role: a client reads server_name, verify_peer and ca_file, a
+// server reads certificate_file and private_key_file.
+struct Config {
     // SNI and certificate hostname to verify against. Empty disables both,
     // which is only appropriate when the peer is identified some other way.
+    // Client only.
     std::string server_name;
     // Verification is on by default; turning it off makes the connection
-    // encrypted but not authenticated.
+    // encrypted but not authenticated. Go spells this InsecureSkipVerify, in
+    // the negative, so that the unsafe choice has to be written out.
     bool verify_peer = true;
-    // Optional PEM bundle. Empty uses the system default trust store.
+    // Optional PEM trust bundle. Empty uses the system default store.
+    // Client only.
     std::string ca_file;
-};
-
-struct ServerConfig {
-    std::string certificate_file;  // PEM
-    std::string private_key_file;  // PEM
+    // PEM certificate chain and private key. Server only.
+    std::string certificate_file;
+    std::string private_key_file;
 };
 
 class TlsStream {
@@ -79,15 +83,15 @@ public:
     struct State;
 
 private:
-    friend TlsStream client(net::TcpStream stream, ClientConfig config);
-    friend TlsStream server(net::TcpStream stream, ServerConfig config);
+    friend TlsStream client(net::TcpConn stream, Config config);
+    friend TlsStream server(net::TcpConn stream, Config config);
 
     std::unique_ptr<State> state_;
 };
 
 // Wrap an already-connected stream. Errors in the configuration surface from
 // handshake(), not here, so both factories stay non-throwing and non-suspending.
-TlsStream client(net::TcpStream stream, ClientConfig config = {});
-TlsStream server(net::TcpStream stream, ServerConfig config);
+TlsStream client(net::TcpConn stream, Config config = {});
+TlsStream server(net::TcpConn stream, Config config);
 
 }  // namespace cio::tls

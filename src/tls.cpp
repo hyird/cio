@@ -46,12 +46,11 @@ void discard_openssl_errors() {
 // here, which is what lets every wait go through the runtime's reactor instead
 // of a blocking socket callback.
 struct TlsStream::State {
-    net::TcpStream socket;
+    net::TcpConn socket;
     SSL_CTX* context = nullptr;
     SSL* ssl = nullptr;
     BIO* network = nullptr;  // owned by us; the internal BIO is owned by SSL
-    ClientConfig client_config;
-    ServerConfig server_config;
+    Config config;
     bool is_client = true;
     bool configured = false;
     bool handshake_done = false;
@@ -84,7 +83,7 @@ Result<void> configure(TlsStream::State& state) {
     }
 
     if (state.is_client) {
-        const ClientConfig& config = state.client_config;
+        const Config& config = state.config;
         if (config.verify_peer) {
             ::SSL_CTX_set_verify(state.context, SSL_VERIFY_PEER, nullptr);
             if (config.ca_file.empty()) {
@@ -99,7 +98,7 @@ Result<void> configure(TlsStream::State& state) {
             ::SSL_CTX_set_verify(state.context, SSL_VERIFY_NONE, nullptr);
         }
     } else {
-        const ServerConfig& config = state.server_config;
+        const Config& config = state.config;
         if (config.certificate_file.empty() || config.private_key_file.empty()) {
             return Error{EINVAL};
         }
@@ -127,12 +126,12 @@ Result<void> configure(TlsStream::State& state) {
     ::SSL_set_bio(state.ssl, internal, internal);
 
     if (state.is_client) {
-        const std::string& name = state.client_config.server_name;
+        const std::string& name = state.config.server_name;
         if (!name.empty()) {
             if (::SSL_set_tlsext_host_name(state.ssl, name.c_str()) != 1) {
                 return take_openssl_error();
             }
-            if (state.client_config.verify_peer &&
+            if (state.config.verify_peer &&
                 ::SSL_set1_host(state.ssl, name.c_str()) != 1) {
                 return take_openssl_error();
             }
@@ -228,20 +227,20 @@ TlsStream::~TlsStream() = default;
 TlsStream::TlsStream(TlsStream&&) noexcept = default;
 TlsStream& TlsStream::operator=(TlsStream&&) noexcept = default;
 
-TlsStream client(net::TcpStream stream, ClientConfig config) {
+TlsStream client(net::TcpConn stream, Config config) {
     TlsStream tls;
     tls.state_ = std::make_unique<TlsStream::State>();
     tls.state_->socket = std::move(stream);
-    tls.state_->client_config = std::move(config);
+    tls.state_->config = std::move(config);
     tls.state_->is_client = true;
     return tls;
 }
 
-TlsStream server(net::TcpStream stream, ServerConfig config) {
+TlsStream server(net::TcpConn stream, Config config) {
     TlsStream tls;
     tls.state_ = std::make_unique<TlsStream::State>();
     tls.state_->socket = std::move(stream);
-    tls.state_->server_config = std::move(config);
+    tls.state_->config = std::move(config);
     tls.state_->is_client = false;
     return tls;
 }

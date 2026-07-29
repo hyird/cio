@@ -167,9 +167,9 @@ The existing typed socket classes remain the low-level network API:
 ```cpp
 namespace cio::net {
 
-class TcpStream {
+class TcpConn {
 public:
-    static Task<Result<TcpStream>> connect(
+    static Task<Result<TcpConn>> connect(
         SocketAddr address, CancelToken cancel = {});
 
     Task<Result<std::size_t>> read(std::span<std::byte> buffer);
@@ -187,7 +187,7 @@ public:
 class TcpListener {
 public:
     static Result<TcpListener> bind(SocketAddr address, int backlog = 1024);
-    Task<Result<TcpStream>> accept();
+    Task<Result<TcpConn>> accept();
 
     void set_deadline(TimePoint deadline);
     void clear_deadline();
@@ -196,13 +196,13 @@ public:
 }  // namespace cio::net
 ```
 
-`TcpStream::connect(SocketAddr)` remains the direct, already-resolved path.
-`TcpStream::connect(host, port)` remains as a convenience and delegates to a
+`TcpConn::connect(SocketAddr)` remains the direct, already-resolved path.
+`TcpConn::connect(host, port)` remains as a convenience and delegates to a
 default `Dialer`.
 
 ### Dialer
 
-Name resolution and address selection belong to `Dialer`, not `TcpStream`:
+Name resolution and address selection belong to `Dialer`, not `TcpConn`:
 
 ```cpp
 namespace cio::net {
@@ -217,13 +217,13 @@ class Dialer {
 public:
     explicit Dialer(DialOptions options = {});
 
-    Task<Result<TcpStream>> dial_tcp(
+    Task<Result<TcpConn>> dial_tcp(
         std::string host,
         std::uint16_t port,
         CancelToken cancel = {}) const;
 };
 
-Task<Result<TcpStream>> dial_tcp(
+Task<Result<TcpConn>> dial_tcp(
     std::string host,
     std::uint16_t port,
     CancelToken cancel = {});
@@ -242,8 +242,8 @@ losing attempts are closed and joined before the dial task returns.
 > joined before the dial returns. `DialOptions` also carries a `family` field
 > that this sketch omits.
 
-UDP keeps its concrete `UdpSocket` API. It gains the same combined/clear
-deadline operations as `TcpStream`, but it does not gain a generic protocol
+UDP keeps its concrete `UdpConn` API. It gains the same combined/clear
+deadline operations as `TcpConn`, but it does not gain a generic protocol
 string or a runtime-polymorphic `Conn` base class.
 
 ## Name resolution
@@ -429,7 +429,7 @@ class-aware internally, but those choices do not affect public APIs.
 
 ## Generic stream algorithms
 
-TLS and protocol libraries need to operate on both `TcpStream` and wrapped
+TLS and protocol libraries need to operate on both `TcpConn` and wrapped
 streams. cio should define structural `AsyncReader` and `AsyncWriter` concepts
 rather than a virtual `Conn` base class. Generic helpers such as
 `read_exact()`, `write_all()` and `copy()` are free functions constrained by
@@ -450,7 +450,7 @@ co_await stream.read(buffer);
 ```
 
 `TlsStream` implements the stream concepts and translates OpenSSL
-`WANT_READ`/`WANT_WRITE` into waits on the underlying `TcpStream`.
+`WANT_READ`/`WANT_WRITE` into waits on the underlying `TcpConn`.
 
 Process signals use `signalfd` and the epoll reactor. A signal subscription is
 RAII-owned and exposes received signal numbers through a channel or an awaited
@@ -473,7 +473,7 @@ changes the following public API plan.
    - with one scheduler worker, verify that blocking work does not delay
      channels, timers or network readiness.
 2. **Resolver and dialer** — *done, except concurrent attempt racing*
-   - retain `resolve()` and both existing `TcpStream::connect()` overloads;
+   - retain `resolve()` and both existing `TcpConn::connect()` overloads;
    - add `Resolver`, `Dialer`, connect cancellation and combined deadlines;
    - test cancel-before-submit, cancel-during-lookup, timeout races, IPv4/IPv6
       fallback and runtime shutdown.

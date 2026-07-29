@@ -116,7 +116,7 @@ Long coroutine soaks should not run under ASan or TSan; see
 | `WaitGroup` / `Mutex` | Task-suspending synchronization |
 | `cio::sleep(duration)` | Runtime timer |
 | `cio::blocking(fn)` | Run blocking work outside scheduler workers |
-| `cio::net::TcpListener` / `TcpStream` / `UdpSocket` | Non-blocking sockets with deadlines |
+| `cio::net::TcpListener` / `TcpConn` / `UdpConn` | Non-blocking sockets with deadlines |
 | `cio::net::Resolver` / `resolve()` | System name resolution on the blocking pool |
 | `cio::dns::Resolver` | Built-in DNS backend; selected via `prefer_builtin` |
 | `cio::Timeout` | Scoped, nestable deadline that restores the enclosing one |
@@ -142,7 +142,7 @@ Cancellation binds to a socket rather than to a call: `set_cancel(token)` makes
 every operation in either direction fail with `Errc::cancelled` once the token
 fires, including one already parked, which is woken. That is why `read()`,
 `write()` and `accept()` take no cancel parameter — like deadlines,
-cancellation lives on the connection. `TcpStream::connect()` and the resolver
+cancellation lives on the connection. `TcpConn::dial()` and the resolver
 and dialer entry points additionally accept a token directly.
 
 `net::Resolver` is the one entry point for name resolution and picks its

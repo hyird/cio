@@ -256,7 +256,7 @@ Internally, after `accept4()` returns a new fd:
 
 1. the runtime chooses a worker, initially round-robin;
 2. the accept coroutine makes an internal scheduling hop to that worker;
-3. the new `TcpStream` is registered with that worker's reactor shard;
+3. the new `TcpConn` is registered with that worker's reactor shard;
 4. the caller of `accept()` continues on that worker.
 
 The common pattern:

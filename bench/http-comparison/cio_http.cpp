@@ -16,7 +16,7 @@ namespace net = cio::net;
 
 namespace {
 
-cio::Task<> serve(net::TcpStream stream) {
+cio::Task<> serve(net::TcpConn stream) {
     std::byte buffer[2048];
     bench::RequestSplitter splitter;
     for (;;) {
@@ -34,7 +34,7 @@ cio::Task<> serve(net::TcpStream stream) {
 }
 
 cio::Task<int> run(std::uint16_t port) {
-    auto listener = net::TcpListener::bind(net::SocketAddr::any_v4(port));
+    auto listener = net::TcpListener::listen(net::SocketAddr::any_v4(port));
     if (!listener) {
         std::fprintf(stderr, "bind failed: %s\n", listener.error().message().c_str());
         co_return 1;

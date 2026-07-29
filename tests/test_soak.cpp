@@ -75,7 +75,7 @@ std::atomic<long> g_echoed{0};
 std::atomic<long> g_mismatched{0};
 std::atomic<long> g_connect_failures{0};
 
-cio::Task<> echo_connection(net::TcpStream stream) {
+cio::Task<> echo_connection(net::TcpConn stream) {
     std::byte buffer[2048];
     for (;;) {
         auto n = co_await stream.read(buffer);
@@ -129,7 +129,7 @@ cio::Task<> churn_client(net::SocketAddr target, std::uint64_t seed, cio::Cancel
     std::uint64_t rng = seed | 1;
 
     while (!stop.cancelled()) {
-        auto stream = co_await net::TcpStream::connect(target);
+        auto stream = co_await net::TcpConn::dial(target);
         if (!stream) {
             g_connect_failures.fetch_add(1, std::memory_order_relaxed);
             co_await cio::sleep(2ms);
@@ -201,7 +201,7 @@ cio::Task<> channel_noise(cio::CancelToken stop) {
 }
 
 cio::Task<bool> soak(std::chrono::seconds duration) {
-    auto listener = net::TcpListener::bind(net::SocketAddr::loopback_v4(0));
+    auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
     CIO_CHECK(listener.has_value());
     if (!listener) co_return false;
     const auto addr = listener->local_addr().value();

@@ -286,7 +286,7 @@ Task<Result<detail::Answer>> query_once(net::SocketAddr server,
     auto request = detail::build_query(name, type, id);
     if (!request) co_return request.error();
 
-    auto socket = net::UdpSocket::bind(
+    auto socket = net::UdpConn::listen(
         server.family() == AF_INET6 ? net::SocketAddr::any_v6(0)
                                     : net::SocketAddr::any_v4(0));
     if (!socket) co_return socket.error();
@@ -296,7 +296,7 @@ Task<Result<detail::Answer>> query_once(net::SocketAddr server,
     if (cancel) socket->set_cancel(cancel);
     socket->set_timeout(timeout);
 
-    if (auto sent = co_await socket->send_to(*request, server); !sent) {
+    if (auto sent = co_await socket->write_to(*request, server); !sent) {
         co_return sent.error();
     }
 
@@ -305,7 +305,7 @@ Task<Result<detail::Answer>> query_once(net::SocketAddr server,
     std::vector<std::byte> buffer(kMaxUdpMessage);
     for (;;) {
         net::SocketAddr from;
-        auto received = co_await socket->recv_from(buffer, from);
+        auto received = co_await socket->read_from(buffer, from);
         if (!received) co_return received.error();
 
         auto answer = detail::parse_response(
@@ -359,6 +359,7 @@ Task<Result<std::vector<net::SocketAddr>>> resolve_type(
 Task<Result<std::vector<net::SocketAddr>>> Resolver::lookup_type(
     std::string host, std::uint16_t port, RecordType type,
     CancelToken cancel) const {
+    if (cancel && cancel.cancelled()) co_return Error{Errc::cancelled};
     if (auto literal = net::SocketAddr::parse(host, port); literal) {
         co_return std::vector<net::SocketAddr>{*literal};
     }
@@ -377,16 +378,24 @@ Task<Result<std::vector<net::SocketAddr>>> Resolver::lookup_type(
 
 Task<Result<std::vector<net::SocketAddr>>> Resolver::lookup(
     std::string host, std::uint16_t port, CancelToken cancel) const {
+    if (cancel && cancel.cancelled()) co_return Error{Errc::cancelled};
     if (auto literal = net::SocketAddr::parse(host, port); literal) {
         co_return std::vector<net::SocketAddr>{*literal};
     }
+    if (!config_.ipv4 && !config_.ipv6) co_return Error{EINVAL};
+
     // The hosts file wins over the network, as it does for every other
-    // resolver on the machine.
+    // resolver on the machine — but only for the families this lookup asked
+    // for, or an ipv4-only request could come back with an AAAA entry.
     if (config_.use_hosts_file) {
-        auto from_hosts = hosts_file_lookup(host, port);
+        std::vector<net::SocketAddr> from_hosts;
+        for (auto& entry : hosts_file_lookup(host, port)) {
+            const bool wanted = entry.family() == AF_INET6 ? config_.ipv6
+                                                           : config_.ipv4;
+            if (wanted) from_hosts.push_back(entry);
+        }
         if (!from_hosts.empty()) co_return from_hosts;
     }
-    if (!config_.ipv4 && !config_.ipv6) co_return Error{EINVAL};
     if (!config_.ipv6) {
         co_return co_await resolve_type(config_, std::move(host), port,
                                         RecordType::a, std::move(cancel));

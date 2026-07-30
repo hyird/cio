@@ -56,6 +56,29 @@ CIO_MAIN {
 non-coroutine `main` required by the C++ standard. Use `cio::Runtime` directly
 when worker count or runtime ownership must be configured explicitly.
 
+## Install and use
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+cmake --install build --prefix /usr/local
+```
+
+```cmake
+find_package(cio 0.1.0 REQUIRED)
+target_link_libraries(app PRIVATE cio::cio)
+# and cio::cio_tls when built with -DCIO_TLS=ON
+```
+
+`add_subdirectory()` works too, and does not inherit this project's tests,
+examples or install rules. `cio/version.hpp` provides `CIO_VERSION_MAJOR`,
+`CIO_VERSION_MINOR`, `CIO_VERSION_PATCH` and a comparable `CIO_VERSION`:
+
+```cpp
+#if CIO_VERSION >= CIO_VERSION_NUMBER(0, 1, 0)
+#endif
+```
+
 ## Build and test
 
 ```sh
@@ -418,3 +441,5 @@ remain stable unless an API change is explicitly requested and documented.
 Before proposing a scheduler mechanism, read
 [Rejected mechanisms](AGENTS.md#rejected-mechanisms) in AGENTS.md and search the
 git history: a long list has already been implemented, measured and removed.
+
+Licensed under the [MIT License](LICENSE).

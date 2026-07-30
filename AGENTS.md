@@ -24,6 +24,8 @@ remain part of the compatibility surface.
 - `tests/`: test executables discovered automatically by CMake
 - `examples/`: public API compile and usage examples
 - `bench/`: C++ microbenchmarks and isolated Go/HTTP/echo comparisons
+- `cmake/`: package config template consumed by `find_package(cio)`
+- `.github/workflows/ci.yml`: the gates below, run on every push
 
 This file is the only design document. `README.md` introduces the library for
 users; everything a change to the runtime has to respect is here.
@@ -55,7 +57,9 @@ cmake --build build-tsan -j
 ctest --test-dir build-tsan --output-on-failure
 ```
 
-Apply verification in proportion to the change:
+CI runs Release plus both sanitizers across GCC and Clang, a non-sanitized soak,
+an install-and-`find_package` round trip, an `add_subdirectory` consumer and a
+whitespace check. Locally, apply verification in proportion to the change:
 
 - Documentation or scripts: syntax/help/smoke checks plus `git diff --check`.
 - Public headers: Release build, full CTest and `test_api_surface`.
@@ -300,6 +304,10 @@ faster. State the direction explicitly.
   without measured need.
 - Keep public headers self-contained. Add representative downstream usage to
   `tests/test_api_surface.cpp` when changing header-visible code.
+- `include/cio/version.hpp` and `project(VERSION)` must agree; CMake fails the
+  configure step when they drift. Bump both.
+- `.clang-format` is the style, not a suggestion. New or moved code should match
+  what it produces.
 - Add regression tests for the exact race or lifetime failure being fixed, not
   only a broad stress test.
 - Update this file when an invariant or constraint changes, and `README.md` when

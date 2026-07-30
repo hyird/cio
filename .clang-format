@@ -1,0 +1,15 @@
+# Matches the style AGENTS.md describes, so it is enforceable rather than
+# aspirational: four-space indent, braces on the same line, 80 columns.
+Language: Cpp
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 80
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AlwaysBreakTemplateDeclarations: Yes
+DerivePointerAlignment: false
+PointerAlignment: Left
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+SpaceAfterTemplateKeyword: false

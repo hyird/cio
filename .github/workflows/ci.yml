@@ -1,0 +1,130 @@
+name: ci
+
+# The gates AGENTS.md requires, run for real instead of by hand. Two of the
+# defects found while developing 0.1.0 only surfaced because a default was
+# flipped locally; CI is what makes that systematic.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Release and both sanitizer configurations, on both supported compilers.
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+        sanitize: [none, asan, tsan]
+    name: ${{ matrix.compiler }} / ${{ matrix.sanitize }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Configure
+        run: |
+          build_type=Release
+          if [ "${{ matrix.sanitize }}" != none ]; then build_type=Debug; fi
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=$build_type \
+            -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
+            -DCIO_SANITIZE=${{ matrix.sanitize }} \
+            -DCIO_TLS=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      # A single pass can miss an intermittent lifetime bug; the leak that the
+      # cancelled-connect work introduced reproduced in roughly half of runs.
+      - name: Repeat the race-sensitive suites
+        if: matrix.sanitize != 'tsan'
+        run: |
+          for i in $(seq 1 5); do
+            ./build/test_net
+            ./build/test_scoped
+            ./build/test_dns
+          done
+
+  # A longer soak must not run under a sanitizer: ASan and TSan can stop
+  # symmetric coroutine transfer from remaining a native tail call, so a
+  # sanitizer soak is not a release-runtime stack test.
+  soak:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build -j
+      - run: ./build/test_soak 60
+
+  # The library must stay installable and consumable via find_package.
+  install:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Install to a prefix
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/prefix" -DCIO_TLS=ON
+          cmake --build build -j
+          cmake --install build
+      - name: Consume it from a separate project
+        run: |
+          mkdir -p /tmp/downstream && cd /tmp/downstream
+          cat > CMakeLists.txt <<'EOT'
+          cmake_minimum_required(VERSION 3.20)
+          project(downstream LANGUAGES CXX)
+          find_package(cio 0.1.0 REQUIRED)
+          add_executable(app main.cpp)
+          target_link_libraries(app PRIVATE cio::cio cio::cio_tls)
+          EOT
+          cat > main.cpp <<'EOT'
+          #include <cio/cio.hpp>
+          #include <cio/tls.hpp>
+          CIO_MAIN {
+              static_assert(CIO_VERSION >= CIO_VERSION_NUMBER(0, 1, 0));
+              co_return 0;
+          }
+          EOT
+          cmake -S . -B b -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/prefix"
+          cmake --build b -j
+          ./b/app
+
+  # add_subdirectory() consumers must not inherit tests, examples or installs.
+  subdirectory:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p /tmp/parent/vendor && cd /tmp/parent
+          cp -r "$GITHUB_WORKSPACE" vendor/cio
+          rm -rf vendor/cio/.git
+          cat > CMakeLists.txt <<'EOT'
+          cmake_minimum_required(VERSION 3.20)
+          project(parent LANGUAGES CXX)
+          add_subdirectory(vendor/cio)
+          add_executable(app main.cpp)
+          target_link_libraries(app PRIVATE cio::cio)
+          EOT
+          printf '#include <cio/cio.hpp>\nCIO_MAIN { co_return 0; }\n' > main.cpp
+          cmake -S . -B b -DCMAKE_BUILD_TYPE=Release
+          cmake --build b -j
+          ./b/app
+
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check whitespace
+        run: git diff --check HEAD~1 || true
+      - name: Trailing whitespace and tabs
+        run: |
+          if git grep -nP '[ \t]+$' -- '*.hpp' '*.cpp'; then
+            echo "trailing whitespace above"; exit 1
+          fi

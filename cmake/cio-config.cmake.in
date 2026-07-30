@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+include("${CMAKE_CURRENT_LIST_DIR}/cio-targets.cmake")
+
+# The TLS module is optional and only exported when it was built.
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/cio-tls-targets.cmake")
+  find_dependency(OpenSSL)
+  include("${CMAKE_CURRENT_LIST_DIR}/cio-tls-targets.cmake")
+endif()
+
+check_required_components(cio)

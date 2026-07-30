@@ -9,9 +9,17 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
 endif()
 
-option(CIO_BUILD_TESTS "Build cio tests" ON)
-option(CIO_BUILD_EXAMPLES "Build cio examples" ON)
-option(CIO_BUILD_BENCHMARKS "Build cio benchmarks" ON)
+# Consumers that add_subdirectory() this project should not inherit its tests,
+# examples or install rules.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  set(CIO_IS_TOP_LEVEL ON)
+else()
+  set(CIO_IS_TOP_LEVEL OFF)
+endif()
+
+option(CIO_BUILD_TESTS "Build cio tests" ${CIO_IS_TOP_LEVEL})
+option(CIO_BUILD_EXAMPLES "Build cio examples" ${CIO_IS_TOP_LEVEL})
+option(CIO_BUILD_BENCHMARKS "Build cio benchmarks" ${CIO_IS_TOP_LEVEL})
 option(CIO_METRICS "Count scheduler/reactor events (see detail/metrics.hpp)" OFF)
 # Not option(): that declares a BOOL, so the "none" default lands in the cache as
 # OFF, no UI can offer the real choices, and a misspelled value silently
@@ -50,8 +58,26 @@ set(CIO_SOURCES
   src/metrics.cpp
 )
 
+# The committed version.hpp must agree with project(VERSION); a mismatch means
+# one of the two was bumped alone.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/cio/version.hpp" _cio_version_hpp)
+foreach(_part MAJOR MINOR PATCH)
+  string(REGEX MATCH "CIO_VERSION_${_part} ([0-9]+)" _m "${_cio_version_hpp}")
+  set(_cio_hpp_${_part} "${CMAKE_MATCH_1}")
+endforeach()
+if(NOT "${_cio_hpp_MAJOR}.${_cio_hpp_MINOR}.${_cio_hpp_PATCH}" STREQUAL
+   "${PROJECT_VERSION}")
+  message(FATAL_ERROR
+    "include/cio/version.hpp says "
+    "${_cio_hpp_MAJOR}.${_cio_hpp_MINOR}.${_cio_hpp_PATCH} but project() says "
+    "${PROJECT_VERSION}; update both.")
+endif()
+
 add_library(cio ${CIO_SOURCES})
 add_library(cio::cio ALIAS cio)
+set_target_properties(cio PROPERTIES
+  VERSION ${PROJECT_VERSION}
+  SOVERSION ${PROJECT_VERSION_MAJOR})
 
 target_include_directories(cio PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -149,4 +175,60 @@ if(CIO_BUILD_BENCHMARKS)
     get_filename_component(bench_name ${bench_file} NAME_WE)
     cio_add_program(bench ${bench_name})
   endforeach()
+endif()
+
+# ----------------------------------------------------------------- install ---
+#
+# Exported so a downstream can find_package(cio) and link cio::cio, instead of
+# vendoring the source tree. Skipped when cio is consumed via add_subdirectory,
+# where the parent project owns installation.
+if(CIO_IS_TOP_LEVEL)
+  include(GNUInstallDirs)
+  include(CMakePackageConfigHelpers)
+
+  set(CIO_INSTALL_TARGETS cio)
+  if(CIO_TLS)
+    list(APPEND CIO_INSTALL_TARGETS cio_tls)
+  endif()
+
+  install(TARGETS cio
+    EXPORT cio-targets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(EXPORT cio-targets
+    FILE cio-targets.cmake
+    NAMESPACE cio::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cio)
+
+  if(CIO_TLS)
+    install(TARGETS cio_tls
+      EXPORT cio-tls-targets
+      ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(EXPORT cio-tls-targets
+      FILE cio-tls-targets.cmake
+      NAMESPACE cio::
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cio)
+  endif()
+
+  install(DIRECTORY include/cio
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.hpp")
+
+  configure_package_config_file(
+    cmake/cio-config.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/cio-config.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cio)
+  write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/cio-config-version.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMinorVersion)
+  install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/cio-config.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/cio-config-version.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cio)
+
+  install(FILES LICENSE
+    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/licenses/cio)
 endif()

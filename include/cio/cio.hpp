@@ -37,4 +37,5 @@
 #include "cio/spawn.hpp"
 #include "cio/sync.hpp"
 #include "cio/task.hpp"
+#include "cio/version.hpp"
 #include "cio/time.hpp"

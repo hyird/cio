@@ -405,6 +405,9 @@ Performance, measured rather than asserted:
 
 - Tail latency at 64 connections is worse than the previous release's; it is the
   price of the 1024-connection gains.
+- Tail latency rose again when the 0.1.0 feature set landed, with throughput
+  neutral in both measured cells and no identified mechanism. See
+  [AGENTS.md](AGENTS.md#standing-costs).
 - The p99.99 and beyond are worse on rare foreign-monitor dispatch.
 - Accepted connections are distributed round-robin, but weight is a property of
   the traffic a connection later carries, so heavy connections cluster by chance

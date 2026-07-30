@@ -165,6 +165,21 @@ Disclose them; do not paper over them.
   at accept time is the cheap one to try first and moves no descriptor.
 - `cio::blocking()` itself has no admission limit; only the built-in file and
   resolver classes are bounded.
+- **Tail latency moved up when the 0.1.0 feature set landed, without a known
+  mechanism.** A publication-ready ten-pair matrix over the feature work found
+  throughput neutral in both cells — c64 -0.00% (95% CI -1.73% to +1.76%) and
+  c1024 -1.11% (-3.19% to +1.03%) — while c64 p99 and Max rose in *both* AB and
+  BA strata, which under the joint gate is attributable rather than noise.
+
+  Nothing added touches the socket hot path: the additions are new translation
+  units, header-only templates, or cold-path handles. The plausible mechanism is
+  code layout — the library roughly doubled in size — but that is a hypothesis,
+  not a measurement. Against it: a self-comparison on this host, the same binary
+  on both sides, once drifted 14.88% at c1024, so deep percentiles here are
+  volatile and Max is a single sample.
+
+  Treat this as disclosed and unexplained. Do not attribute it to a specific
+  change without isolating one, and do not quietly drop it either.
 
 ## Runtime invariants
 

@@ -80,7 +80,7 @@ cio::Task<> echo_connection(net::TcpConn stream) {
     for (;;) {
         auto n = co_await stream.read(buffer);
         if (!n || *n == 0) break;
-        if (auto written = co_await stream.write_all(std::span(buffer, *n)); !written) break;
+        if (auto written = co_await stream.write(std::span(buffer, *n)); !written) break;
     }
 }
 
@@ -146,7 +146,7 @@ cio::Task<> churn_client(net::SocketAddr target, std::uint64_t seed, cio::Cancel
             const bool tight_deadline = (next_random(rng) % 16) == 0;
             stream->set_read_timeout(tight_deadline ? 1ms : 5s);
 
-            if (!(co_await stream->write_all(payload))) break;
+            if (!(co_await stream->write(payload))) break;
 
             std::vector<std::byte> received(size);
             std::size_t got = 0;

@@ -455,7 +455,7 @@ cio::Task<> echo_connection(net::TcpConn stream) {
     for (;;) {
         auto n = co_await stream.read(buffer);
         if (!n || *n == 0) break;
-        if (auto written = co_await stream.write_all(std::span(buffer, *n)); !written) break;
+        if (auto written = co_await stream.write(std::span(buffer, *n)); !written) break;
     }
 }
 
@@ -494,7 +494,7 @@ void test_echo_round_trip() {
         if (!client) co_return "";
 
         const std::string message = "hello cio";
-        auto written = co_await client->write_all(bytes_of(message));
+        auto written = co_await client->write(bytes_of(message));
         CIO_CHECK(written.has_value());
 
         std::string received;
@@ -548,7 +548,7 @@ void test_combined_deadline_covers_both_directions() {
 
         // One combined clear releases both directions.
         client->clear_deadline();
-        co_await server_side.write_all(bytes_of("ok"));
+        co_await server_side.write(bytes_of("ok"));
         auto n = co_await client->read(buffer);
         CIO_CHECK(n.has_value());
         CIO_CHECK_EQ(*n, std::size_t{2});
@@ -642,7 +642,7 @@ void test_read_deadline() {
         CIO_CHECK(!still_timed_out.has_value());
 
         client->clear_read_deadline();
-        co_await server_side.write_all(bytes_of("ok"));
+        co_await server_side.write(bytes_of("ok"));
         auto n = co_await client->read(buffer);
         CIO_CHECK(n.has_value());
         CIO_CHECK_EQ(*n, std::size_t{2});
@@ -703,7 +703,7 @@ void test_expired_deadline_precedes_ready_data_write_and_eof() {
         CIO_CHECK(data_pair.has_value());
         if (!data_pair) co_return false;
         auto& [data_client, data_peer] = *data_pair;
-        auto sent = co_await data_peer.write_all(bytes_of("x"));
+        auto sent = co_await data_peer.write(bytes_of("x"));
         CIO_CHECK(sent.has_value());
         if (!sent) co_return false;
         data_client.set_read_deadline(cio::Clock::now());
@@ -906,7 +906,7 @@ void test_many_concurrent_connections() {
                 std::byte buffer[32];
                 for (int r = 0; r < kRoundTrips; ++r) {
                     const std::string payload = "ping" + std::to_string(r);
-                    if (!(co_await stream->write_all(bytes_of(payload)))) break;
+                    if (!(co_await stream->write(bytes_of(payload)))) break;
 
                     std::size_t got = 0;
                     while (got < payload.size()) {
@@ -2515,10 +2515,17 @@ struct MemoryStream {
     }
 
     cio::Task<cio::Result<std::size_t>> write(std::span<const std::byte> buffer) {
-        // Short writes too, so write_all's loop is actually exercised.
-        const std::size_t n = std::min(buffer.size(), std::size_t{2});
-        written.insert(written.end(), buffer.begin(), buffer.begin() + n);
-        co_return n;
+        // The Writer contract: everything is accepted unless an error stops it.
+        written.insert(written.end(), buffer.begin(), buffer.end());
+        co_return buffer.size();
+    }
+};
+
+// A writer that reports a short count without an error violates the io::Writer
+// contract, exactly as Go's io.Writer forbids it.
+struct ShortWriter {
+    cio::Task<cio::Result<std::size_t>> write(std::span<const std::byte> buffer) {
+        co_return std::min(buffer.size(), std::size_t{2});
     }
 };
 
@@ -2543,8 +2550,7 @@ void test_stream_algorithms_over_short_io() {
         CIO_CHECK_EQ(std::string(reinterpret_cast<const char*>(exact.data()), 9),
                      std::string("the quick"));
 
-        // copy drains the rest through two-byte writes. Destination first,
-        // as io.Copy(dst, src) is.
+        // copy drains the rest. Destination first, as io.Copy(dst, src) is.
         MemoryStream sink;
         auto copied = co_await cio::io::copy(sink, source);
         CIO_CHECK(copied.has_value());
@@ -2561,6 +2567,17 @@ void test_stream_algorithms_over_short_io() {
             co_await cio::io::read_full(source, std::span<std::byte>{too_much});
         CIO_CHECK(!truncated.has_value());
         CIO_CHECK(truncated.error().is(cio::Errc::closed));
+
+        // A short-writing destination is a broken writer under the contract:
+        // copy reports it instead of quietly spinning a retry loop, as Go's
+        // io.Copy reports ErrShortWrite.
+        MemoryStream more;
+        more.incoming.assign(4, std::byte{'x'});
+        more.read_chunk = 4;  // hand copy a 4-byte chunk so the 2-byte writer shorts
+        ShortWriter bad;
+        auto rejected = co_await cio::io::copy(bad, more);
+        CIO_CHECK(!rejected.has_value());
+        CIO_CHECK(rejected.error().is(EIO));
         co_return true;
     };
     CIO_CHECK(cio::run(body()));
@@ -2586,7 +2603,7 @@ void test_stream_algorithms_over_tcp() {
 
         auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
-        auto sent = co_await cio::io::write_all(*client, bytes_of("hello world"));
+        auto sent = co_await client->write(bytes_of("hello world"));
         CIO_CHECK(sent.has_value());
 
         const auto received = co_await server;

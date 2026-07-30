@@ -88,15 +88,15 @@ public:
 
     // Reads at the shared file offset. 0 means end of file.
     Task<Result<std::size_t>> read(std::span<std::byte> buffer);
-    // Positioned read; does not change the shared offset.
+    // Positioned read; does not change the shared offset. Fills the whole
+    // span unless end of file intervenes, per Go's io.ReaderAt; a short count
+    // therefore means EOF.
     Task<Result<std::size_t>> read_at(std::span<std::byte> buffer,
                                       std::uint64_t offset);
+    // Full write or error, per Go's io.Writer / io.WriterAt contracts.
     Task<Result<std::size_t>> write(std::span<const std::byte> buffer);
     Task<Result<std::size_t>> write_at(std::span<const std::byte> buffer,
                                        std::uint64_t offset);
-
-    // Loops over short writes.
-    Task<Result<void>> write_all(std::span<const std::byte> buffer);
 
     Task<Result<void>> sync();
     Task<Result<void>> sync_data();

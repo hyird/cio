@@ -77,7 +77,7 @@ std::vector<Sample> samples;
 cio::Task<> feeder(net::TcpConn writer, cio::Chan<int> request, cio::Chan<int> ack) {
     std::vector<std::byte> blob(kBlob, std::byte{0x41});
     while (auto req = co_await request.recv()) {
-        if (!(co_await writer.write_all(blob))) break;
+        if (!(co_await writer.write(blob))) break;
         co_await ack.send(1);
     }
 }

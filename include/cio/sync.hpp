@@ -245,13 +245,13 @@ public:
     public:
         ReadGuard() = default;
         explicit ReadGuard(RWMutex* owner) noexcept : owner_(owner) {}
-        ~ReadGuard() { if (owner_ != nullptr) owner_->unlock_read(); }
+        ~ReadGuard() { if (owner_ != nullptr) owner_->runlock(); }
 
         ReadGuard(ReadGuard&& other) noexcept
             : owner_(std::exchange(other.owner_, nullptr)) {}
         ReadGuard& operator=(ReadGuard&& other) noexcept {
             if (this != &other) {
-                if (owner_ != nullptr) owner_->unlock_read();
+                if (owner_ != nullptr) owner_->runlock();
                 owner_ = std::exchange(other.owner_, nullptr);
             }
             return *this;
@@ -285,8 +285,9 @@ public:
         RWMutex* owner_ = nullptr;
     };
 
-    // Go's RLock. Suspends while a writer holds or is waiting for the lock.
-    [[nodiscard]] auto lock_read() noexcept {
+    // Go's RLock, snake-cased as one word the way the Go community
+    // pronounces it. Suspends while a writer holds or is waiting for the lock.
+    [[nodiscard]] auto rlock() noexcept {
         struct Awaiter {
             RWMutex* self;
             detail::WaitNode node{};
@@ -332,7 +333,7 @@ public:
         return Awaiter{this, {}};
     }
 
-    bool try_lock_read() noexcept {
+    bool try_rlock() noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         if (writing_ || waiting_writers_ != 0) return false;
         ++readers_;
@@ -346,7 +347,7 @@ public:
         return true;
     }
 
-    void unlock_read() {
+    void runlock() {
         detail::WaitNode* to_wake = nullptr;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -455,7 +456,8 @@ private:
 // wait() releases the mutex, suspends, and reacquires it before returning, which
 // is the contract that makes a condition variable usable. Spurious wakeups are
 // possible, so callers must re-check their predicate in a loop, exactly as with
-// sync.Cond or std::condition_variable.
+// sync.Cond. wait() takes the guard because C++ scopes the lock in an object
+// where Go scopes it in convention; signal() and broadcast() are Go's names.
 class Cond {
 public:
     explicit Cond(Mutex& mutex) noexcept : mutex_(&mutex) {}
@@ -475,7 +477,8 @@ public:
         co_return;
     }
 
-    void notify_one() {
+    // Go's Signal.
+    void signal() {
         Chan<Unit> next;
         {
             std::lock_guard<std::mutex> lock(list_mutex_);
@@ -486,7 +489,8 @@ public:
         next.close();
     }
 
-    void notify_all() {
+    // Go's Broadcast.
+    void broadcast() {
         std::vector<Chan<Unit>> all;
         {
             std::lock_guard<std::mutex> lock(list_mutex_);

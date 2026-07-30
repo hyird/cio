@@ -3,7 +3,7 @@
 //     auto tcp = co_await cio::net::TcpConn::dial("example.com", 443);
 //     auto stream = cio::tls::client(std::move(*tcp), {.server_name = "example.com"});
 //     co_await stream.handshake();
-//     co_await cio::io::write_all(stream, request);
+//     co_await stream.write(request);
 //
 // This is an optional target: enabling it links OpenSSL, which is why it is not
 // part of the core library. Build with -DCIO_TLS=ON and link cio::tls.
@@ -67,6 +67,7 @@ public:
     Task<Result<void>> handshake();
 
     Task<Result<std::size_t>> read(std::span<std::byte> buffer);
+    // Full write or error, per Go's io.Writer contract.
     Task<Result<std::size_t>> write(std::span<const std::byte> buffer);
 
     // Sends close_notify, then closes the socket. Idempotent.

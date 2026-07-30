@@ -23,7 +23,7 @@ void test_readers_share_writers_exclude() {
         for (int i = 0; i < 8; ++i) {
             readers.spawn([](cio::RWMutex& m, std::atomic<int>& live,
                              std::atomic<int>& peak) -> cio::Task<> {
-                auto guard = co_await m.lock_read();
+                auto guard = co_await m.rlock();
                 const int now = live.fetch_add(1) + 1;
                 int seen = peak.load();
                 while (now > seen && !peak.compare_exchange_weak(seen, now)) {
@@ -51,7 +51,7 @@ void test_readers_share_writers_exclude() {
             }(lock, inside_writer, overlapped));
             mixed.spawn([](cio::RWMutex& m, std::atomic<int>& inside,
                            std::atomic<bool>& bad) -> cio::Task<> {
-                auto guard = co_await m.lock_read();
+                auto guard = co_await m.rlock();
                 if (inside.load() != 0) bad.store(true);
                 co_await cio::sleep(2ms);
             }(lock, inside_writer, overlapped));
@@ -72,7 +72,7 @@ void test_writer_is_not_starved() {
         std::atomic<bool> stop{false};
 
         // Hold a read lock so the writer has to queue.
-        auto first = co_await lock.lock_read();
+        auto first = co_await lock.rlock();
 
         auto writer = cio::spawn([](cio::RWMutex& m,
                                     std::atomic<bool>& ran) -> cio::Task<> {
@@ -82,12 +82,12 @@ void test_writer_is_not_starved() {
 
         co_await cio::sleep(10ms);
         // With a writer queued, a fresh reader must not be admitted.
-        CIO_CHECK(!lock.try_lock_read());
+        CIO_CHECK(!lock.try_rlock());
 
         cio::TaskGroup latecomers;
         for (int i = 0; i < 4; ++i) {
             latecomers.spawn([](cio::RWMutex& m) -> cio::Task<> {
-                auto guard = co_await m.lock_read();
+                auto guard = co_await m.rlock();
                 co_await cio::sleep(2ms);
             }(lock));
         }
@@ -105,20 +105,20 @@ void test_writer_is_not_starved() {
 void test_try_lock_variants() {
     auto body = []() -> cio::Task<bool> {
         cio::RWMutex lock;
-        CIO_CHECK(lock.try_lock_read());
+        CIO_CHECK(lock.try_rlock());
         // Another reader may join.
-        CIO_CHECK(lock.try_lock_read());
+        CIO_CHECK(lock.try_rlock());
         // A writer may not.
         CIO_CHECK(!lock.try_lock());
-        lock.unlock_read();
-        lock.unlock_read();
+        lock.runlock();
+        lock.runlock();
 
         CIO_CHECK(lock.try_lock());
         CIO_CHECK(!lock.try_lock());
-        CIO_CHECK(!lock.try_lock_read());
+        CIO_CHECK(!lock.try_rlock());
         lock.unlock();
-        CIO_CHECK(lock.try_lock_read());
-        lock.unlock_read();
+        CIO_CHECK(lock.try_rlock());
+        lock.runlock();
         co_return true;
     };
     CIO_CHECK(cio::run(body()));
@@ -212,7 +212,7 @@ void test_cond_wait_and_notify() {
             auto guard = co_await mutex.lock();
             ready = 1;
         }
-        cond.notify_all();
+        cond.broadcast();
         co_await waiters.join();
         CIO_CHECK_EQ(woke.load(), 3);
         co_return true;
@@ -244,7 +244,7 @@ void test_cond_notify_one() {
             auto guard = co_await mutex.lock();
             tickets = 1;
         }
-        cond.notify_one();
+        cond.signal();
         co_await cio::sleep(30ms);
         CIO_CHECK_EQ(served.load(), 1);
 
@@ -253,7 +253,7 @@ void test_cond_notify_one() {
             auto guard = co_await mutex.lock();
             tickets = 2;
         }
-        cond.notify_all();
+        cond.broadcast();
         co_await waiters.join();
         CIO_CHECK_EQ(served.load(), 3);
         co_return true;

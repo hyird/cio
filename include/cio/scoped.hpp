@@ -2,7 +2,7 @@
 //
 //     {
 //         cio::Timeout overall(stream, 5s);   // whole exchange
-//         co_await cio::io::write_all(stream, request);
+//         co_await stream.write(request);
 //         {
 //             cio::Timeout first_byte(stream, 200ms);   // tighter, nested
 //             co_await stream.read(header);
@@ -213,13 +213,19 @@ public:
         }
     }
 
-    // Writes what it can; may be a partial write, like write(2).
+    // Writes the whole span unless an error occurs, per Go's io.Writer
+    // contract.
     Task<Result<std::size_t>> write(std::span<const std::byte> buffer) {
         if (!impl_.valid()) co_return Error{EBADF};
-        for (;;) {
+        const std::size_t total = buffer.size();
+        while (!buffer.empty()) {
             const ssize_t n =
                 ::write(impl_.native_handle(), buffer.data(), buffer.size());
-            if (n >= 0) co_return static_cast<std::size_t>(n);
+            if (n > 0) {
+                buffer = buffer.subspan(static_cast<std::size_t>(n));
+                continue;
+            }
+            if (n == 0) co_return Error{Errc::closed};
 
             const int error = errno;
             if (error == EINTR) continue;
@@ -228,16 +234,7 @@ public:
                 co_return ready.error();
             }
         }
-    }
-
-    Task<Result<void>> write_all(std::span<const std::byte> buffer) {
-        while (!buffer.empty()) {
-            auto n = co_await write(buffer);
-            if (!n) co_return n.error();
-            if (*n == 0) co_return Error{Errc::closed};
-            buffer = buffer.subspan(*n);
-        }
-        co_return ok();
+        co_return total;
     }
 
     void set_deadline(TimePoint deadline) { impl_.set_deadline(deadline); }

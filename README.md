@@ -62,7 +62,7 @@ cmake --install build --prefix /usr/local
 ```
 
 ```cmake
-find_package(cio 0.1.0 REQUIRED)
+find_package(cio 0.2.0 REQUIRED)
 target_link_libraries(app PRIVATE cio::cio)
 # 以 -DCIO_TLS=ON 构建时再加 cio::cio_tls
 ```
@@ -146,7 +146,7 @@ ctest --test-dir build-tls --output-on-failure
 | `cio::PollableFd` | 收养外来 fd（eventfd、timerfd、inotify、C 库） |
 | `cio::net::Dialer` / `dial_tcp()` | 解析加地址竞速与超时 |
 | `cio::fs::File` / `open` / `read_file` / `read_dir` | 阻塞池上的文件与目录操作（`os`） |
-| `cio::process::Command` / `spawn` / `run` | 经 `pidfd` 等待的子进程（`os/exec`） |
+| `cio::process::Command` / `start` / `run` / `output` | 经 `pidfd` 等待的子进程（`os/exec`） |
 | `cio::signal::SignalSet` | 基于 `signalfd` 的信号投递 |
 | `cio::tls::Conn` | 可选 TLS（`-DCIO_TLS=ON`，链接 OpenSSL） |
 | `cio::io::read_full` / `copy` / `read_all` | `io.ReadFull` / `io.Copy` / `io.ReadAll` |
@@ -155,6 +155,10 @@ ctest --test-dir build-tls --output-on-failure
 | `cio::io::Reader` / `Writer` | `io.Reader` / `io.Writer`，以 concept 表达 |
 | `net::split_host_port` / `join_host_port` | `net.SplitHostPort` / `net.JoinHostPort` |
 | `cio::Runtime` / `cio::run(task)` / `CIO_MAIN` | 运行时所有权与入口点 |
+
+`write()` 遵循 Go 的 `io.Writer` 契约：除非返回错误，否则写满整个 span——短写
+必须伴随错误。因此不存在 `write_all()`：`write()` 本身就是。`copy` 遇到无错误
+的短写目标时报告 `EIO`，对应 Go 的 `io.ErrShortWrite`。
 
 `net::Conn`、`net::PacketConn` 与 `net::Listener` 是 Go net 的三个接口，以
 concept 而非虚基类表达：协议库可以只针对「行为像连接的任何东西」写一次，而具
@@ -330,7 +334,7 @@ taskset -c 23 python3 bench/http-comparison/matrix_wrk.py \
 | `fs::FileInfo::is_directory()` | `is_dir()` | `FileInfo.IsDir` |
 | `cio::AsyncReader` / `AsyncWriter` | `cio::io::Reader` / `Writer` | `io.Reader` / `io.Writer` |
 | `cio::read_exact()` | `cio::io::read_full()` | `io.ReadFull` |
-| `cio::write_all()` / `copy()` | `cio::io::write_all()` / `copy()` | `io` 包 |
+| `cio::write_all()` / `copy()` | `write()` 成员（写满）/ `cio::io::copy()` | `io.Writer` 契约 / `io.Copy` |
 | `tls::ClientConfig` + `ServerConfig` | 合并为一个 `tls::Config` | `tls.Config` |
 | `tls::TlsStream` | `tls::Conn` | `tls.Conn` |
 
@@ -343,6 +347,33 @@ taskset -c 23 python3 bench/http-comparison/matrix_wrk.py \
   的机器，或要求结果与 `getent hosts` 一致的场合，把
   `LookupOptions::prefer_builtin` 或 `DialOptions::prefer_builtin_resolver`
   设为 false。
+
+### 0.1.0 → 0.2.0（未发布）
+
+这一轮把名字之外的两个维度也对齐了 Go：参数/契约与方法归属。
+
+| 0.1.0 | 0.2.0 | Go |
+|---|---|---|
+| 各类型的 `write_all()` 与 `cio::io::write_all()` | 删除；`write()` 即写满 | `io.Writer` 契约 |
+| `bufio::Reader::read_until()` | `read_string()` | `bufio.Reader.ReadString` |
+| `bufio::Reader::peek()`（仅看缓冲） | `peek(n)`（按需填充） | `bufio.Reader.Peek` |
+| `bufio::Reader::consume(n)` | `discard(n)`（可跨缓冲跳过） | `bufio.Reader.Discard` |
+| `bufio::Reader::read_full()` 成员 | 删除；用自由函数 `io::read_full` 组合 | Go 的组合方式 |
+| `bufio::Writer::write_all()` | `write()`（满足 `io::Writer`） | `bufio.Writer.Write` |
+| `BufferPool::take` / `Pool<T>::take` | `get` | `sync.Pool.Get` |
+| `Cond::notify_one` / `notify_all` | `signal()` / `broadcast()` | `sync.Cond.Signal` / `Broadcast` |
+| `RWMutex::lock_read` 等 | `rlock` / `runlock` / `try_rlock` | `RLock` / `RUnlock` / `TryRLock` |
+| `process::spawn(cmd)` / `process::run(cmd)` | `cmd.start()` / `cmd.run()` / `cmd.output()` | `Cmd.Start` / `Run` / `Output` |
+| `Command::working_dir` | `dir` | `Cmd.Dir` |
+| `Child::in/out/err()`、`close_in()` | `stdin_pipe()` 等、`close_stdin()` | `Cmd.StdinPipe` 等 |
+| `File::read_at` 允许短读 | 填满或到 EOF | `io.ReaderAt` 契约 |
+
+语义变更（会静默编译通过）：所有 `write()`——socket、文件、`PollableFd`、
+bufio——现在写满才返回，短写必然伴随错误；`File::read_at` 短返回只意味着
+EOF。保留的刻意偏差：`Once::call`（`do` 是 C++ 关键字）、`Timer::chan()`
+（Go 的 `C` 字段没有可用的 C++ 名字）、`stdin_pipe()` 而非 `stdin()`
+（`stdin` 是 `<cstdio>` 宏）、`select` 的 `otherwise()`（`default` 是关键
+字）。
 
 ## 已知限制
 

@@ -231,10 +231,9 @@ public:
 
     // Reads whatever is available. 0 means the peer closed cleanly (EOF).
     Task<Result<std::size_t>> read(std::span<std::byte> buffer);
-    // Writes what it can; may be a partial write, like write(2).
+    // Writes the whole span unless an error occurs, per Go's io.Writer
+    // contract; the returned count equals buffer.size() on success.
     Task<Result<std::size_t>> write(std::span<const std::byte> buffer);
-    // Loops until everything is written or an error occurs.
-    Task<Result<void>> write_all(std::span<const std::byte> buffer);
 
     // Non-suspending attempts, for hot paths that want to skip the awaiter
     // entirely when the socket is already ready.
@@ -338,8 +337,8 @@ public:
     static Task<Result<UnixConn>> dial(UnixAddr addr, CancelToken cancel);
 
     Task<Result<std::size_t>> read(std::span<std::byte> buffer);
+    // Full write or error, per Go's io.Writer contract.
     Task<Result<std::size_t>> write(std::span<const std::byte> buffer);
-    Task<Result<void>> write_all(std::span<const std::byte> buffer);
 
     Result<std::size_t> try_read(std::span<std::byte> buffer);
     Result<std::size_t> try_write(std::span<const std::byte> buffer);

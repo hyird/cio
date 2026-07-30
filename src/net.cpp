@@ -950,27 +950,18 @@ Task<Result<std::size_t>> TcpConn::read(std::span<std::byte> buffer) {
 }
 
 Task<Result<std::size_t>> TcpConn::write(std::span<const std::byte> buffer) {
+    // Go's io.Writer contract: the whole span goes out unless an error stops
+    // it, so no caller needs a retry loop and none can forget one.
+    const std::size_t total = buffer.size();
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
-    co_return co_await tcp_write_some(
-        operation.desc, operation.generation, buffer);
-}
-
-Task<Result<void>> TcpConn::write_all(std::span<const std::byte> buffer) {
-    // One immutable descriptor incarnation for the whole logical operation:
-    // close() may update the Socket fields while this coroutine is parked, so
-    // a partial write must not re-read them on its next chunk.
-    const IoOperation operation = capture_operation(fd_, desc_);
-    if (!operation) co_return operation.error;
-
     while (!buffer.empty()) {
-        auto written = co_await tcp_write_some(
-            operation.desc, operation.generation, buffer);
-        if (!written) co_return written.error();
-        if (*written == 0) co_return Error{Errc::closed};
-        buffer = buffer.subspan(*written);
+        auto n = co_await tcp_write_some(operation.desc, operation.generation,
+                                         buffer);
+        if (!n) co_return n.error();
+        buffer = buffer.subspan(*n);
     }
-    co_return ok();
+    co_return total;
 }
 
 Result<bool> TcpConn::begin_connect(SocketAddr addr, TcpConn& stream) {
@@ -1767,19 +1758,16 @@ Task<Result<std::size_t>> UnixConn::read(std::span<std::byte> buffer) {
 }
 
 Task<Result<std::size_t>> UnixConn::write(std::span<const std::byte> buffer) {
+    const std::size_t total = buffer.size();
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
-    co_return co_await tcp_write_some(operation.desc, operation.generation,
-                                      buffer);
-}
-
-Task<Result<void>> UnixConn::write_all(std::span<const std::byte> buffer) {
     while (!buffer.empty()) {
-        auto n = co_await write(buffer);
+        auto n = co_await tcp_write_some(operation.desc, operation.generation,
+                                         buffer);
         if (!n) co_return n.error();
         buffer = buffer.subspan(*n);
     }
-    co_return ok();
+    co_return total;
 }
 
 Result<std::size_t> UnixConn::try_read(std::span<std::byte> buffer) {

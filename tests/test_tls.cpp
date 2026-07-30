@@ -138,7 +138,7 @@ void test_handshake_and_round_trip() {
                     co_return std::string{"server read failed"};
                 }
                 if (auto written =
-                        co_await cio::io::write_all(stream, bytes_of("world"));
+                        co_await stream.write(bytes_of("world"));
                     !written) {
                     co_return std::string{"server write failed"};
                 }
@@ -159,7 +159,7 @@ void test_handshake_and_round_trip() {
         CIO_CHECK(shaken.has_value());
         CIO_CHECK(!stream.protocol_version().empty());
 
-        auto sent = co_await cio::io::write_all(stream, bytes_of("hello"));
+        auto sent = co_await stream.write(bytes_of("hello"));
         CIO_CHECK(sent.has_value());
 
         std::vector<std::byte> reply(5);
@@ -251,7 +251,7 @@ void test_large_transfer_spans_records() {
 
                 const std::string payload(kSize, 'z');
                 const auto written =
-                    co_await cio::io::write_all(stream, bytes_of(payload));
+                    co_await stream.write(bytes_of(payload));
                 (void)co_await stream.shutdown();
                 co_return written.has_value();
             }(std::move(*listener), certificate.cert.get(),

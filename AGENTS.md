@@ -110,6 +110,9 @@ go test ./...
   出的尝试都必须在父任务返回前被 join。detach 会让任务 park 在 socket 上直到
   内核放弃重试，而运行时若先关停则直接泄漏协程帧——关停不会展开 park 在
   channel 或 socket 上的任务。
+- **`io::Writer` 遵循 Go 的 `io.Writer` 契约。** `write()` 无错误即写满；无
+  错误的短写是坏 writer，`copy` 对它报 `EIO`。因此库内不存在 `write_all`——
+  每个调用方自带重试循环的世界正是这条契约要消灭的。
 - **不做 context value。** 取消作用域携带完成信号、错误与截止时间。以不透明
   类型为键的映射是依赖注入机制，不是取消机制。
 - **内置解析器不做 DNS 缓存、DNSSEC 与 search 列表**，除 stub 解析外不实现用

@@ -7,7 +7,7 @@
 #pragma once
 
 #define CIO_VERSION_MAJOR 0
-#define CIO_VERSION_MINOR 1
+#define CIO_VERSION_MINOR 2
 #define CIO_VERSION_PATCH 0
 
 // Comparable: CIO_VERSION >= CIO_VERSION_NUMBER(0, 1, 0)
@@ -17,7 +17,7 @@
     CIO_VERSION_NUMBER(CIO_VERSION_MAJOR, CIO_VERSION_MINOR,            \
                        CIO_VERSION_PATCH)
 
-#define CIO_VERSION_STRING "0.1.0"
+#define CIO_VERSION_STRING "0.2.0"
 
 namespace cio {
 

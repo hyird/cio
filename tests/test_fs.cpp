@@ -56,7 +56,7 @@ void test_create_write_read_roundtrip() {
         CIO_CHECK(file.has_value());
         CIO_CHECK(file->valid());
 
-        auto written = co_await file->write_all(bytes_of("hello file"));
+        auto written = co_await file->write(bytes_of("hello file"));
         CIO_CHECK(written.has_value());
         auto synced = co_await file->sync();
         CIO_CHECK(synced.has_value());
@@ -94,7 +94,7 @@ void test_sequential_offset_and_seek() {
     auto body = [&path]() -> cio::Task<bool> {
         auto file = co_await fs::create(path.get());
         CIO_CHECK(file.has_value());
-        CIO_CHECK((co_await file->write_all(bytes_of("abcdefgh"))).has_value());
+        CIO_CHECK((co_await file->write(bytes_of("abcdefgh"))).has_value());
 
         // The shared offset sits at the end after writing.
         auto rewound = co_await file->seek(0);
@@ -139,7 +139,7 @@ void test_open_flags_and_errors() {
         options.exclusive = true;
         auto created = co_await fs::open(path.get(), options);
         CIO_CHECK(created.has_value());
-        CIO_CHECK((co_await created->write_all(bytes_of("x"))).has_value());
+        CIO_CHECK((co_await created->write(bytes_of("x"))).has_value());
         created->close();
         // close() is idempotent.
         created->close();
@@ -162,7 +162,7 @@ void test_open_flags_and_errors() {
         append.append = true;
         auto appender = co_await fs::open(path.get(), append);
         CIO_CHECK(appender.has_value());
-        CIO_CHECK((co_await appender->write_all(bytes_of("yz"))).has_value());
+        CIO_CHECK((co_await appender->write(bytes_of("yz"))).has_value());
 
         auto info = co_await fs::stat(path.get());
         CIO_CHECK(info.has_value());
@@ -185,7 +185,7 @@ void test_remove_and_move_semantics() {
         // The moved-from handle owns nothing and must not close fd.
         CIO_CHECK(!file->valid());
 
-        CIO_CHECK((co_await moved.write_all(bytes_of("gone soon"))).has_value());
+        CIO_CHECK((co_await moved.write(bytes_of("gone soon"))).has_value());
         moved.close();
 
         auto removed = co_await fs::remove(path.get());
@@ -206,7 +206,7 @@ void test_concurrent_positioned_reads() {
         const std::string payload(64 * 1024, 'q');
         auto writer = co_await fs::create(path.get());
         CIO_CHECK(writer.has_value());
-        CIO_CHECK((co_await writer->write_all(bytes_of(payload))).has_value());
+        CIO_CHECK((co_await writer->write(bytes_of(payload))).has_value());
         writer->close();
 
         auto file = co_await fs::open(path.get());
@@ -240,7 +240,7 @@ void test_file_admission_is_bounded() {
     auto body = [&path]() -> cio::Task<bool> {
         auto writer = co_await fs::create(path.get());
         CIO_CHECK(writer.has_value());
-        CIO_CHECK((co_await writer->write_all(bytes_of("payload"))).has_value());
+        CIO_CHECK((co_await writer->write(bytes_of("payload"))).has_value());
         writer->close();
 
         auto file = co_await fs::open(path.get());
@@ -279,7 +279,7 @@ void test_file_saturation_does_not_starve_resolver() {
     auto body = [&path]() -> cio::Task<bool> {
         auto writer = co_await fs::create(path.get());
         CIO_CHECK(writer.has_value());
-        CIO_CHECK((co_await writer->write_all(bytes_of("payload"))).has_value());
+        CIO_CHECK((co_await writer->write(bytes_of("payload"))).has_value());
         writer->close();
 
         auto file = co_await fs::open(path.get());

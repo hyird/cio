@@ -11,7 +11,7 @@ void PooledBuffer::release() noexcept {
     std::byte* const data = std::exchange(data_, nullptr);
     const std::size_t size = std::exchange(size_, 0);
     if (pool != nullptr) {
-        pool->give_back(data, size);
+        pool->put(data, size);
     } else {
         // An oversized buffer was never pooled; free it directly.
         ::operator delete(data, std::align_val_t{alignof(std::max_align_t)});
@@ -76,7 +76,7 @@ BufferPool::ThreadCache::~ThreadCache() {
     owner = nullptr;
 }
 
-PooledBuffer BufferPool::take(std::size_t bytes) {
+PooledBuffer BufferPool::get(std::size_t bytes) {
     if (bytes == 0) bytes = 1;
 
     if (bytes > kMaxPooledBytes) {
@@ -123,7 +123,7 @@ PooledBuffer BufferPool::take(std::size_t bytes) {
     return PooledBuffer{this, static_cast<std::byte*>(raw), size};
 }
 
-void BufferPool::give_back(std::byte* data, std::size_t size) noexcept {
+void BufferPool::put(std::byte* data, std::size_t size) noexcept {
     if (data == nullptr) return;
     if (size > kMaxPooledBytes) {
         ::operator delete(data, std::align_val_t{alignof(std::max_align_t)});

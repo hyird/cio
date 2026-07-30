@@ -80,7 +80,7 @@ jobs:
           cat > CMakeLists.txt <<'EOT'
           cmake_minimum_required(VERSION 3.20)
           project(downstream LANGUAGES CXX)
-          find_package(cio 0.1.0 REQUIRED)
+          find_package(cio 0.2.0 REQUIRED)
           add_executable(app main.cpp)
           target_link_libraries(app PRIVATE cio::cio cio::cio_tls)
           EOT
@@ -88,7 +88,7 @@ jobs:
           #include <cio/cio.hpp>
           #include <cio/tls.hpp>
           CIO_MAIN {
-              static_assert(CIO_VERSION >= CIO_VERSION_NUMBER(0, 1, 0));
+              static_assert(CIO_VERSION >= CIO_VERSION_NUMBER(0, 2, 0));
               co_return 0;
           }
           EOT

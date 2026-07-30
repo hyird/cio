@@ -118,7 +118,7 @@ void test_cancel_rebind_and_clear() {
 
         // The replaced token no longer governs this socket.
         first.cancel();
-        co_await pair->server.write_all(bytes_of("ab"));
+        co_await pair->server.write(bytes_of("ab"));
         std::byte buffer[16];
         auto read = co_await pair->client.read(buffer);
         CIO_CHECK(read.has_value());
@@ -132,7 +132,7 @@ void test_cancel_rebind_and_clear() {
 
         // Clearing restores normal operation even after a cancel.
         pair->client.clear_cancel();
-        co_await pair->server.write_all(bytes_of("cd"));
+        co_await pair->server.write(bytes_of("cd"));
         auto after = co_await pair->client.read(buffer);
         CIO_CHECK(after.has_value());
         CIO_CHECK_EQ(*after, std::size_t{2});
@@ -185,7 +185,7 @@ void test_timeout_scope_restores_outer_deadline() {
         const auto restored = pair->client.deadline(/*write_direction=*/false);
         CIO_CHECK(restored == outer);
 
-        co_await pair->server.write_all(bytes_of("ok"));
+        co_await pair->server.write(bytes_of("ok"));
         std::byte buffer[16];
         auto read = co_await pair->client.read(buffer);
         CIO_CHECK(read.has_value());
@@ -234,7 +234,7 @@ void test_timeout_scope_clears_when_none_was_set() {
         CIO_CHECK(pair->client.deadline(true) == cio::TimePoint{});
 
         // A cleared deadline means the socket works again.
-        co_await pair->server.write_all(bytes_of("hi"));
+        co_await pair->server.write(bytes_of("hi"));
         std::byte buffer[16];
         auto read = co_await pair->client.read(buffer);
         CIO_CHECK(read.has_value());
@@ -473,7 +473,7 @@ void test_generic_over_conn_concept() {
         auto pair = co_await make_pair();
         CIO_CHECK(pair.has_value());
 
-        co_await pair->server.write_all(bytes_of("ping"));
+        co_await pair->server.write(bytes_of("ping"));
         auto echoed = co_await echo_once(pair->client);
         CIO_CHECK(echoed.has_value());
         CIO_CHECK_EQ(*echoed, std::size_t{4});

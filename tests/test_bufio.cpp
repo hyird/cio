@@ -120,39 +120,46 @@ void test_large_read_bypasses_the_buffer() {
     CIO_CHECK(cio::run(body()));
 }
 
-void test_read_full_and_peek_consume() {
+void test_read_full_peek_and_discard() {
     auto body = []() -> cio::Task<bool> {
         DribbleSource source{"HEADERbodybody", 0, 3};
         cio::bufio::Reader in(source, 32);
 
         std::vector<std::byte> header(6);
-        auto filled = co_await in.read_full(std::span<std::byte>{header});
+        // Go composes: io.ReadFull over the bufio.Reader, no duplicate method.
+        auto filled = co_await cio::io::read_full(in, std::span<std::byte>{header});
         CIO_CHECK(filled.has_value());
         CIO_CHECK_EQ(std::string(reinterpret_cast<const char*>(header.data()), 6),
                      std::string("HEADER"));
 
-        // Pull one byte so a fill leaves something buffered; read_full above
-        // consumed exactly what it needed.
-        std::byte one[1];
-        auto pulled = co_await in.read(one);
-        CIO_CHECK(pulled.has_value());
-        CIO_CHECK(in.buffered() > std::size_t{0});
-
-        // peek shows buffered bytes without consuming them.
-        const auto peeked = in.peek();
+        // Go's Peek(n): a view of the next n bytes, filling as needed and
+        // never consuming.
+        auto peeked = co_await in.peek(4);
+        CIO_CHECK(peeked.has_value());
+        CIO_CHECK_EQ(peeked->size(), std::size_t{4});
+        CIO_CHECK_EQ(static_cast<char>((*peeked)[0]), 'b');
         const std::size_t before = in.buffered();
-        CIO_CHECK_EQ(peeked.size(), before);
-        CIO_CHECK_EQ(in.buffered(), before);
+        CIO_CHECK(before >= std::size_t{4});
 
-        in.consume(1);
+        // A request beyond the buffer capacity is EMSGSIZE, as ErrBufferFull.
+        auto too_wide = co_await in.peek(1024);
+        CIO_CHECK(!too_wide.has_value());
+        CIO_CHECK(too_wide.error().is(EMSGSIZE));
+
+        // Go's Discard(n): skips, reading as needed; short only at EOF.
+        auto dropped = co_await in.discard(1);
+        CIO_CHECK(dropped.has_value());
+        CIO_CHECK_EQ(*dropped, std::size_t{1});
         CIO_CHECK_EQ(in.buffered(), before - 1);
-        // consume past the end is capped rather than underflowing.
-        in.consume(1000);
+        auto drained = co_await in.discard(1000);
+        CIO_CHECK(drained.has_value());
+        CIO_CHECK(*drained < std::size_t{1000});  // hit end of stream
         CIO_CHECK_EQ(in.buffered(), std::size_t{0});
 
         // Asking for more than remains is Errc::closed, not a short success.
         std::vector<std::byte> too_much(64);
-        auto truncated = co_await in.read_full(std::span<std::byte>{too_much});
+        auto truncated =
+            co_await cio::io::read_full(in, std::span<std::byte>{too_much});
         CIO_CHECK(!truncated.has_value());
         CIO_CHECK(truncated.error().is(cio::Errc::closed));
         co_return true;
@@ -355,7 +362,7 @@ int main() {
     RUN_TEST(test_read_line_reassembles);
     RUN_TEST(test_buffering_reduces_reads);
     RUN_TEST(test_large_read_bypasses_the_buffer);
-    RUN_TEST(test_read_full_and_peek_consume);
+    RUN_TEST(test_read_full_peek_and_discard);
     RUN_TEST(test_line_limit_is_enforced);
     RUN_TEST(test_writer_batches_and_flushes);
     RUN_TEST(test_writer_flushes_when_full_and_bypasses_large);

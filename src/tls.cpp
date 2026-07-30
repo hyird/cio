@@ -158,8 +158,9 @@ Task<Result<void>> flush_network(Conn::State& state) {
                                     static_cast<int>(want));
         if (read <= 0) co_return take_openssl_error();
 
-        auto written = co_await cio::io::write_all(
-            state.socket,
+        // socket.write() follows the full-write contract, so one call drains
+        // the batch or reports why it could not.
+        auto written = co_await state.socket.write(
             std::span<const std::byte>{state.transfer.data(),
                                        static_cast<std::size_t>(read)});
         if (!written) co_return written.error();

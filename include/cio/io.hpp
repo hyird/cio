@@ -34,8 +34,11 @@ concept Reader = requires(T& reader, std::span<std::byte> buffer) {
     { reader.read(buffer) } -> std::same_as<Task<Result<std::size_t>>>;
 };
 
-// io.Writer: writes some bytes from a caller-owned span. A short write is
-// normal.
+// io.Writer, with Go's contract: write() returns the full length unless it
+// returns an error. A short count without an error is a broken writer — Go
+// forbids it for the same reason, because every caller would otherwise need a
+// retry loop, and the ones that forget become data-loss bugs. This is why there
+// is no write_all(): write() already is one.
 template <typename T>
 concept Writer = requires(T& writer, std::span<const std::byte> buffer) {
     { writer.write(buffer) } -> std::same_as<Task<Result<std::size_t>>>;
@@ -52,22 +55,6 @@ Task<Result<void>> read_full(R& reader, std::span<std::byte> buffer) {
     while (!buffer.empty()) {
         auto n = co_await reader.read(buffer);
         if (!n) co_return n.error();
-        if (*n == 0) co_return Error{Errc::closed};
-        buffer = buffer.subspan(*n);
-    }
-    co_return ok();
-}
-
-// Writes every byte, looping over short writes.
-//
-// Go has no io.WriteAll — its callers loop, or use io.Copy — but a socket write
-// that stops short is common enough to be worth naming.
-template <Writer W>
-Task<Result<void>> write_all(W& writer, std::span<const std::byte> buffer) {
-    while (!buffer.empty()) {
-        auto n = co_await writer.write(buffer);
-        if (!n) co_return n.error();
-        // A writer that reports success without progress would spin forever.
         if (*n == 0) co_return Error{Errc::closed};
         buffer = buffer.subspan(*n);
     }
@@ -94,9 +81,11 @@ Task<Result<std::uint64_t>> copy(W& dst, R& src, std::span<std::byte> scratch) {
         if (!n) co_return n.error();
         if (*n == 0) co_return total;
 
-        if (auto written = co_await write_all(dst, scratch.first(*n)); !written) {
-            co_return written.error();
-        }
+        auto written = co_await dst.write(scratch.first(*n));
+        if (!written) co_return written.error();
+        // The Writer contract makes a short count without an error a defect in
+        // the destination, as io.ErrShortWrite does.
+        if (*written != *n) co_return Error{EIO};
         total += *n;
     }
 }
@@ -109,7 +98,7 @@ Task<Result<std::uint64_t>> copy(W& dst, R& src, std::span<std::byte> scratch) {
 // deep task chains where frame size matters.
 template <Writer W, Reader R>
 Task<Result<std::uint64_t>> copy(W& dst, R& src) {
-    auto scratch = buffer_pool().take(64 * 1024);
+    auto scratch = buffer_pool().get(64 * 1024);
     // Qualified: an unqualified call would also find std::copy by ADL, because
     // the argument types come from namespace std.
     co_return co_await cio::io::copy(dst, src, scratch.bytes());
@@ -178,10 +167,9 @@ public:
         auto n = co_await source_->read(out);
         if (!n) co_return n.error();
         if (*n == 0) co_return std::size_t{0};
-        if (auto mirrored = co_await write_all(*mirror_, out.first(*n));
-            !mirrored) {
-            co_return mirrored.error();
-        }
+        auto mirrored = co_await mirror_->write(out.first(*n));
+        if (!mirrored) co_return mirrored.error();
+        if (*mirrored != *n) co_return Error{EIO};
         co_return *n;
     }
 

@@ -4,7 +4,7 @@
 //     while (auto line = co_await in.read_line()) { ... }
 //
 //     cio::bufio::Writer out(stream);
-//     co_await out.write_all(header);
+//     co_await out.write(header);
 //     co_await out.flush();
 //
 // Without this, a line-oriented protocol costs one syscall per read, and framing
@@ -46,7 +46,7 @@ class Reader {
 public:
     explicit Reader(R& source, std::size_t capacity = kDefaultBufferBytes)
         : source_(&source),
-          storage_(buffer_pool().take(capacity == 0 ? 1 : capacity)),
+          storage_(buffer_pool().get(capacity == 0 ? 1 : capacity)),
           // The pool rounds up to a size class, so the block can be larger than
           // the request. Use the requested capacity as the logical size, or a
           // caller asking for a small buffer would silently get a larger one and
@@ -81,23 +81,14 @@ public:
         co_return n;
     }
 
-    // Reads exactly `out.size()` bytes. End of stream first is Errc::closed.
-    Task<Result<void>> read_full(std::span<std::byte> out) {
-        while (!out.empty()) {
-            auto n = co_await read(out);
-            if (!n) co_return n.error();
-            if (*n == 0) co_return Error{Errc::closed};
-            out = out.subspan(*n);
-        }
-        co_return ok();
-    }
-
-    // Reads through the next `delimiter`, which is included in the result.
+    // Go's ReadString: reads through the next `delimiter`, which is included
+    // in the result.
     //
     // Returns nullopt at a clean end of stream with nothing buffered, so a loop
-    // reads `while (auto chunk = co_await in.read_until('\\n'))`. Trailing bytes
-    // with no delimiter are returned as a final chunk rather than dropped.
-    Task<Result<std::optional<std::string>>> read_until(
+    // reads `while (auto chunk = co_await in.read_string('\\n'))`. Trailing
+    // bytes with no delimiter are returned as a final chunk rather than
+    // dropped.
+    Task<Result<std::optional<std::string>>> read_string(
         char delimiter, std::size_t limit = kDefaultMaxLineBytes) {
         std::string out;
         for (;;) {
@@ -125,10 +116,10 @@ public:
         }
     }
 
-    // read_until('\n') with the trailing "\r\n" or "\n" removed.
+    // read_string('\n') with the trailing "\r\n" or "\n" removed.
     Task<Result<std::optional<std::string>>> read_line(
         std::size_t limit = kDefaultMaxLineBytes) {
-        auto chunk = co_await read_until('\n', limit);
+        auto chunk = co_await read_string('\n', limit);
         if (!chunk) co_return chunk.error();
         if (!*chunk) co_return std::optional<std::string>{};
 
@@ -138,15 +129,42 @@ public:
         co_return std::optional<std::string>{std::move(line)};
     }
 
-    // Buffered bytes without consuming them, for a caller that must decide how
-    // much of a frame it has. Only what is already in the buffer.
-    std::span<const std::byte> peek() const noexcept {
-        return {storage_.bytes().data() + begin_, buffered()};
+    // Go's Peek: a view of the next `count` bytes without consuming them,
+    // filling from the source as needed. A request beyond the buffer's
+    // capacity is EMSGSIZE, as Go's ErrBufferFull is; a shorter view than
+    // requested means end of stream. The view is invalidated by any other
+    // call on this Reader.
+    Task<Result<std::span<const std::byte>>> peek(std::size_t count) {
+        if (count > capacity_) co_return Error{EMSGSIZE};
+        while (buffered() < count) {
+            const std::size_t before = buffered();
+            if (auto filled = co_await fill(); !filled) {
+                co_return filled.error();
+            }
+            if (buffered() == before) break;  // end of stream
+        }
+        co_return std::span<const std::byte>{
+            storage_.bytes().data() + begin_,
+            std::min(count, buffered())};
     }
 
-    // Drops `count` buffered bytes, capped at what is buffered.
-    void consume(std::size_t count) noexcept {
-        begin_ += std::min(count, buffered());
+    // Go's Discard: skips `count` bytes, reading past the buffer as needed.
+    // Returns how many were skipped; fewer than requested means end of stream.
+    Task<Result<std::size_t>> discard(std::size_t count) {
+        std::size_t dropped = 0;
+        while (dropped < count) {
+            if (buffered() == 0) {
+                const std::size_t before = buffered();
+                if (auto filled = co_await fill(); !filled) {
+                    co_return filled.error();
+                }
+                if (buffered() == before) break;  // end of stream
+            }
+            const std::size_t take = std::min(count - dropped, buffered());
+            begin_ += take;
+            dropped += take;
+        }
+        co_return dropped;
     }
 
 private:
@@ -184,7 +202,7 @@ class Writer {
 public:
     explicit Writer(W& sink, std::size_t capacity = kDefaultBufferBytes)
         : sink_(&sink),
-          storage_(buffer_pool().take(capacity == 0 ? 1 : capacity)),
+          storage_(buffer_pool().get(capacity == 0 ? 1 : capacity)),
           // Same reason as Reader: the pool's block may exceed the request, and
           // flush timing must follow the capacity the caller chose.
           capacity_(std::min(capacity == 0 ? 1 : capacity, storage_.size())) {}
@@ -197,15 +215,16 @@ public:
     std::size_t buffered() const noexcept { return held_; }
     std::size_t available() const noexcept { return capacity_ - held_; }
 
-    // Buffers `in`, flushing as needed. A write at least as large as the buffer
-    // goes straight through after flushing what is held, so a big write is not
-    // copied twice.
-    Task<Result<void>> write_all(std::span<const std::byte> in) {
+    // Buffers `in`, flushing as needed; the whole span is accepted unless an
+    // error stops it, so this Writer satisfies io::Writer and Go's contract. A
+    // write at least as large as the buffer goes straight through after
+    // flushing what is held, so a big write is not copied twice.
+    Task<Result<std::size_t>> write(std::span<const std::byte> in) {
         if (in.size() >= capacity_) {
             if (auto flushed = co_await flush(); !flushed) {
                 co_return flushed.error();
             }
-            co_return co_await io::write_all(*sink_, in);
+            co_return co_await sink_->write(in);
         }
         if (in.size() > available()) {
             if (auto flushed = co_await flush(); !flushed) {
@@ -214,11 +233,12 @@ public:
         }
         std::copy_n(in.data(), in.size(), storage_.bytes().data() + held_);
         held_ += in.size();
-        co_return ok();
+        co_return in.size();
     }
 
-    Task<Result<void>> write_string(std::string_view text) {
-        co_return co_await write_all(std::span<const std::byte>{
+    // Go's WriteString.
+    Task<Result<std::size_t>> write_string(std::string_view text) {
+        co_return co_await write(std::span<const std::byte>{
             reinterpret_cast<const std::byte*>(text.data()), text.size()});
     }
 
@@ -227,9 +247,10 @@ public:
     Task<Result<void>> flush() {
         if (held_ == 0) co_return ok();
         const std::size_t pending = std::exchange(held_, 0);
-        co_return co_await io::write_all(
-            *sink_, std::span<const std::byte>{storage_.bytes().data(),
-                                              pending});
+        auto written = co_await sink_->write(std::span<const std::byte>{
+            storage_.bytes().data(), pending});
+        if (!written) co_return written.error();
+        co_return ok();
     }
 
 private:

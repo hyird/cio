@@ -26,7 +26,7 @@ cio::Task<> serve(net::TcpConn stream) {
         const int requests =
             splitter.feed(reinterpret_cast<const char*>(buffer), *n);
         for (int i = 0; i < requests; ++i) {
-            auto written = co_await stream.write_all(std::span(
+            auto written = co_await stream.write(std::span(
                 reinterpret_cast<const std::byte*>(bench::kResponse), bench::kResponseLen));
             if (!written) co_return;
         }

@@ -172,7 +172,8 @@ Task<Result<Status>> Child::wait() {
     co_return status;
 }
 
-Result<Child> spawn(const Command& command) {
+Result<Child> Command::start() const {
+    const Command& command = *this;
     if (command.program.empty()) return Error{EINVAL};
 
     Pipe in_pipe;
@@ -232,7 +233,7 @@ Result<Child> spawn(const Command& command) {
             !redirect(err_pipe.write_end(), STDERR_FILENO)) {
             fail();
         }
-        if (command.working_dir && ::chdir(command.working_dir->c_str()) != 0) {
+        if (command.dir && ::chdir(command.dir->c_str()) != 0) {
             fail();
         }
 
@@ -310,11 +311,20 @@ Result<Child> spawn(const Command& command) {
     return child;
 }
 
-Task<Result<Output>> run(Command command, std::size_t max_output) {
+Task<Result<Status>> Command::run() const {
+    auto child = start();
+    if (!child) co_return child.error();
+    co_return co_await child->wait();
+}
+
+Task<Result<Output>> Command::output(std::size_t max_output) const {
+    // Pipes are forced on a copy, so calling output() does not mutate the
+    // Command it was called on.
+    Command command = *this;
     command.stdout_pipe = true;
     command.stderr_pipe = true;
 
-    auto child = spawn(command);
+    auto child = command.start();
     if (!child) co_return child.error();
 
     // Drain both streams concurrently. Reading one to completion first would
@@ -324,11 +334,11 @@ Task<Result<Output>> run(Command command, std::size_t max_output) {
            std::size_t limit) -> Task<Result<std::vector<std::byte>>> {
             if (stream == nullptr) co_return std::vector<std::byte>{};
             co_return co_await io::read_all(*stream, limit);
-        }(child->err(), max_output));
+        }(child->stderr_pipe(), max_output));
 
     Result<std::vector<std::byte>> out = std::vector<std::byte>{};
-    if (child->out() != nullptr) {
-        out = co_await io::read_all(*child->out(), max_output);
+    if (child->stdout_pipe() != nullptr) {
+        out = co_await io::read_all(*child->stdout_pipe(), max_output);
     }
     auto err = co_await err_task;
 

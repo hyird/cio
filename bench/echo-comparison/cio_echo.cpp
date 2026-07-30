@@ -107,7 +107,7 @@ cio::Task<> serve(net::TcpConn stream) {
             stats->burn_us.fetch_add(burn, std::memory_order_relaxed);
         }
         burn_microseconds(burn);
-        if (auto written = co_await stream.write_all(std::span(buffer, *n)); !written) break;
+        if (auto written = co_await stream.write(std::span(buffer, *n)); !written) break;
     }
 }
 

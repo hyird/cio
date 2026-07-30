@@ -246,10 +246,6 @@ static_assert(std::same_as<
                   std::declval<ConstBytes>())),
               cio::Task<cio::Result<std::size_t>>>);
 static_assert(std::same_as<
-              decltype(std::declval<cio::net::TcpConn&>().write_all(
-                  std::declval<ConstBytes>())),
-              cio::Task<cio::Result<void>>>);
-static_assert(std::same_as<
               decltype(cio::net::TcpListener::listen(
                   std::declval<cio::net::SocketAddr>(), 16)),
               cio::Result<cio::net::TcpListener>>);
@@ -442,7 +438,7 @@ cio::Task<int> exercise_concurrency_surface() {
     static_assert(cio::io::Writer<cio::net::TcpConn>);
     const auto exact = co_await cio::io::read_full(stream, input);
     (void)exact;
-    const auto all_written = co_await cio::io::write_all(stream, output);
+    const auto all_written = co_await stream.write(output);
     (void)all_written;
     const auto copied = co_await cio::io::copy(stream, stream);
     (void)copied;

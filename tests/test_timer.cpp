@@ -228,7 +228,7 @@ void test_buffer_pool_reuses_storage() {
 
     std::byte* first = nullptr;
     {
-        auto buffer = pool.take(4096);
+        auto buffer = pool.get(4096);
         CIO_CHECK(buffer.valid());
         // Rounded up to a power-of-two class, never smaller than requested.
         CIO_CHECK(buffer.size() >= std::size_t{4096});
@@ -238,27 +238,27 @@ void test_buffer_pool_reuses_storage() {
 
     // The same storage comes back rather than a fresh allocation.
     {
-        auto again = pool.take(4096);
+        auto again = pool.get(4096);
         CIO_CHECK_EQ(again.bytes().data(), first);
     }
 
     // A size class is shared across a range of requests.
     {
-        auto small = pool.take(600);
-        auto also_small = pool.take(1000);
+        auto small = pool.get(600);
+        auto also_small = pool.get(1000);
         CIO_CHECK(small.size() == also_small.size());
     }
 
     // Above the pooled range: served, but not retained.
     {
-        auto huge = pool.take(cio::BufferPool::kMaxPooledBytes * 2);
+        auto huge = pool.get(cio::BufferPool::kMaxPooledBytes * 2);
         CIO_CHECK(huge.valid());
         CIO_CHECK(huge.size() >= cio::BufferPool::kMaxPooledBytes * 2);
     }
 
     // Zero is served as a usable buffer rather than an empty span.
     {
-        auto tiny = pool.take(0);
+        auto tiny = pool.get(0);
         CIO_CHECK(tiny.valid());
         CIO_CHECK(tiny.size() > std::size_t{0});
     }
@@ -266,7 +266,7 @@ void test_buffer_pool_reuses_storage() {
 
 void test_buffer_pool_move_semantics() {
     cio::BufferPool pool;
-    auto first = pool.take(1024);
+    auto first = pool.get(1024);
     std::byte* const data = first.bytes().data();
 
     auto moved = std::move(first);
@@ -275,7 +275,7 @@ void test_buffer_pool_move_semantics() {
     CIO_CHECK_EQ(moved.bytes().data(), data);
 
     // Move-assignment must return the overwritten buffer, not leak it.
-    auto second = pool.take(1024);
+    auto second = pool.get(1024);
     second = std::move(moved);
     CIO_CHECK_EQ(second.bytes().data(), data);
     CIO_CHECK(!moved.valid());
@@ -289,14 +289,14 @@ void test_object_pool_reuses_objects() {
     cio::Pool<Poolable> pool;
     Poolable* first = nullptr;
     {
-        auto handle = pool.take();
+        auto handle = pool.get();
         CIO_CHECK(handle.valid());
         handle->uses = 5;
         first = &*handle;
     }
     CIO_CHECK_EQ(pool.retained(), std::size_t{1});
     {
-        auto handle = pool.take();
+        auto handle = pool.get();
         CIO_CHECK_EQ(&*handle, first);
         // State is the caller's to reset; the pool does not pretend otherwise.
         CIO_CHECK_EQ(handle->uses, 5);

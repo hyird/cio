@@ -2,10 +2,12 @@
 //
 //     cio::process::Command cmd("/bin/echo");
 //     cmd.args = {"hello"};
+//     auto result = co_await cmd.output();          // Go's cmd.Output()
+//
 //     cmd.stdout_pipe = true;
-//     auto child = cio::process::spawn(cmd);
-//     auto output = co_await cio::io::read_all(*child->out());
-//     auto status = co_await child->wait();
+//     auto child = cmd.start();                     // Go's cmd.Start()
+//     auto text = co_await cio::io::read_all(*child->stdout_pipe());
+//     auto status = co_await child->wait();         // Go's cmd.Wait()
 //
 // Waiting uses pidfd, so a child is a pollable descriptor like any other: the
 // task suspends on the worker-local reactor rather than blocking a thread in
@@ -49,6 +51,10 @@ struct Status {
     bool signalled() const noexcept { return signal.has_value(); }
 };
 
+class Child;
+struct Output;
+
+// Go's exec.Cmd: an options struct with the run methods on it.
 struct Command {
     explicit Command(std::string program_path) : program(std::move(program_path)) {}
 
@@ -57,15 +63,28 @@ struct Command {
     std::vector<std::string> args;
     std::optional<std::string> argv0;
 
-    // Inherited from the parent when empty.
+    // Inherited from the parent when empty. `dir` is Go's Cmd.Dir.
     std::optional<std::vector<std::string>> env;
-    std::optional<std::string> working_dir;
+    std::optional<std::string> dir;
 
-    // Each requested pipe becomes a socket on the Child. Streams not piped are
-    // inherited from the parent.
+    // Each requested pipe becomes a descriptor on the Child. Streams not piped
+    // are inherited from the parent.
     bool stdin_pipe = false;
     bool stdout_pipe = false;
     bool stderr_pipe = false;
+
+    // Go's cmd.Start(): launches the child and returns without waiting. A
+    // missing program is ENOENT here rather than a mysterious exit status
+    // later, because the exec result is reported back over a close-on-exec
+    // pipe.
+    Result<Child> start() const;
+
+    // Go's cmd.Run(): start, then wait. No streams are captured.
+    Task<Result<Status>> run() const;
+
+    // Go's cmd.Output(), except stderr is returned alongside stdout instead of
+    // being folded into the error.
+    Task<Result<Output>> output(std::size_t max_output = 16u * 1024 * 1024) const;
 };
 
 // A running child process.
@@ -82,14 +101,17 @@ public:
     bool valid() const noexcept { return pid_ > 0; }
     int pid() const noexcept { return pid_; }
 
-    // Pipes, present only when requested. `in()` is where the parent writes.
-    PollableFd* in() noexcept { return stdin_ ? &*stdin_ : nullptr; }
-    PollableFd* out() noexcept { return stdout_ ? &*stdout_ : nullptr; }
-    PollableFd* err() noexcept { return stderr_ ? &*stderr_ : nullptr; }
+    // Go's StdinPipe/StdoutPipe/StderrPipe, present only when requested on
+    // the Command. stdin_pipe() is where the parent writes. Not stdin()/
+    // stdout()/stderr(): those are macros from <cstdio>.
+    PollableFd* stdin_pipe() noexcept { return stdin_ ? &*stdin_ : nullptr; }
+    PollableFd* stdout_pipe() noexcept { return stdout_ ? &*stdout_ : nullptr; }
+    PollableFd* stderr_pipe() noexcept { return stderr_ ? &*stderr_ : nullptr; }
 
     // Closes the child's stdin, which is how a filter is told there is no more
-    // input. Without it a child reading to EOF never finishes.
-    void close_in() { stdin_.reset(); }
+    // input; Go spells this closing the pipe from StdinPipe. Without it a
+    // child reading to EOF never finishes.
+    void close_stdin() { stdin_.reset(); }
 
     // Suspends until the child exits, then reaps it. Calling it twice returns
     // the same status rather than blocking forever on an already-reaped child.
@@ -111,7 +133,7 @@ public:
     Result<void> terminate() const { return signal(SIGTERM); }
 
 private:
-    friend Result<Child> spawn(const Command& command);
+    friend struct Command;
 
     int pid_ = -1;
     std::optional<PollableFd> pidfd_;
@@ -121,20 +143,11 @@ private:
     std::optional<Status> status_;
 };
 
-// Starts `command`. Reports the failure the child would have had: a missing
-// program is ENOENT here rather than a mysterious exit status later, because the
-// exec result is reported back over a close-on-exec pipe.
-Result<Child> spawn(const Command& command);
-
-// Runs to completion and collects stdout and stderr. The convenience form, for
-// the common case of shelling out and reading the result.
+// What Command::output() collects.
 struct Output {
     Status status;
     std::vector<std::byte> out;
     std::vector<std::byte> err;
 };
-
-Task<Result<Output>> run(Command command,
-                         std::size_t max_output = 16u * 1024 * 1024);
 
 }  // namespace cio::process

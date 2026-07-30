@@ -89,9 +89,11 @@ public:
     BufferPool(const BufferPool&) = delete;
     BufferPool& operator=(const BufferPool&) = delete;
 
-    // Never returns an invalid buffer: a size above the pooled range is served
-    // by a direct allocation that the handle frees instead of returning.
-    PooledBuffer take(std::size_t bytes);
+    // Go's sync.Pool.Get shape; Put is the handle's destructor, because RAII
+    // is how C++ spells "give it back". Never returns an invalid buffer: a
+    // size above the pooled range is served by a direct allocation that the
+    // handle frees instead of returning.
+    PooledBuffer get(std::size_t bytes);
 
     // Retained buffers, for tests and diagnostics.
     std::size_t retained() const;
@@ -103,7 +105,7 @@ private:
     static unsigned class_of(std::size_t bytes) noexcept;
     static std::size_t class_bytes(unsigned index) noexcept;
 
-    void give_back(std::byte* data, std::size_t size) noexcept;
+    void put(std::byte* data, std::size_t size) noexcept;
 
     struct ThreadCache {
         std::vector<std::byte*> free_list[kClassCount];
@@ -136,7 +138,7 @@ public:
     public:
         Handle() = default;
         ~Handle() {
-            if (pool_ != nullptr && value_) pool_->give_back(std::move(value_));
+            if (pool_ != nullptr && value_) pool_->put(std::move(value_));
         }
 
         Handle(Handle&& other) noexcept
@@ -145,7 +147,7 @@ public:
         Handle& operator=(Handle&& other) noexcept {
             if (this != &other) {
                 if (pool_ != nullptr && value_) {
-                    pool_->give_back(std::move(value_));
+                    pool_->put(std::move(value_));
                 }
                 pool_ = std::exchange(other.pool_, nullptr);
                 value_ = std::move(other.value_);
@@ -168,7 +170,8 @@ public:
         std::unique_ptr<T> value_;
     };
 
-    Handle take() {
+    // Go's Get; Put is the handle going out of scope.
+    Handle get() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!free_.empty()) {
@@ -187,7 +190,7 @@ public:
 
 private:
     friend class Handle;
-    void give_back(std::unique_ptr<T> value) {
+    void put(std::unique_ptr<T> value) {
         std::lock_guard<std::mutex> lock(mutex_);
         free_.push_back(std::move(value));
     }

@@ -339,11 +339,22 @@ Task<Result<std::size_t>> File::read_at(std::span<std::byte> buffer,
     if (fd_ < 0) co_return Error{EBADF};
     if (buffer.empty()) co_return std::size_t{0};
     const int fd = fd_;
+    // io.ReaderAt: fill the span unless EOF ends it, so a short count means
+    // exactly one thing.
     co_return co_await on_pool([fd, buffer, offset]() -> Result<std::size_t> {
-        const ssize_t n = ::pread(fd, buffer.data(), buffer.size(),
-                                  static_cast<off_t>(offset));
-        if (n < 0) return Error::from_errno();
-        return static_cast<std::size_t>(n);
+        std::size_t got = 0;
+        while (got < buffer.size()) {
+            const ssize_t n = ::pread(fd, buffer.data() + got,
+                                      buffer.size() - got,
+                                      static_cast<off_t>(offset + got));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return Error::from_errno();
+            }
+            if (n == 0) break;  // EOF
+            got += static_cast<std::size_t>(n);
+        }
+        return got;
     });
 }
 
@@ -351,10 +362,22 @@ Task<Result<std::size_t>> File::write(std::span<const std::byte> buffer) {
     if (fd_ < 0) co_return Error{EBADF};
     if (buffer.empty()) co_return std::size_t{0};
     const int fd = fd_;
+    // The loop runs on the pool thread inside one job: a partial write(2) on a
+    // regular file is rare, and bouncing back through admission for each
+    // continuation would cost more than it protects.
     co_return co_await on_pool([fd, buffer]() -> Result<std::size_t> {
-        const ssize_t n = ::write(fd, buffer.data(), buffer.size());
-        if (n < 0) return Error::from_errno();
-        return static_cast<std::size_t>(n);
+        std::size_t written = 0;
+        while (written < buffer.size()) {
+            const ssize_t n = ::write(fd, buffer.data() + written,
+                                      buffer.size() - written);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return Error::from_errno();
+            }
+            if (n == 0) return Error{ENOSPC};
+            written += static_cast<std::size_t>(n);
+        }
+        return written;
     });
 }
 
@@ -364,22 +387,20 @@ Task<Result<std::size_t>> File::write_at(std::span<const std::byte> buffer,
     if (buffer.empty()) co_return std::size_t{0};
     const int fd = fd_;
     co_return co_await on_pool([fd, buffer, offset]() -> Result<std::size_t> {
-        const ssize_t n = ::pwrite(fd, buffer.data(), buffer.size(),
-                                   static_cast<off_t>(offset));
-        if (n < 0) return Error::from_errno();
-        return static_cast<std::size_t>(n);
+        std::size_t written = 0;
+        while (written < buffer.size()) {
+            const ssize_t n = ::pwrite(fd, buffer.data() + written,
+                                       buffer.size() - written,
+                                       static_cast<off_t>(offset + written));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return Error::from_errno();
+            }
+            if (n == 0) return Error{ENOSPC};
+            written += static_cast<std::size_t>(n);
+        }
+        return written;
     });
-}
-
-Task<Result<void>> File::write_all(std::span<const std::byte> buffer) {
-    while (!buffer.empty()) {
-        auto n = co_await write(buffer);
-        if (!n) co_return n.error();
-        // A regular-file write reporting zero progress would loop forever.
-        if (*n == 0) co_return Error{ENOSPC};
-        buffer = buffer.subspan(*n);
-    }
-    co_return ok();
 }
 
 Task<Result<void>> File::sync() {

@@ -129,7 +129,7 @@ cio::Task<> connection(net::SocketAddr target, std::size_t payload, Histogram* h
         while (!g_stop.load(std::memory_order_relaxed)) {
             const auto started = cio::Clock::now();
 
-            if (!(co_await stream->write_all(request))) break;
+            if (!(co_await stream->write(request))) break;
 
             std::size_t got = 0;
             bool broken = false;

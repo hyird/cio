@@ -33,7 +33,7 @@ cio::Task<> serve(net::TcpConn stream) {
     for (;;) {
         auto n = co_await stream.read(buffer);
         if (!n || *n == 0) break;
-        if (auto written = co_await stream.write_all(std::span(buffer, *n)); !written) break;
+        if (auto written = co_await stream.write(std::span(buffer, *n)); !written) break;
     }
 }
 
@@ -57,7 +57,7 @@ cio::Task<long> client(net::SocketAddr target, long requests) {
 
     long completed = 0;
     for (long i = 0; i < requests; ++i) {
-        if (!(co_await stream->write_all(request))) break;
+        if (!(co_await stream->write(request))) break;
 
         std::size_t got = 0;
         while (got < kPayload) {

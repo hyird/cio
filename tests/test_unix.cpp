@@ -74,7 +74,7 @@ void test_filesystem_round_trip() {
             auto filled = co_await cio::io::read_full(
                 *conn, std::span<std::byte>{buffer});
             if (!filled) co_return std::string{};
-            if (!(co_await conn->write_all(bytes_of("world")))) {
+            if (!(co_await conn->write(bytes_of("world")))) {
                 co_return std::string{};
             }
             co_return std::string(
@@ -83,7 +83,7 @@ void test_filesystem_round_trip() {
 
         auto client = co_await net::UnixConn::dial(addr);
         CIO_CHECK(client.has_value());
-        CIO_CHECK((co_await client->write_all(bytes_of("hello"))).has_value());
+        CIO_CHECK((co_await client->write(bytes_of("hello"))).has_value());
 
         std::vector<std::byte> reply(5);
         auto read = co_await cio::io::read_full(*client,
@@ -112,7 +112,7 @@ void test_abstract_namespace() {
         auto serving = cio::spawn([](net::UnixListener l) -> cio::Task<bool> {
             auto conn = co_await l.accept();
             if (!conn) co_return false;
-            co_return (co_await conn->write_all(bytes_of("ok"))).has_value();
+            co_return (co_await conn->write(bytes_of("ok"))).has_value();
         }(std::move(*listener)));
 
         auto client = co_await net::UnixConn::dial(addr);

@@ -30,7 +30,7 @@ cio::Task<> serve(net::TcpConn stream) {
         }
         if (*n == 0) break;  // clean EOF
 
-        if (auto written = co_await stream.write_all(std::span(buffer, *n)); !written) break;
+        if (auto written = co_await stream.write(std::span(buffer, *n)); !written) break;
     }
     std::printf("[%s] closed\n", peer ? peer->to_string().c_str() : "?");
 }

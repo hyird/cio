@@ -30,7 +30,7 @@ void test_run_collects_output() {
     auto body = []() -> cio::Task<bool> {
         process::Command cmd("/bin/echo");
         cmd.args = {"hello", "world"};
-        auto result = co_await process::run(std::move(cmd));
+        auto result = co_await cmd.output();
         CIO_CHECK(result.has_value());
         CIO_CHECK(result->status.success());
         CIO_CHECK_EQ(result->status.exit_code.value_or(-1), 0);
@@ -45,7 +45,7 @@ void test_exit_code_and_stderr() {
     auto body = []() -> cio::Task<bool> {
         process::Command cmd("/bin/sh");
         cmd.args = {"-c", "echo out; echo err >&2; exit 3"};
-        auto result = co_await process::run(std::move(cmd));
+        auto result = co_await cmd.output();
         CIO_CHECK(result.has_value());
         CIO_CHECK(!result->status.success());
         CIO_CHECK_EQ(result->status.exit_code.value_or(-1), 3);
@@ -61,12 +61,12 @@ void test_exit_code_and_stderr() {
 // that is what the exec-status pipe is for.
 void test_missing_program_reports_enoent() {
     process::Command cmd("/nonexistent/program/xyz");
-    auto child = process::spawn(cmd);
+    auto child = cmd.start();
     CIO_CHECK(!child.has_value());
     CIO_CHECK(child.error().is(ENOENT));
 
     process::Command empty("");
-    CIO_CHECK(!process::spawn(empty).has_value());
+    CIO_CHECK(!empty.start().has_value());
 }
 
 void test_stdin_pipe_feeds_a_filter() {
@@ -75,18 +75,18 @@ void test_stdin_pipe_feeds_a_filter() {
         cmd.stdin_pipe = true;
         cmd.stdout_pipe = true;
 
-        auto child = process::spawn(cmd);
+        auto child = cmd.start();
         CIO_CHECK(child.has_value());
         CIO_CHECK(child->valid());
         CIO_CHECK(child->pid() > 0);
 
-        CIO_CHECK(child->in() != nullptr);
-        CIO_CHECK((co_await child->in()->write_all(bytes_of("piped input")))
+        CIO_CHECK(child->stdin_pipe() != nullptr);
+        CIO_CHECK((co_await child->stdin_pipe()->write(bytes_of("piped input")))
                       .has_value());
         // Without closing stdin, a filter reading to EOF never finishes.
-        child->close_in();
+        child->close_stdin();
 
-        auto out = co_await cio::io::read_all(*child->out());
+        auto out = co_await cio::io::read_all(*child->stdout_pipe());
         CIO_CHECK(out.has_value());
         CIO_CHECK_EQ(string_of(*out), std::string("piped input"));
 
@@ -102,7 +102,7 @@ void test_kill_reports_signal() {
     auto body = []() -> cio::Task<bool> {
         process::Command cmd("/bin/sleep");
         cmd.args = {"60"};
-        auto child = process::spawn(cmd);
+        auto child = cmd.start();
         CIO_CHECK(child.has_value());
 
         CIO_CHECK(child->kill().has_value());
@@ -128,7 +128,7 @@ void test_wait_honours_a_deadline() {
     auto body = []() -> cio::Task<bool> {
         process::Command cmd("/bin/sleep");
         cmd.args = {"60"};
-        auto child = process::spawn(cmd);
+        auto child = cmd.start();
         CIO_CHECK(child.has_value());
 
         child->set_deadline(cio::Clock::now() + 30ms);
@@ -153,7 +153,7 @@ void test_wait_is_cancellable() {
     auto body = []() -> cio::Task<bool> {
         process::Command cmd("/bin/sleep");
         cmd.args = {"60"};
-        auto child = process::spawn(cmd);
+        auto child = cmd.start();
         CIO_CHECK(child.has_value());
 
         cio::CancelSource stop;
@@ -181,9 +181,9 @@ void test_env_and_working_dir() {
         process::Command cmd("/bin/sh");
         cmd.args = {"-c", "echo $CIO_TEST_VAR; pwd"};
         cmd.env = std::vector<std::string>{"CIO_TEST_VAR=set-by-test", "PATH=/bin"};
-        cmd.working_dir = "/tmp";
+        cmd.dir = "/tmp";
 
-        auto result = co_await process::run(std::move(cmd));
+        auto result = co_await cmd.output();
         CIO_CHECK(result.has_value());
         CIO_CHECK(result->status.success());
         const std::string out = string_of(result->out);
@@ -203,7 +203,7 @@ void test_large_output_on_both_streams() {
                     "for i in $(seq 1 400); do "
                     "echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; "
                     "echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb >&2; done"};
-        auto result = co_await process::run(std::move(cmd));
+        auto result = co_await cmd.output();
         CIO_CHECK(result.has_value());
         CIO_CHECK(result->status.success());
         CIO_CHECK(result->out.size() > std::size_t{16000});
@@ -220,10 +220,10 @@ void test_pipe_through_bufio() {
         cmd.args = {"-c", "echo one; echo two; echo three"};
         cmd.stdout_pipe = true;
 
-        auto child = process::spawn(cmd);
+        auto child = cmd.start();
         CIO_CHECK(child.has_value());
 
-        cio::bufio::Reader in(*child->out());
+        cio::bufio::Reader in(*child->stdout_pipe());
         std::string joined;
         while (auto line = co_await in.read_line()) {
             if (!*line) break;

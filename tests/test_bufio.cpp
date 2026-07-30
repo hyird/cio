@@ -259,9 +259,99 @@ void test_over_a_socket() {
     CIO_CHECK(cio::run(body()));
 }
 
+
+// ------------------------------------------------- io helpers ---
+
+void test_read_all_and_limit() {
+    auto body = []() -> cio::Task<bool> {
+        DribbleSource source{std::string(5000, 'k'), 0, 250};
+        auto all = co_await cio::io::read_all(source);
+        CIO_CHECK(all.has_value());
+        CIO_CHECK_EQ(all->size(), std::size_t{5000});
+
+        // The bound reports rather than truncating, so a cut-off read cannot be
+        // mistaken for a complete one.
+        DribbleSource big{std::string(5000, 'k'), 0, 250};
+        auto refused = co_await cio::io::read_all(big, /*limit=*/1000);
+        CIO_CHECK(!refused.has_value());
+        CIO_CHECK(refused.error().is(EMSGSIZE));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+void test_limit_reader_stops_at_the_bound() {
+    auto body = []() -> cio::Task<bool> {
+        DribbleSource source{"HEADER" + std::string(100, 'b'), 0, 4};
+        cio::io::LimitReader limited(source, 6);
+
+        // The wrapped reader ends at the bound, so a parser that reads to "end
+        // of stream" consumes exactly the slice it was given.
+        auto slice = co_await cio::io::read_all(limited);
+        CIO_CHECK(slice.has_value());
+        CIO_CHECK_EQ(slice->size(), std::size_t{6});
+        CIO_CHECK_EQ(std::string(reinterpret_cast<const char*>(slice->data()), 6),
+                     std::string("HEADER"));
+        CIO_CHECK_EQ(limited.remaining(), std::uint64_t{0});
+
+        // The underlying stream is untouched beyond the bound and can continue.
+        std::vector<std::byte> rest(4);
+        auto more = co_await cio::io::read_full(source,
+                                                std::span<std::byte>{rest});
+        CIO_CHECK(more.has_value());
+        CIO_CHECK_EQ(std::string(reinterpret_cast<const char*>(rest.data()), 4),
+                     std::string("bbbb"));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+void test_tee_reader_mirrors() {
+    auto body = []() -> cio::Task<bool> {
+        DribbleSource source{"mirror me", 0, 3};
+        CountingSink mirror;
+        cio::io::TeeReader tee(source, mirror);
+
+        auto read = co_await cio::io::read_all(tee);
+        CIO_CHECK(read.has_value());
+        CIO_CHECK_EQ(std::string(reinterpret_cast<const char*>(read->data()),
+                                 read->size()),
+                     std::string("mirror me"));
+        // Everything read was also written, in order.
+        CIO_CHECK_EQ(mirror.seen, std::string("mirror me"));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// A mirror that fails must fail the read, not silently lose the copy.
+void test_tee_reader_propagates_mirror_failure() {
+    struct FailingSink {
+        cio::Task<cio::Result<std::size_t>> write(std::span<const std::byte>) {
+            co_return cio::Error{ENOSPC};
+        }
+    };
+    auto body = []() -> cio::Task<bool> {
+        DribbleSource source{"data", 0, 4};
+        FailingSink mirror;
+        cio::io::TeeReader tee(source, mirror);
+
+        std::byte buffer[4];
+        auto read = co_await tee.read(buffer);
+        CIO_CHECK(!read.has_value());
+        CIO_CHECK(read.error().is(ENOSPC));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 }  // namespace
 
 int main() {
+    RUN_TEST(test_read_all_and_limit);
+    RUN_TEST(test_limit_reader_stops_at_the_bound);
+    RUN_TEST(test_tee_reader_mirrors);
+    RUN_TEST(test_tee_reader_propagates_mirror_failure);
     RUN_TEST(test_read_line_reassembles);
     RUN_TEST(test_buffering_reduces_reads);
     RUN_TEST(test_large_read_bypasses_the_buffer);

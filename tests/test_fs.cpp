@@ -310,9 +310,144 @@ void test_file_saturation_does_not_starve_resolver() {
     CIO_CHECK(runtime.block_on(body()));
 }
 
+
+// -------------------------------------------------- directories & files ---
+
+// A temp directory removed by remove_all when the guard dies.
+class TempDir {
+public:
+    TempDir() {
+        const char* base = std::getenv("TMPDIR");
+        path_ = std::string(base != nullptr ? base : "/tmp") + "/cio_test_dir_" +
+                std::to_string(::getpid()) + "_" +
+                std::to_string(dir_counter_.fetch_add(1));
+    }
+    ~TempDir() { (void)cio::run(cio::fs::remove_all(path_)); }
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+    const std::string& get() const noexcept { return path_; }
+
+private:
+    std::string path_;
+    static std::atomic<unsigned> dir_counter_;
+};
+
+std::atomic<unsigned> TempDir::dir_counter_{0};
+
+void test_mkdir_read_dir_and_remove_all() {
+    TempDir root;
+    auto body = [&root]() -> cio::Task<bool> {
+        // mkdir_all creates every missing prefix; mkdir does not.
+        const std::string nested = root.get() + "/a/b/c";
+        CIO_CHECK(!(co_await fs::mkdir(nested)).has_value());
+        CIO_CHECK((co_await fs::mkdir_all(nested)).has_value());
+        // Re-running it is success, as os.MkdirAll defines it.
+        CIO_CHECK((co_await fs::mkdir_all(nested)).has_value());
+
+        auto info = co_await fs::stat(nested);
+        CIO_CHECK(info.has_value());
+        CIO_CHECK(info->is_dir());
+
+        // A file where a directory should be is an error, not silent success.
+        const std::string blocked = root.get() + "/a/file";
+        CIO_CHECK((co_await fs::write_file(blocked, bytes_of("x"))).has_value());
+        CIO_CHECK(!(co_await fs::mkdir_all(blocked + "/deeper")).has_value());
+
+        // read_dir excludes "." and ".." and classifies entries.
+        auto entries = co_await fs::read_dir(root.get() + "/a");
+        CIO_CHECK(entries.has_value());
+        CIO_CHECK_EQ(entries->size(), std::size_t{2});
+        bool saw_dir = false;
+        bool saw_file = false;
+        for (const auto& e : *entries) {
+            CIO_CHECK(e.name != "." && e.name != "..");
+            if (e.name == "b") { CIO_CHECK(e.is_dir); saw_dir = true; }
+            if (e.name == "file") { CIO_CHECK(e.is_regular); saw_file = true; }
+        }
+        CIO_CHECK(saw_dir);
+        CIO_CHECK(saw_file);
+
+        auto missing = co_await fs::read_dir(root.get() + "/absent");
+        CIO_CHECK(!missing.has_value());
+
+        // remove_all takes the whole tree; removing what is already gone is
+        // success.
+        CIO_CHECK((co_await fs::remove_all(root.get() + "/a")).has_value());
+        CIO_CHECK(!(co_await fs::stat(root.get() + "/a")).has_value());
+        CIO_CHECK((co_await fs::remove_all(root.get() + "/a")).has_value());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+void test_read_file_write_file_and_rename() {
+    TempDir root;
+    auto body = [&root]() -> cio::Task<bool> {
+        CIO_CHECK((co_await fs::mkdir_all(root.get())).has_value());
+        const std::string path = root.get() + "/data";
+        const std::string payload(10000, 'q');
+
+        CIO_CHECK((co_await fs::write_file(path, bytes_of(payload))).has_value());
+        auto read = co_await fs::read_file(path);
+        CIO_CHECK(read.has_value());
+        CIO_CHECK_EQ(read->size(), payload.size());
+        CIO_CHECK_EQ(string_of(*read), payload);
+
+        // write_file truncates rather than appending.
+        CIO_CHECK((co_await fs::write_file(path, bytes_of("short"))).has_value());
+        auto shortened = co_await fs::read_file(path);
+        CIO_CHECK(shortened.has_value());
+        CIO_CHECK_EQ(string_of(*shortened), std::string("short"));
+
+        // The limit is enforced, and reports rather than truncating, so a
+        // cut-off body cannot be mistaken for a complete one.
+        auto refused = co_await fs::read_file(path, /*limit=*/2);
+        CIO_CHECK(!refused.has_value());
+        CIO_CHECK(refused.error().is(EMSGSIZE));
+
+        // Rename within a filesystem is the atomic update primitive.
+        const std::string moved = root.get() + "/renamed";
+        CIO_CHECK((co_await fs::rename(path, moved)).has_value());
+        CIO_CHECK(!(co_await fs::stat(path)).has_value());
+        auto after = co_await fs::read_file(moved);
+        CIO_CHECK(after.has_value());
+        CIO_CHECK_EQ(string_of(*after), std::string("short"));
+
+        CIO_CHECK(!(co_await fs::rename(path, moved)).has_value());
+        CIO_CHECK(!(co_await fs::read_file(root.get() + "/absent")).has_value());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// remove_all must not follow a symlink out of the tree it was asked to remove.
+void test_remove_all_does_not_follow_symlinks() {
+    TempDir root;
+    auto body = [&root]() -> cio::Task<bool> {
+        CIO_CHECK((co_await fs::mkdir_all(root.get() + "/tree")).has_value());
+        const std::string outside = root.get() + "/keep_me";
+        CIO_CHECK((co_await fs::write_file(outside, bytes_of("precious")))
+                      .has_value());
+
+        const std::string link = root.get() + "/tree/link";
+        CIO_CHECK_EQ(::symlink(outside.c_str(), link.c_str()), 0);
+
+        CIO_CHECK((co_await fs::remove_all(root.get() + "/tree")).has_value());
+        // The link is gone; its target is not.
+        auto survived = co_await fs::read_file(outside);
+        CIO_CHECK(survived.has_value());
+        CIO_CHECK_EQ(string_of(*survived), std::string("precious"));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 }  // namespace
 
 int main() {
+    RUN_TEST(test_mkdir_read_dir_and_remove_all);
+    RUN_TEST(test_read_file_write_file_and_rename);
+    RUN_TEST(test_remove_all_does_not_follow_symlinks);
     RUN_TEST(test_create_write_read_roundtrip);
     RUN_TEST(test_sequential_offset_and_seek);
     RUN_TEST(test_open_flags_and_errors);

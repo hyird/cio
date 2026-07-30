@@ -115,4 +115,79 @@ Task<Result<std::uint64_t>> copy(W& dst, R& src) {
     co_return co_await cio::io::copy(dst, src, scratch.bytes());
 }
 
+// io.ReadAll: reads until end of stream.
+//
+// `limit` is not optional the way io.ReadAll's absence of one is: reading an
+// untrusted stream into memory without a bound is how a service is made to
+// exhaust its own heap. Exceeding it is EMSGSIZE rather than a truncated result,
+// so a caller cannot mistake a cut-off body for a complete one.
+template <Reader R>
+Task<Result<std::vector<std::byte>>> read_all(
+    R& reader, std::size_t limit = 64u * 1024 * 1024) {
+    std::vector<std::byte> out;
+    std::byte chunk[16 * 1024];
+    for (;;) {
+        auto n = co_await reader.read(chunk);
+        if (!n) co_return n.error();
+        if (*n == 0) co_return out;
+        if (out.size() + *n > limit) co_return Error{EMSGSIZE};
+        out.insert(out.end(), chunk, chunk + *n);
+    }
+}
+
+// io.LimitReader: a reader that stops after `limit` bytes.
+//
+// Wrapping rather than a parameter on read: a length-delimited body is handed to
+// a parser that should not need to know it is bounded, which is exactly what
+// io.LimitReader is for.
+template <Reader R>
+class LimitReader {
+public:
+    LimitReader(R& source, std::uint64_t limit) noexcept
+        : source_(&source), remaining_(limit) {}
+
+    std::uint64_t remaining() const noexcept { return remaining_; }
+
+    Task<Result<std::size_t>> read(std::span<std::byte> out) {
+        if (remaining_ == 0) co_return std::size_t{0};  // end of the slice
+        if (out.size() > remaining_) {
+            out = out.first(static_cast<std::size_t>(remaining_));
+        }
+        auto n = co_await source_->read(out);
+        if (!n) co_return n.error();
+        remaining_ -= *n;
+        co_return *n;
+    }
+
+private:
+    R* source_ = nullptr;
+    std::uint64_t remaining_ = 0;
+};
+
+// io.TeeReader: reads from `source` and writes what it read to `mirror`.
+//
+// A mirror write that fails fails the read, rather than being dropped: a tee
+// whose copy silently goes missing is worse than one that stops.
+template <Reader R, Writer W>
+class TeeReader {
+public:
+    TeeReader(R& source, W& mirror) noexcept
+        : source_(&source), mirror_(&mirror) {}
+
+    Task<Result<std::size_t>> read(std::span<std::byte> out) {
+        auto n = co_await source_->read(out);
+        if (!n) co_return n.error();
+        if (*n == 0) co_return std::size_t{0};
+        if (auto mirrored = co_await write_all(*mirror_, out.first(*n));
+            !mirrored) {
+            co_return mirrored.error();
+        }
+        co_return *n;
+    }
+
+private:
+    R* source_ = nullptr;
+    W* mirror_ = nullptr;
+};
+
 }  // namespace cio::io

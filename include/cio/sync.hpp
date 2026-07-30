@@ -8,6 +8,8 @@
 #include <coroutine>
 #include <cstddef>
 #include <mutex>
+#include <utility>
+#include <vector>
 #include <stdexcept>
 #include <utility>
 
@@ -225,6 +227,278 @@ private:
     std::atomic<bool> has_waiters_{false};
     detail::WaitNode* head_ = nullptr;
     detail::WaitNode* tail_ = nullptr;
+};
+
+
+// Go's sync.RWMutex.
+//
+// Writer-preferring: a waiting writer blocks new readers, so a steady stream of
+// readers cannot starve it. Go makes the same choice, and the alternative turns
+// a read-heavy workload into a writer that never runs.
+class RWMutex {
+public:
+    RWMutex() = default;
+    RWMutex(const RWMutex&) = delete;
+    RWMutex& operator=(const RWMutex&) = delete;
+
+    class [[nodiscard]] ReadGuard {
+    public:
+        ReadGuard() = default;
+        explicit ReadGuard(RWMutex* owner) noexcept : owner_(owner) {}
+        ~ReadGuard() { if (owner_ != nullptr) owner_->unlock_read(); }
+
+        ReadGuard(ReadGuard&& other) noexcept
+            : owner_(std::exchange(other.owner_, nullptr)) {}
+        ReadGuard& operator=(ReadGuard&& other) noexcept {
+            if (this != &other) {
+                if (owner_ != nullptr) owner_->unlock_read();
+                owner_ = std::exchange(other.owner_, nullptr);
+            }
+            return *this;
+        }
+        ReadGuard(const ReadGuard&) = delete;
+        ReadGuard& operator=(const ReadGuard&) = delete;
+
+    private:
+        RWMutex* owner_ = nullptr;
+    };
+
+    class [[nodiscard]] WriteGuard {
+    public:
+        WriteGuard() = default;
+        explicit WriteGuard(RWMutex* owner) noexcept : owner_(owner) {}
+        ~WriteGuard() { if (owner_ != nullptr) owner_->unlock(); }
+
+        WriteGuard(WriteGuard&& other) noexcept
+            : owner_(std::exchange(other.owner_, nullptr)) {}
+        WriteGuard& operator=(WriteGuard&& other) noexcept {
+            if (this != &other) {
+                if (owner_ != nullptr) owner_->unlock();
+                owner_ = std::exchange(other.owner_, nullptr);
+            }
+            return *this;
+        }
+        WriteGuard(const WriteGuard&) = delete;
+        WriteGuard& operator=(const WriteGuard&) = delete;
+
+    private:
+        RWMutex* owner_ = nullptr;
+    };
+
+    // Go's RLock. Suspends while a writer holds or is waiting for the lock.
+    [[nodiscard]] auto lock_read() noexcept {
+        struct Awaiter {
+            RWMutex* self;
+            detail::WaitNode node{};
+
+            bool await_ready() const noexcept { return false; }
+            bool await_suspend(std::coroutine_handle<> h) {
+                std::lock_guard<std::mutex> lock(self->mutex_);
+                if (!self->writing_ && self->waiting_writers_ == 0) {
+                    ++self->readers_;
+                    return false;
+                }
+                node.arm(h);
+                node.next = self->read_waiters_;
+                self->read_waiters_ = &node;
+                return true;
+            }
+            ReadGuard await_resume() const noexcept { return ReadGuard{self}; }
+        };
+        return Awaiter{this, {}};
+    }
+
+    // Go's Lock.
+    [[nodiscard]] auto lock() noexcept {
+        struct Awaiter {
+            RWMutex* self;
+            detail::WaitNode node{};
+
+            bool await_ready() const noexcept { return false; }
+            bool await_suspend(std::coroutine_handle<> h) {
+                std::lock_guard<std::mutex> lock(self->mutex_);
+                if (!self->writing_ && self->readers_ == 0) {
+                    self->writing_ = true;
+                    return false;
+                }
+                ++self->waiting_writers_;
+                node.arm(h);
+                node.next = self->write_waiters_;
+                self->write_waiters_ = &node;
+                return true;
+            }
+            WriteGuard await_resume() const noexcept { return WriteGuard{self}; }
+        };
+        return Awaiter{this, {}};
+    }
+
+    bool try_lock_read() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (writing_ || waiting_writers_ != 0) return false;
+        ++readers_;
+        return true;
+    }
+
+    bool try_lock() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (writing_ || readers_ != 0) return false;
+        writing_ = true;
+        return true;
+    }
+
+    void unlock_read() {
+        detail::WaitNode* to_wake = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (readers_ == 0) return;
+            if (--readers_ != 0) return;
+            to_wake = take_next_writer_locked();
+        }
+        detail::wake_list(to_wake);
+    }
+
+    void unlock() {
+        detail::WaitNode* to_wake = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!writing_) return;
+            writing_ = false;
+            // A waiting writer goes first; only when none is left do readers
+            // proceed, which is what makes this writer-preferring.
+            to_wake = take_next_writer_locked();
+            if (to_wake == nullptr) {
+                to_wake = std::exchange(read_waiters_, nullptr);
+                for (detail::WaitNode* n = to_wake; n != nullptr; n = n->next) {
+                    ++readers_;
+                }
+            }
+        }
+        detail::wake_list(to_wake);
+    }
+
+private:
+    detail::WaitNode* take_next_writer_locked() noexcept {
+        if (write_waiters_ == nullptr) return nullptr;
+        detail::WaitNode* next = write_waiters_;
+        write_waiters_ = next->next;
+        next->next = nullptr;
+        --waiting_writers_;
+        writing_ = true;
+        return next;
+    }
+
+    std::mutex mutex_;
+    std::size_t readers_ = 0;
+    std::size_t waiting_writers_ = 0;
+    bool writing_ = false;
+    detail::WaitNode* read_waiters_ = nullptr;
+    detail::WaitNode* write_waiters_ = nullptr;
+};
+
+// Go's sync.Once.
+//
+// The callable may suspend, which sync.Once cannot express: every other task
+// awaiting the same Once waits for the first to finish rather than racing past a
+// half-initialised value.
+class Once {
+public:
+    Once() = default;
+    Once(const Once&) = delete;
+    Once& operator=(const Once&) = delete;
+
+    bool done() const noexcept { return done_.load(std::memory_order_acquire); }
+
+    template <typename F>
+    Task<void> call(F fn) {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (done_.load(std::memory_order_acquire)) co_return;
+            if (running_) {
+                // Someone else is initialising. Wait for them rather than
+                // running it a second time.
+                auto gate = gate_;
+                lock.unlock();
+                (void)co_await gate.recv();
+                co_return;
+            }
+            // The gate must exist before running_ is published, or a second
+            // caller could observe running_ and find nothing to wait on.
+            if (!static_cast<bool>(gate_)) gate_ = make_chan<Unit>(0);
+            running_ = true;
+        }
+
+        // Outside the lock: fn may suspend, and holding a std::mutex across a
+        // suspension would block a worker rather than the task.
+        co_await std::move(fn)();
+
+        Chan<Unit> gate;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            done_.store(true, std::memory_order_release);
+            running_ = false;
+            gate = gate_;
+        }
+        // Closing releases every waiter at once.
+        gate.close();
+        co_return;
+    }
+
+private:
+    std::mutex mutex_;
+    std::atomic<bool> done_{false};
+    bool running_ = false;
+    Chan<Unit> gate_{};
+};
+
+// Go's sync.Cond, over a cio Mutex.
+//
+// wait() releases the mutex, suspends, and reacquires it before returning, which
+// is the contract that makes a condition variable usable. Spurious wakeups are
+// possible, so callers must re-check their predicate in a loop, exactly as with
+// sync.Cond or std::condition_variable.
+class Cond {
+public:
+    explicit Cond(Mutex& mutex) noexcept : mutex_(&mutex) {}
+    Cond(const Cond&) = delete;
+    Cond& operator=(const Cond&) = delete;
+
+    // Requires the mutex to be held; returns holding it again.
+    Task<void> wait(Mutex::Guard& guard) {
+        auto waiter = make_chan<Unit>(0);
+        {
+            std::lock_guard<std::mutex> lock(list_mutex_);
+            waiters_.push_back(waiter);
+        }
+        guard = Mutex::Guard{};       // release
+        (void)co_await waiter.recv();  // woken by notify
+        guard = co_await mutex_->lock();
+        co_return;
+    }
+
+    void notify_one() {
+        Chan<Unit> next;
+        {
+            std::lock_guard<std::mutex> lock(list_mutex_);
+            if (waiters_.empty()) return;
+            next = waiters_.front();
+            waiters_.erase(waiters_.begin());
+        }
+        next.close();
+    }
+
+    void notify_all() {
+        std::vector<Chan<Unit>> all;
+        {
+            std::lock_guard<std::mutex> lock(list_mutex_);
+            all.swap(waiters_);
+        }
+        for (auto& waiter : all) waiter.close();
+    }
+
+private:
+    Mutex* mutex_ = nullptr;
+    std::mutex list_mutex_;
+    std::vector<Chan<Unit>> waiters_;
 };
 
 }  // namespace cio

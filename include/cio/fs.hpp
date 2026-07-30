@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <vector>
 #include <utility>
 
 #include "cio/result.hpp"
@@ -112,9 +113,45 @@ private:
     int fd_ = -1;
 };
 
+// A single directory entry, as os.ReadDir yields.
+struct DirEntry {
+    std::string name;
+    bool is_dir = false;
+    bool is_regular = false;
+    bool is_symlink = false;
+};
+
 Task<Result<File>> open(std::string path, OpenOptions options = {});
 Task<Result<File>> create(std::string path, std::uint32_t permissions = 0644);
 Task<Result<FileInfo>> stat(std::string path);
 Task<Result<void>> remove(std::string path);
+
+// os.ReadDir. Entries exclude "." and "..", and are returned in directory order
+// rather than sorted, which is what readdir gives; sort at the call site if the
+// order matters.
+Task<Result<std::vector<DirEntry>>> read_dir(std::string path);
+
+// os.Rename. Within one filesystem this is atomic, which is what makes
+// write-to-temp-then-rename a safe update; across filesystems it fails with
+// EXDEV rather than silently copying.
+Task<Result<void>> rename(std::string from, std::string to);
+
+// os.Mkdir and os.MkdirAll.
+Task<Result<void>> mkdir(std::string path, std::uint32_t permissions = 0755);
+Task<Result<void>> mkdir_all(std::string path,
+                             std::uint32_t permissions = 0755);
+
+// os.RemoveAll: removes a path and everything under it.
+Task<Result<void>> remove_all(std::string path);
+
+// os.ReadFile and os.WriteFile.
+//
+// read_file takes a limit for the same reason io::read_all does: a file of
+// unknown size read into memory without a bound is a way to exhaust the heap.
+Task<Result<std::vector<std::byte>>> read_file(
+    std::string path, std::size_t limit = 64u * 1024 * 1024);
+Task<Result<void>> write_file(std::string path,
+                             std::span<const std::byte> contents,
+                             std::uint32_t permissions = 0644);
 
 }  // namespace cio::fs

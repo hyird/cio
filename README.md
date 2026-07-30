@@ -104,11 +104,11 @@ cmake --build build-tsan -j
 ctest --test-dir build-tsan --output-on-failure
 ```
 
-Seventeen test executables cover the public API, scheduler, worker bitmaps,
+Nineteen test executables cover the public API, scheduler, worker bitmaps,
 directed MPSC inbox, channels, `select`, networking, Unix sockets, DNS, files,
-signals, buffered I/O, timers and pools, scoped deadlines and descriptor
-adoption, synchronization and soak behaviour. The optional TLS module adds an
-eighteenth:
+processes, signals, buffered I/O, timers and pools, scoped deadlines and
+descriptor adoption, synchronization and soak behaviour. The optional TLS module
+adds a twentieth:
 
 ```sh
 cmake -S . -B build-tls -DCMAKE_BUILD_TYPE=Release -DCIO_TLS=ON
@@ -137,7 +137,7 @@ Long coroutine soaks should not run under ASan or TSan; see
 | `cio::select(...)` | Receive, send, timeout and default cases |
 | `cio::TaskGroup` | Structured child-task scope |
 | `CancelSource` / `CancelToken` | Cooperative cancellation |
-| `WaitGroup` / `Mutex` | Task-suspending synchronization |
+| `WaitGroup` / `Mutex` / `RWMutex` / `Once` / `Cond` | Task-suspending synchronization (`sync`) |
 | `cio::sleep(duration)` | Runtime timer |
 | `cio::Timer` / `Ticker` / `after_func` | `time.Timer` / `time.Ticker` / `time.AfterFunc` |
 | `cio::buffer_pool()` / `Pool<T>` | Reusable I/O buffers and objects |
@@ -150,10 +150,12 @@ Long coroutine soaks should not run under ASan or TSan; see
 | `cio::Timeout` | Scoped, nestable deadline that restores the enclosing one |
 | `cio::PollableFd` | Adopt a foreign fd (eventfd, timerfd, inotify, a C library) |
 | `cio::net::Dialer` / `dial_tcp()` | Resolution plus raced address selection and timeouts |
-| `cio::fs::File` / `open()` / `stat()` | Regular-file I/O on the blocking pool |
+| `cio::fs::File` / `open` / `read_file` / `read_dir` | Files and directories on the blocking pool (`os`) |
+| `cio::process::Command` / `spawn` / `run` | Child processes, awaited through `pidfd` (`os/exec`) |
 | `cio::signal::SignalSet` | `signalfd`-backed signal delivery |
 | `cio::tls::Conn` | Optional TLS (`-DCIO_TLS=ON`, links OpenSSL) |
-| `cio::io::read_full` / `write_all` / `copy` | `io.ReadFull` / `io.Copy` over `io::Reader`/`io::Writer` |
+| `cio::io::read_full` / `copy` / `read_all` | `io.ReadFull` / `io.Copy` / `io.ReadAll` |
+| `cio::io::LimitReader` / `TeeReader` | `io.LimitReader` / `io.TeeReader` |
 | `net::Conn` / `PacketConn` / `Listener` | Go's three net interfaces, as concepts |
 | `cio::io::Reader` / `Writer` | `io.Reader` / `io.Writer`, as concepts |
 | `net::split_host_port` / `join_host_port` | `net.SplitHostPort` / `net.JoinHostPort` |

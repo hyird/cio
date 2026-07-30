@@ -18,10 +18,15 @@
 // one. Timeout saves what it finds and puts it back, so scopes nest.
 #pragma once
 
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
+#include <span>
 #include <utility>
 
 #include "cio/clock.hpp"
+#include "cio/io.hpp"
 #include "cio/net.hpp"
 #include "cio/result.hpp"
 
@@ -144,10 +149,19 @@ private:
 // A pollable descriptor the runtime did not create.
 //
 // This is the escape hatch for integrating a C library that hands out an fd —
-// eventfd, timerfd, inotify, signalfd, a third-party protocol library. It
-// registers the descriptor with the worker-local reactor and exposes readiness,
-// deadlines and cancellation, and nothing else: the runtime does not perform,
-// interpret or buffer the I/O, the caller makes its own syscalls.
+// eventfd, timerfd, inotify, signalfd, a pipe, a third-party protocol library.
+// It registers the descriptor with the worker-local reactor and exposes
+// readiness, deadlines and cancellation.
+//
+// Two ways to use it. `readable()`/`writable()` wait and leave the syscall to the
+// caller, which is what an interface with its own framing needs. `read()`/
+// `write()` do the ordinary thing with read(2) and write(2), which makes a
+// PollableFd satisfy io::Reader and io::Writer, so bufio and the io helpers work
+// over a pipe or a character device unchanged. Nothing is interpreted or buffered
+// either way.
+//
+// read(2), not recv(2): this has to work on pipes and character devices, where
+// the socket calls fail with ENOTSOCK.
 //
 // The descriptor must be non-blocking. Ownership transfers: close() unregisters
 // and closes it, and the destructor does the same.
@@ -182,6 +196,50 @@ public:
     detail::IoAwaiter readable() noexcept { return impl_.readable(); }
     detail::IoAwaiter writable() noexcept { return impl_.writable(); }
 
+    // Reads what is available; 0 means end of file.
+    Task<Result<std::size_t>> read(std::span<std::byte> buffer) {
+        if (!impl_.valid()) co_return Error{EBADF};
+        for (;;) {
+            const ssize_t n =
+                ::read(impl_.native_handle(), buffer.data(), buffer.size());
+            if (n >= 0) co_return static_cast<std::size_t>(n);
+
+            const int error = errno;
+            if (error == EINTR) continue;
+            if (error != EAGAIN && error != EWOULDBLOCK) co_return Error{error};
+            if (auto ready = co_await impl_.readable(); !ready) {
+                co_return ready.error();
+            }
+        }
+    }
+
+    // Writes what it can; may be a partial write, like write(2).
+    Task<Result<std::size_t>> write(std::span<const std::byte> buffer) {
+        if (!impl_.valid()) co_return Error{EBADF};
+        for (;;) {
+            const ssize_t n =
+                ::write(impl_.native_handle(), buffer.data(), buffer.size());
+            if (n >= 0) co_return static_cast<std::size_t>(n);
+
+            const int error = errno;
+            if (error == EINTR) continue;
+            if (error != EAGAIN && error != EWOULDBLOCK) co_return Error{error};
+            if (auto ready = co_await impl_.writable(); !ready) {
+                co_return ready.error();
+            }
+        }
+    }
+
+    Task<Result<void>> write_all(std::span<const std::byte> buffer) {
+        while (!buffer.empty()) {
+            auto n = co_await write(buffer);
+            if (!n) co_return n.error();
+            if (*n == 0) co_return Error{Errc::closed};
+            buffer = buffer.subspan(*n);
+        }
+        co_return ok();
+    }
+
     void set_deadline(TimePoint deadline) { impl_.set_deadline(deadline); }
     void set_timeout(Duration timeout) { impl_.set_timeout(timeout); }
     void clear_deadline() { impl_.clear_deadline(); }
@@ -208,5 +266,8 @@ private:
 
     Descriptor impl_;
 };
+
+static_assert(io::Reader<PollableFd>);
+static_assert(io::Writer<PollableFd>);
 
 }  // namespace cio

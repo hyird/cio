@@ -1,11 +1,14 @@
 #include "cio/fs.hpp"
 
 #include <fcntl.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <string_view>
 
 #include "cio/blocking.hpp"
 
@@ -94,6 +97,228 @@ Task<Result<void>> remove(std::string path) {
     co_return co_await on_pool(
         [path = std::move(path)]() -> Result<void> {
             if (::unlink(path.c_str()) != 0) return Error::from_errno();
+            return ok();
+        });
+}
+
+Task<Result<std::vector<DirEntry>>> read_dir(std::string path) {
+    co_return co_await on_pool(
+        [path = std::move(path)]() -> Result<std::vector<DirEntry>> {
+            DIR* dir = ::opendir(path.c_str());
+            if (dir == nullptr) return Error::from_errno();
+
+            std::vector<DirEntry> entries;
+            errno = 0;
+            for (dirent* e = ::readdir(dir); e != nullptr; e = ::readdir(dir)) {
+                const std::string_view name(e->d_name);
+                if (name == "." || name == "..") continue;
+
+                DirEntry entry;
+                entry.name = std::string(name);
+                // d_type is not filled in on every filesystem; fall back to
+                // lstat rather than reporting everything as unknown.
+                switch (e->d_type) {
+                    case DT_DIR: entry.is_dir = true; break;
+                    case DT_REG: entry.is_regular = true; break;
+                    case DT_LNK: entry.is_symlink = true; break;
+                    default: {
+                        struct ::stat st {};
+                        const std::string full = path + "/" + entry.name;
+                        if (::lstat(full.c_str(), &st) == 0) {
+                            entry.is_dir = S_ISDIR(st.st_mode);
+                            entry.is_regular = S_ISREG(st.st_mode);
+                            entry.is_symlink = S_ISLNK(st.st_mode);
+                        }
+                        break;
+                    }
+                }
+                entries.push_back(std::move(entry));
+                errno = 0;
+            }
+            const int read_error = errno;
+            ::closedir(dir);
+            // readdir returns null both at the end and on failure; errno is the
+            // only way to tell a short listing from a complete one.
+            if (read_error != 0) return Error{read_error};
+            return entries;
+        });
+}
+
+Task<Result<void>> rename(std::string from, std::string to) {
+    co_return co_await on_pool(
+        [from = std::move(from), to = std::move(to)]() -> Result<void> {
+            if (::rename(from.c_str(), to.c_str()) != 0) {
+                return Error::from_errno();
+            }
+            return ok();
+        });
+}
+
+Task<Result<void>> mkdir(std::string path, std::uint32_t permissions) {
+    co_return co_await on_pool(
+        [path = std::move(path), permissions]() -> Result<void> {
+            if (::mkdir(path.c_str(), static_cast<mode_t>(permissions)) != 0) {
+                return Error::from_errno();
+            }
+            return ok();
+        });
+}
+
+Task<Result<void>> mkdir_all(std::string path, std::uint32_t permissions) {
+    co_return co_await on_pool(
+        [path = std::move(path), permissions]() -> Result<void> {
+            if (path.empty()) return Error{EINVAL};
+
+            // Create each prefix in turn. An existing directory is success, as
+            // os.MkdirAll defines it; an existing *file* is not.
+            std::string partial;
+            partial.reserve(path.size());
+            std::size_t at = 0;
+            while (at <= path.size()) {
+                const std::size_t slash = path.find('/', at);
+                const std::size_t end =
+                    slash == std::string::npos ? path.size() : slash;
+                partial.assign(path, 0, end == 0 ? 1 : end);
+                at = end + 1;
+                if (partial == "/" || partial.empty()) {
+                    if (slash == std::string::npos) break;
+                    continue;
+                }
+                if (::mkdir(partial.c_str(),
+                            static_cast<mode_t>(permissions)) != 0) {
+                    const int error = errno;
+                    if (error != EEXIST) return Error{error};
+                    struct ::stat st {};
+                    if (::stat(partial.c_str(), &st) != 0) {
+                        return Error::from_errno();
+                    }
+                    if (!S_ISDIR(st.st_mode)) return Error{ENOTDIR};
+                }
+                if (slash == std::string::npos) break;
+            }
+            return ok();
+        });
+}
+
+Task<Result<void>> remove_all(std::string path) {
+    // Recursion happens on the pool thread in one job: walking a tree with a
+    // job per entry would multiply admission pressure for no benefit.
+    co_return co_await on_pool(
+        [path = std::move(path)]() -> Result<void> {
+            struct Walker {
+                static Result<void> remove(const std::string& target) {
+                    struct ::stat st {};
+                    if (::lstat(target.c_str(), &st) != 0) {
+                        const int error = errno;
+                        // Already gone is success, as os.RemoveAll defines it.
+                        if (error == ENOENT) return ok();
+                        return Error{error};
+                    }
+                    // A symlink is removed, never followed: following one would
+                    // let a link inside the tree delete something outside it.
+                    if (S_ISDIR(st.st_mode)) {
+                        DIR* dir = ::opendir(target.c_str());
+                        if (dir == nullptr) return Error::from_errno();
+                        Result<void> failure = ok();
+                        errno = 0;
+                        for (dirent* e = ::readdir(dir); e != nullptr;
+                             e = ::readdir(dir)) {
+                            const std::string_view name(e->d_name);
+                            if (name == "." || name == "..") continue;
+                            auto child =
+                                remove(target + "/" + std::string(name));
+                            if (!child && failure) failure = child;
+                            errno = 0;
+                        }
+                        const int read_error = errno;
+                        ::closedir(dir);
+                        if (!failure) return failure;
+                        if (read_error != 0) return Error{read_error};
+                        if (::rmdir(target.c_str()) != 0) {
+                            return Error::from_errno();
+                        }
+                        return ok();
+                    }
+                    if (::unlink(target.c_str()) != 0) {
+                        const int error = errno;
+                        if (error == ENOENT) return ok();
+                        return Error{error};
+                    }
+                    return ok();
+                }
+            };
+            return Walker::remove(path);
+        });
+}
+
+Task<Result<std::vector<std::byte>>> read_file(std::string path,
+                                              std::size_t limit) {
+    co_return co_await on_pool(
+        [path = std::move(path), limit]() -> Result<std::vector<std::byte>> {
+            const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0) return Error::from_errno();
+
+            std::vector<std::byte> out;
+            // Size the buffer from stat as a hint only; a file can grow between
+            // the stat and the reads, so the limit is what actually bounds this.
+            struct ::stat st {};
+            if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+                st.st_size > 0) {
+                const auto hint = static_cast<std::size_t>(st.st_size);
+                out.reserve(std::min(hint, limit));
+            }
+
+            std::byte chunk[64 * 1024];
+            for (;;) {
+                const ssize_t n = ::read(fd, chunk, sizeof(chunk));
+                if (n < 0) {
+                    const int error = errno;
+                    if (error == EINTR) continue;
+                    ::close(fd);
+                    return Error{error};
+                }
+                if (n == 0) break;
+                if (out.size() + static_cast<std::size_t>(n) > limit) {
+                    ::close(fd);
+                    return Error{EMSGSIZE};
+                }
+                out.insert(out.end(), chunk, chunk + n);
+            }
+            ::close(fd);
+            return out;
+        });
+}
+
+Task<Result<void>> write_file(std::string path,
+                             std::span<const std::byte> contents,
+                             std::uint32_t permissions) {
+    // The span must stay alive until the job finishes, which it does: this task
+    // does not resume until the pool call returns, and file operations are not
+    // cancellable for exactly that reason.
+    co_return co_await on_pool(
+        [path = std::move(path), contents, permissions]() -> Result<void> {
+            const int fd = ::open(path.c_str(),
+                                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                                  static_cast<mode_t>(permissions));
+            if (fd < 0) return Error::from_errno();
+
+            std::size_t written = 0;
+            while (written < contents.size()) {
+                const ssize_t n = ::write(fd, contents.data() + written,
+                                          contents.size() - written);
+                if (n < 0) {
+                    const int error = errno;
+                    if (error == EINTR) continue;
+                    ::close(fd);
+                    return Error{error};
+                }
+                if (n == 0) {
+                    ::close(fd);
+                    return Error{ENOSPC};
+                }
+                written += static_cast<std::size_t>(n);
+            }
+            if (::close(fd) != 0) return Error::from_errno();
             return ok();
         });
 }

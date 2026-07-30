@@ -31,6 +31,7 @@
 #include "cio/main.hpp"
 #include "cio/net.hpp"
 #include "cio/pool.hpp"
+#include "cio/process.hpp"
 #include "cio/result.hpp"
 #include "cio/runtime.hpp"
 #include "cio/scoped.hpp"

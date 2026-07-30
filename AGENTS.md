@@ -125,62 +125,6 @@ These are settled. Reopening one needs new evidence, not a new argument.
   userspace protocol beyond stub resolution. It reads `/etc/hosts` and
   `/etc/resolv.conf` and nothing else; NSS modules are the system backend's job.
 
-## Rejected mechanisms
-
-A long list of scheduler mechanisms has already been implemented, measured
-against frozen baselines and removed. Do not treat an untried-looking idea as
-untried: search the git history for the mechanism before building it, because
-re-deriving one of these costs a benchmark host-day.
-
-The rejected set already covers, at minimum: overload bitmaps and proactive
-donation, soft-affinity completion sharing, several reactor owner-poll and
-deadline protocols, bounded `runnext`, foreign-completion batching and
-prioritization, normal-worker reactor rescue, fixed unconditional-yield
-cooperative budgets, restricting steal-half propagation, a lock-free MPMC ring
-in front of the shared fallback queue, and timer-heap lock removal.
-
-Two standing conclusions follow from it:
-
-- **The rare foreign-monitor dispatch path has had four separate designs
-  rejected.** A fifth needs a diagnosis of why that path is slow, not another
-  policy.
-- **Topology-aware victim selection cannot be validated on a single-socket,
-  single-LLC host**, because a topology-aware thief always takes the same-domain
-  branch there. It needs different hardware before it is worth writing.
-
-## Standing costs
-
-These are properties of the design, not bugs to be fixed opportunistically.
-Disclose them; do not paper over them.
-
-- Detached `go()` is slower than the shared-reactor design this replaced, and
-  tail latency at low and mid connection counts is worse. Throughput at
-  saturation and mixed-load fairness are what was bought with it.
-- The extreme tail — p99.99 and beyond — is worse on rare foreign-monitor
-  dispatch than the common readiness path.
-- **Accept placement is round-robin over connections, not over load.** Weight is
-  a property of the traffic a connection carries later, which is unknowable at
-  accept time, so heavy connections cluster across reactor shards. Descriptor
-  migration between epoll instances is the expensive fix; weight-aware placement
-  at accept time is the cheap one to try first and moves no descriptor.
-- `cio::blocking()` itself has no admission limit; only the built-in file and
-  resolver classes are bounded.
-- **Tail latency moved up when the 0.1.0 feature set landed, without a known
-  mechanism.** A publication-ready ten-pair matrix over the feature work found
-  throughput neutral in both cells — c64 -0.00% (95% CI -1.73% to +1.76%) and
-  c1024 -1.11% (-3.19% to +1.03%) — while c64 p99 and Max rose in *both* AB and
-  BA strata, which under the joint gate is attributable rather than noise.
-
-  Nothing added touches the socket hot path: the additions are new translation
-  units, header-only templates, or cold-path handles. The plausible mechanism is
-  code layout — the library roughly doubled in size — but that is a hypothesis,
-  not a measurement. Against it: a self-comparison on this host, the same binary
-  on both sides, once drifted 14.88% at c1024, so deep percentiles here are
-  volatile and Max is a single sample.
-
-  Treat this as disclosed and unexplained. Do not attribute it to a specific
-  change without isolating one, and do not quietly drop it either.
-
 ## Runtime invariants
 
 Treat the following as load-bearing contracts, not implementation suggestions.

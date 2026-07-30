@@ -330,12 +330,6 @@ not paired with the table above; do not read the two together as one sweep.
 Absolute numbers are host-specific and are useful mainly as a shape: throughput
 saturates near 64 connections, and tail latency is the axis that moves.
 
-What this scheduler costs, stated rather than omitted: detached `go()` is
-measurably slower than the shared-reactor design it replaced, and tail latency at
-low and mid connection counts is worse. Saturated throughput and mixed-load
-fairness are what was bought with it. The standing costs are listed in
-[AGENTS.md](AGENTS.md#standing-costs).
-
 Comparisons against Boost.Asio and Go live under `bench/`: `http-comparison`
 drives all three runtimes with the same third-party `wrk`, `echo-comparison`
 adds a skew sweep, and `go-core` is the Go counterpart of `bench_core` in its
@@ -400,15 +394,6 @@ Runtime:
 - `cio::blocking()` itself has no admission limit; only the built-in file and
   resolver classes are bounded. A flood of user blocking work is held only by
   the global queue bound and the thread ceiling.
-
-Performance, measured rather than asserted:
-
-- Tail latency at 64 connections is worse than the previous release's; it is the
-  price of the 1024-connection gains.
-- Tail latency rose again when the 0.1.0 feature set landed, with throughput
-  neutral in both measured cells and no identified mechanism. See
-  [AGENTS.md](AGENTS.md#standing-costs).
-- The p99.99 and beyond are worse on rare foreign-monitor dispatch.
 - Accepted connections are distributed round-robin, but weight is a property of
   the traffic a connection later carries, so heavy connections cluster by chance
   and skewed workloads land unevenly across reactor shards.
@@ -458,8 +443,8 @@ Read [AGENTS.md](AGENTS.md) before changing runtime ownership, waiter lifetime,
 shutdown or benchmark methodology. Public API and observable semantics should
 remain stable unless an API change is explicitly requested and documented.
 
-Before proposing a scheduler mechanism, read
-[Rejected mechanisms](AGENTS.md#rejected-mechanisms) in AGENTS.md and search the
-git history: a long list has already been implemented, measured and removed.
+Before proposing a scheduler mechanism, search the git history: a long list has
+already been implemented, measured against frozen baselines and removed, and the
+commit messages record why.
 
 Licensed under the [MIT License](LICENSE).

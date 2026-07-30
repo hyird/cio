@@ -185,10 +185,22 @@ struct CIO_CACHE_ALIGNED IoDesc {
                deadline_seq[i].load(std::memory_order_acquire);
     }
 
+    // On the syscall-admission path, so it must cost one load and a
+    // predicted-not-taken branch when nothing is bound — which is the common
+    // case, since a socket only has a pointer here if set_cancel() was called.
+    //
+    // The pointer load is relaxed on purpose. Acquire would order it against
+    // the publication in set_cancel(), but missing a binding published in the
+    // same instant only defers the cancellation to the next admission check,
+    // and a parked operation is woken by the hook regardless. That is the same
+    // latitude set_deadline() already has against an in-flight syscall. The
+    // flag's own load stays acquire, so a pointer we do observe is never read
+    // against a stale value.
     bool cancelled() const noexcept {
         const std::atomic<bool>* const flag =
-            cancel_flag.load(std::memory_order_acquire);
-        return flag != nullptr && flag->load(std::memory_order_acquire);
+            cancel_flag.load(std::memory_order_relaxed);
+        if (flag == nullptr) [[likely]] return false;
+        return flag->load(std::memory_order_acquire);
     }
 
     bool runtime_stopping() const noexcept {

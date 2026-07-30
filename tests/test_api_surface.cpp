@@ -415,6 +415,28 @@ cio::Task<int> exercise_concurrency_surface() {
     (void)received;
     (void)sent;
 
+    // Go's three net interfaces, as concepts. Compile-time only: the concrete
+    // socket keeps its non-virtual fast path.
+    static_assert(cio::net::Conn<cio::net::TcpConn>);
+    static_assert(cio::net::PacketConn<cio::net::UdpConn>);
+    static_assert(cio::net::Listener<cio::net::TcpListener>);
+    static_assert(!cio::net::Conn<cio::net::UdpConn>);
+    static_assert(!cio::net::PacketConn<cio::net::TcpConn>);
+
+    // Addr surface and the split/join pair.
+    const auto listener_addr = listener.addr();
+    (void)listener_addr;
+    const std::string ip = peer.ip();
+    (void)ip;
+    const auto joined = cio::net::join_host_port("::1", 443);
+    (void)joined;
+    const auto split = cio::net::split_host_port("example.com:80");
+    (void)split;
+
+    // Error classifiers, mirroring net.Error.
+    const cio::Error deadline{cio::Errc::timed_out};
+    static_assert(std::is_same_v<decltype(deadline.is_timeout()), bool>);
+
     // Generic stream algorithms apply to the concrete socket types.
     static_assert(cio::AsyncReader<cio::net::TcpConn>);
     static_assert(cio::AsyncWriter<cio::net::TcpConn>);

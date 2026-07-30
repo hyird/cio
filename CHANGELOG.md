@@ -36,6 +36,19 @@ or mDNS — or wherever answers must agree with `getent hosts`.
 
 ### Added
 
+- `net::Conn`, `net::PacketConn` and `net::Listener`: Go's three net interfaces
+  as concepts rather than virtual bases, so generic protocol code is possible
+  without putting a vtable on the socket fast path. `tls::TlsStream` satisfies
+  `Conn`, as Go's `tls.Conn` implements `net.Conn`.
+- `Error::is_timeout()`, `is_cancelled()`, `is_temporary()`, `is_closed()` and
+  `is_not_found()`, mirroring Go's `net.Error`, so callers classify a failure
+  instead of comparing codes. A deadline and `ETIMEDOUT` both answer
+  `is_timeout()`.
+- `net::split_host_port()` and `net::join_host_port()`, mirroring
+  `net.SplitHostPort` and `net.JoinHostPort`, including bracketing for IPv6
+  literals and rejection of the ambiguous unbracketed form.
+- `SocketAddr::ip()` and `TcpListener::addr()`, mirroring `TCPAddr.IP` and
+  `Listener.Addr`.
 - `cio::net::Resolver` with `LookupOptions`, `AddressFamily`, `lookup_host()`
   and `lookup_addr()`. `resolve()` is retained and delegates to a default
   `Resolver`.

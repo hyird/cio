@@ -397,6 +397,35 @@ demonstrated *at that queue*. `bench_core` does not saturate the global fallback
 path, so this screen shows the ring costs something on paths that do not need it
 rather than showing it fails under the contention it targets.
 
+### Neutral: the descriptor-scoped cancellation check
+
+Cancellation is checked at syscall admission, which put a new atomic load and
+branch on every socket operation — the one hot-path cost added by the 0.1.0
+work. Everything else it introduced is compile-time (the `Conn`/`PacketConn`/
+`Listener` concepts, the error classifiers) or per-scope rather than
+per-operation (`Timeout`).
+
+The experiment isolates exactly that check: both sides are the same tree, with
+the two `if (cancelled())` lines removed from `io_error()` and `begin_syscall()`
+on the A side. Ten pairs at the saturated 64-connection cell, servers on CPUs
+0-7 and `wrk` on 14 threads across 8-21. Local run
+`wrk-cancel-check-cost-20260730-001`, publication-ready.
+
+| | A, no check | B, with check | paired geometric B/A (95% CI) |
+|---|---:|---:|---:|
+| req/s | 799,184 | 796,067 | -0.38% (-2.88% to +2.18%) |
+
+Server CPU was 7.97 cores on both sides and median p50 differed by one
+microsecond. The interval straddles zero, so the check is not measurable at this
+workload's resolution. That is a bound, not a proof of zero cost: it says the
+cost is below what a saturated 64-connection cell can resolve over ten pairs.
+
+The pointer load is deliberately `memory_order_relaxed`. Acquire would order it
+against the publication in `set_cancel()`, but missing a binding published in
+the same instant only defers cancellation to the next admission check, and a
+parked operation is woken by the hook regardless — the same latitude
+`set_deadline()` already has against an in-flight syscall.
+
 ### Resolved: c1024 parity, measured between clean commits
 
 The retag round left c1024 throughput parity undemonstrated. That gap could not

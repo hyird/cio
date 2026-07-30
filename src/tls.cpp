@@ -318,12 +318,46 @@ Task<Result<void>> TlsStream::shutdown() {
     co_return ok();
 }
 
+Result<net::SocketAddr> TlsStream::local_addr() const {
+    if (state_ == nullptr) return Error{EBADF};
+    return state_->socket.local_addr();
+}
+
+Result<net::SocketAddr> TlsStream::remote_addr() const {
+    if (state_ == nullptr) return Error{EBADF};
+    return state_->socket.remote_addr();
+}
+
 void TlsStream::set_deadline(TimePoint deadline) {
     if (state_ != nullptr) state_->socket.set_deadline(deadline);
 }
 
+void TlsStream::set_read_deadline(TimePoint deadline) {
+    if (state_ != nullptr) state_->socket.set_read_deadline(deadline);
+}
+
+void TlsStream::set_write_deadline(TimePoint deadline) {
+    if (state_ != nullptr) state_->socket.set_write_deadline(deadline);
+}
+
 void TlsStream::clear_deadline() {
     if (state_ != nullptr) state_->socket.clear_deadline();
+}
+
+void TlsStream::clear_read_deadline() {
+    if (state_ != nullptr) state_->socket.clear_read_deadline();
+}
+
+void TlsStream::clear_write_deadline() {
+    if (state_ != nullptr) state_->socket.clear_write_deadline();
+}
+
+void TlsStream::set_cancel(CancelToken token) {
+    if (state_ != nullptr) state_->socket.set_cancel(std::move(token));
+}
+
+void TlsStream::clear_cancel() {
+    if (state_ != nullptr) state_->socket.clear_cancel();
 }
 
 void TlsStream::close() {

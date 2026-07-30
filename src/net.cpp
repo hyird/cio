@@ -642,6 +642,68 @@ Task<Result<std::vector<std::string>>> Resolver::lookup_addr(
         [address] { return lookup_addr_blocking(address); }, std::move(cancel));
 }
 
+std::string SocketAddr::ip() const {
+    char buffer[INET6_ADDRSTRLEN] = {};
+    switch (family()) {
+        case AF_INET: {
+            const auto* v4 = reinterpret_cast<const sockaddr_in*>(storage_);
+            ::inet_ntop(AF_INET, &v4->sin_addr, buffer, sizeof(buffer));
+            return buffer;
+        }
+        case AF_INET6: {
+            const auto* v6 = reinterpret_cast<const sockaddr_in6*>(storage_);
+            ::inet_ntop(AF_INET6, &v6->sin6_addr, buffer, sizeof(buffer));
+            return buffer;
+        }
+        default:
+            return {};
+    }
+}
+
+Result<std::pair<std::string, std::string>> split_host_port(
+    std::string_view host_port) {
+    if (host_port.empty()) return Error{EINVAL};
+
+    if (host_port.front() == '[') {
+        // "[::1]:80" — the brackets are what disambiguate an IPv6 literal from
+        // a host:port with many colons.
+        const std::size_t close = host_port.find(']');
+        if (close == std::string_view::npos) return Error{EINVAL};
+        if (close + 1 >= host_port.size() || host_port[close + 1] != ':') {
+            return Error{EINVAL};
+        }
+        const std::string_view host = host_port.substr(1, close - 1);
+        const std::string_view port = host_port.substr(close + 2);
+        if (host.empty() || port.empty()) return Error{EINVAL};
+        return std::pair<std::string, std::string>{std::string(host),
+                                                   std::string(port)};
+    }
+
+    const std::size_t colon = host_port.rfind(':');
+    if (colon == std::string_view::npos) return Error{EINVAL};
+    // More than one colon without brackets is an unbracketed IPv6 literal,
+    // which is ambiguous and which Go rejects too.
+    if (host_port.find(':') != colon) return Error{EINVAL};
+
+    const std::string_view host = host_port.substr(0, colon);
+    const std::string_view port = host_port.substr(colon + 1);
+    if (port.empty()) return Error{EINVAL};
+    return std::pair<std::string, std::string>{std::string(host),
+                                               std::string(port)};
+}
+
+std::string join_host_port(std::string_view host, std::string_view port) {
+    // Bracket anything that looks like an IPv6 literal, as Go does.
+    if (host.find(':') != std::string_view::npos) {
+        return "[" + std::string(host) + "]:" + std::string(port);
+    }
+    return std::string(host) + ":" + std::string(port);
+}
+
+std::string join_host_port(std::string_view host, std::uint16_t port) {
+    return join_host_port(host, std::to_string(port));
+}
+
 Task<Result<std::vector<SocketAddr>>> resolve(std::string host, std::uint16_t port) {
     co_return co_await Resolver{}.lookup_host(std::move(host), port);
 }

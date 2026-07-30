@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <concepts>
 #include <span>
 #include <string>
 #include <string_view>
@@ -50,9 +51,14 @@ public:
     // Constructs from a raw sockaddr; `len` must be the true length.
     static SocketAddr from_raw(const void* addr, unsigned len);
 
+    // "1.2.3.4:80" or "[::1]:80", as Go's Addr.String() renders it.
     std::string to_string() const;
+    // The address without the port: "1.2.3.4" or "::1". Go exposes TCPAddr.IP.
+    std::string ip() const;
     std::uint16_t port() const noexcept;
     int family() const noexcept;
+    // "tcp" or "udp" is not knowable from a sockaddr, so Go's Addr.Network()
+    // has no counterpart here; the protocol is the type that owns the address.
 
     const sockaddr* raw() const noexcept;
     unsigned length() const noexcept { return length_; }
@@ -65,6 +71,16 @@ private:
     alignas(8) unsigned char storage_[128]{};
     unsigned length_ = 0;
 };
+
+// Splits "host:port" or "[host]:port", as Go's net.SplitHostPort does. The port
+// is returned as text because Go does, and because a service name like "http"
+// is a legal port field there.
+Result<std::pair<std::string, std::string>> split_host_port(
+    std::string_view host_port);
+
+// The inverse, bracketing an IPv6 literal, as Go's net.JoinHostPort does.
+std::string join_host_port(std::string_view host, std::string_view port);
+std::string join_host_port(std::string_view host, std::uint16_t port);
 
 enum class AddressFamily {
     any,
@@ -267,6 +283,10 @@ public:
 
     Task<Result<TcpConn>> accept();
 
+    // Go's Listener interface spells this Addr(); local_addr() from Socket is
+    // the same value and is kept so the socket surface stays uniform.
+    Result<SocketAddr> addr() const { return local_addr(); }
+
     void set_deadline(TimePoint deadline);
     void clear_deadline();
 };
@@ -330,5 +350,55 @@ public:
     void clear_read_deadline();
     void clear_write_deadline();
 };
+
+// ---------------------------------------------------------------------------
+// Go's net package is organised around three interfaces. cio expresses them as
+// concepts rather than virtual bases: a protocol library can still be written
+// once against "anything that behaves like a connection", but the concrete
+// socket keeps its non-virtual fast path.
+//
+// A TLS stream satisfies Conn as well, exactly as Go's tls.Conn implements
+// net.Conn, so a generic helper works over plaintext and TLS unchanged.
+
+// net.Conn
+template <typename T>
+concept Conn = requires(T& c, std::span<std::byte> in,
+                        std::span<const std::byte> out, TimePoint t) {
+    { c.read(in) } -> std::same_as<Task<Result<std::size_t>>>;
+    { c.write(out) } -> std::same_as<Task<Result<std::size_t>>>;
+    c.close();
+    { c.local_addr() } -> std::same_as<Result<SocketAddr>>;
+    { c.remote_addr() } -> std::same_as<Result<SocketAddr>>;
+    c.set_deadline(t);
+    c.set_read_deadline(t);
+    c.set_write_deadline(t);
+};
+
+// net.PacketConn
+template <typename T>
+concept PacketConn = requires(T& c, std::span<std::byte> in,
+                              std::span<const std::byte> out, SocketAddr& from,
+                              const SocketAddr& to, TimePoint t) {
+    { c.read_from(in, from) } -> std::same_as<Task<Result<std::size_t>>>;
+    { c.write_to(out, to) } -> std::same_as<Task<Result<std::size_t>>>;
+    c.close();
+    { c.local_addr() } -> std::same_as<Result<SocketAddr>>;
+    c.set_deadline(t);
+    c.set_read_deadline(t);
+    c.set_write_deadline(t);
+};
+
+// net.Listener
+template <typename T>
+concept Listener = requires(T& l, TimePoint t) {
+    l.accept();
+    l.close();
+    { l.addr() } -> std::same_as<Result<SocketAddr>>;
+    l.set_deadline(t);
+};
+
+static_assert(Conn<TcpConn>);
+static_assert(PacketConn<UdpConn>);
+static_assert(Listener<TcpListener>);
 
 }  // namespace cio::net

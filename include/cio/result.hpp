@@ -59,6 +59,29 @@ public:
         return "unknown error";
     }
 
+    // Classifiers, mirroring Go's net.Error. Callers should branch on these
+    // rather than on a specific code: a deadline surfaces as Errc::timed_out,
+    // but the same condition arrives from the OS as ETIMEDOUT.
+    bool is_timeout() const noexcept {
+        return code_ == static_cast<int>(Errc::timed_out) || code_ == ETIMEDOUT;
+    }
+    bool is_cancelled() const noexcept {
+        return code_ == static_cast<int>(Errc::cancelled) || code_ == ECANCELED;
+    }
+    // Worth retrying: the condition is expected to pass.
+    bool is_temporary() const noexcept {
+        return is_timeout() || code_ == EAGAIN || code_ == EWOULDBLOCK ||
+               code_ == EINTR || code_ == ENOBUFS || code_ == ENOMEM ||
+               code_ == static_cast<int>(Errc::would_block) ||
+               code_ == static_cast<int>(Errc::overloaded);
+    }
+    // The peer or this side closed; further I/O will not succeed.
+    bool is_closed() const noexcept {
+        return code_ == static_cast<int>(Errc::closed) || code_ == EPIPE ||
+               code_ == ECONNRESET || code_ == ESHUTDOWN;
+    }
+    bool is_not_found() const noexcept { return code_ == ENOENT; }
+
     friend bool operator==(Error a, Error b) noexcept { return a.code_ == b.code_; }
 
 private:

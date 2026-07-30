@@ -72,8 +72,19 @@ public:
     // Sends close_notify, then closes the socket. Idempotent.
     Task<Result<void>> shutdown();
 
+    // The full net.Conn surface, delegated to the underlying socket, so a
+    // TlsStream satisfies net::Conn exactly as Go's tls.Conn implements
+    // net.Conn and a generic helper works over plaintext and TLS unchanged.
+    Result<net::SocketAddr> local_addr() const;
+    Result<net::SocketAddr> remote_addr() const;
     void set_deadline(TimePoint deadline);
+    void set_read_deadline(TimePoint deadline);
+    void set_write_deadline(TimePoint deadline);
     void clear_deadline();
+    void clear_read_deadline();
+    void clear_write_deadline();
+    void set_cancel(CancelToken token);
+    void clear_cancel();
     void close();
 
     // The negotiated protocol version name, or empty before the handshake.
@@ -93,5 +104,7 @@ private:
 // handshake(), not here, so both factories stay non-throwing and non-suspending.
 TlsStream client(net::TcpConn stream, Config config = {});
 TlsStream server(net::TcpConn stream, Config config);
+
+static_assert(net::Conn<TlsStream>);
 
 }  // namespace cio::tls

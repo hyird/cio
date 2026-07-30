@@ -126,7 +126,18 @@ Long coroutine soaks should not run under ASan or TSan; see
 | `cio::signal::SignalSet` | `signalfd`-backed signal delivery |
 | `cio::tls::TlsStream` | Optional TLS (`-DCIO_TLS=ON`, links OpenSSL) |
 | `cio::read_exact` / `write_all` / `copy` | Generic algorithms over `AsyncReader`/`AsyncWriter` |
+| `net::Conn` / `PacketConn` / `Listener` | Go's three net interfaces, as concepts |
+| `net::split_host_port` / `join_host_port` | `net.SplitHostPort` / `net.JoinHostPort` |
 | `cio::Runtime` / `cio::run(task)` / `CIO_MAIN` | Runtime ownership and entry points |
+
+`net::Conn`, `net::PacketConn` and `net::Listener` are Go's three net
+interfaces expressed as concepts rather than virtual bases: a protocol library
+can be written once against "anything that behaves like a connection" while the
+concrete socket keeps a non-virtual fast path. `tls::TlsStream` satisfies
+`Conn`, as Go's `tls.Conn` implements `net.Conn`, so a generic helper works over
+plaintext and TLS unchanged. `Error` carries `is_timeout()`, `is_cancelled()`,
+`is_temporary()`, `is_closed()` and `is_not_found()`, mirroring `net.Error`, so
+callers classify rather than compare codes.
 
 Receiving from a closed and drained channel returns `std::nullopt`. Sending to a
 closed channel returns `false`. `select` returns the winning case index and case

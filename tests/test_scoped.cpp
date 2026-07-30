@@ -336,9 +336,127 @@ void test_pollable_fd_deadline_and_cancel() {
     CIO_CHECK(cio::run(body()));
 }
 
+// ------------------------------------------------- Go-shaped surface ---
+
+// The concepts are the public abstraction, so their negatives matter as much as
+// their positives: a UdpConn must not satisfy Conn, or generic code written for
+// a stream would silently accept a datagram socket.
+static_assert(net::Conn<net::TcpConn>);
+static_assert(net::PacketConn<net::UdpConn>);
+static_assert(net::Listener<net::TcpListener>);
+static_assert(!net::Conn<net::UdpConn>);
+static_assert(!net::PacketConn<net::TcpConn>);
+static_assert(!net::Listener<net::TcpConn>);
+
+void test_address_helpers() {
+    // Splitting, including the bracketed IPv6 form Go requires.
+    auto plain = net::split_host_port("example.com:80");
+    CIO_CHECK(plain.has_value());
+    CIO_CHECK_EQ(plain->first, std::string("example.com"));
+    CIO_CHECK_EQ(plain->second, std::string("80"));
+
+    auto v6 = net::split_host_port("[::1]:443");
+    CIO_CHECK(v6.has_value());
+    CIO_CHECK_EQ(v6->first, std::string("::1"));
+    CIO_CHECK_EQ(v6->second, std::string("443"));
+
+    // A service name is a legal port field, as in Go.
+    auto named = net::split_host_port("localhost:http");
+    CIO_CHECK(named.has_value());
+    CIO_CHECK_EQ(named->second, std::string("http"));
+
+    // Rejections: no port, empty port, and an unbracketed IPv6 literal, which
+    // is genuinely ambiguous.
+    CIO_CHECK(!net::split_host_port("example.com").has_value());
+    CIO_CHECK(!net::split_host_port("example.com:").has_value());
+    CIO_CHECK(!net::split_host_port("::1:443").has_value());
+    CIO_CHECK(!net::split_host_port("[::1]443").has_value());
+    CIO_CHECK(!net::split_host_port("").has_value());
+
+    // Joining brackets an IPv6 literal and leaves a name alone.
+    CIO_CHECK_EQ(net::join_host_port("::1", 443), std::string("[::1]:443"));
+    CIO_CHECK_EQ(net::join_host_port("example.com", 80),
+                 std::string("example.com:80"));
+    CIO_CHECK_EQ(net::join_host_port("1.2.3.4", "http"),
+                 std::string("1.2.3.4:http"));
+
+    // Round trip through the parser.
+    const auto addr = net::SocketAddr::parse("127.0.0.1", 8080).value();
+    CIO_CHECK_EQ(addr.ip(), std::string("127.0.0.1"));
+    CIO_CHECK_EQ(addr.port(), std::uint16_t{8080});
+    CIO_CHECK_EQ(addr.to_string(), net::join_host_port(addr.ip(), addr.port()));
+
+    const auto v6_addr = net::SocketAddr::parse("::1", 443).value();
+    CIO_CHECK_EQ(v6_addr.ip(), std::string("::1"));
+    CIO_CHECK_EQ(v6_addr.to_string(), std::string("[::1]:443"));
+}
+
+void test_error_classifiers() {
+    CIO_CHECK(cio::Error{cio::Errc::timed_out}.is_timeout());
+    CIO_CHECK(cio::Error{ETIMEDOUT}.is_timeout());
+    CIO_CHECK(cio::Error{cio::Errc::cancelled}.is_cancelled());
+    CIO_CHECK(cio::Error{ECANCELED}.is_cancelled());
+    CIO_CHECK(cio::Error{cio::Errc::closed}.is_closed());
+    CIO_CHECK(cio::Error{EPIPE}.is_closed());
+    CIO_CHECK(cio::Error{ECONNRESET}.is_closed());
+    CIO_CHECK(cio::Error{ENOENT}.is_not_found());
+
+    // A timeout is temporary; a reset connection is not.
+    CIO_CHECK(cio::Error{cio::Errc::timed_out}.is_temporary());
+    CIO_CHECK(cio::Error{EAGAIN}.is_temporary());
+    CIO_CHECK(!cio::Error{ECONNRESET}.is_temporary());
+    CIO_CHECK(!cio::Error{ENOENT}.is_temporary());
+
+    // The classifiers must not fire on success.
+    const cio::Error none{};
+    CIO_CHECK(!none.is_timeout());
+    CIO_CHECK(!none.is_cancelled());
+    CIO_CHECK(!none.is_closed());
+    CIO_CHECK(!none.is_temporary());
+}
+
+// A generic helper written once against net::Conn must accept the concrete
+// socket without a vtable, which is the point of using a concept.
+template <net::Conn C>
+cio::Task<cio::Result<std::size_t>> echo_once(C& conn) {
+    std::byte buffer[32];
+    auto n = co_await conn.read(buffer);
+    if (!n) co_return n.error();
+    co_return co_await conn.write(std::span<const std::byte>{buffer, *n});
+}
+
+void test_generic_over_conn_concept() {
+    auto body = []() -> cio::Task<bool> {
+        auto pair = co_await make_pair();
+        CIO_CHECK(pair.has_value());
+
+        co_await pair->server.write_all(bytes_of("ping"));
+        auto echoed = co_await echo_once(pair->client);
+        CIO_CHECK(echoed.has_value());
+        CIO_CHECK_EQ(*echoed, std::size_t{4});
+
+        std::byte buffer[8];
+        auto back = co_await pair->server.read(buffer);
+        CIO_CHECK(back.has_value());
+        CIO_CHECK_EQ(*back, std::size_t{4});
+
+        // remote_addr is part of Conn and must name the peer.
+        const auto remote = pair->client.remote_addr();
+        const auto local = pair->server.local_addr();
+        CIO_CHECK(remote.has_value());
+        CIO_CHECK(local.has_value());
+        CIO_CHECK_EQ(remote->to_string(), local->to_string());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 }  // namespace
 
 int main() {
+    RUN_TEST(test_address_helpers);
+    RUN_TEST(test_error_classifiers);
+    RUN_TEST(test_generic_over_conn_concept);
     RUN_TEST(test_cancel_refuses_new_operations);
     RUN_TEST(test_cancel_wakes_a_parked_operation);
     RUN_TEST(test_cancel_rebind_and_clear);

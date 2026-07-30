@@ -114,7 +114,7 @@ void test_handshake_and_round_trip() {
     auto body = [&certificate]() -> cio::Task<bool> {
         auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         auto serving = cio::spawn(
             [](net::TcpListener l, std::string cert,
@@ -189,7 +189,7 @@ void test_verification_rejects_untrusted_certificate() {
     auto body = [&certificate]() -> cio::Task<bool> {
         auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         auto serving = cio::spawn(
             [](net::TcpListener l, std::string cert,
@@ -232,7 +232,7 @@ void test_large_transfer_spans_records() {
     auto body = [&certificate]() -> cio::Task<bool> {
         auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         constexpr std::size_t kSize = 256 * 1024;
 

@@ -88,23 +88,6 @@ enum class AddressFamily {
     ipv6,
 };
 
-struct LookupOptions {
-    AddressFamily family = AddressFamily::any;
-    // Use cio's built-in DNS resolver rather than getaddrinfo(), mirroring
-    // Go's Resolver.PreferGo — and defaulting the same way Go does on Unix,
-    // for the reason Go gives: a blocked DNS query costs one task, while a
-    // blocked C call costs an operating system thread.
-    //
-    // The built-in resolver speaks DNS over the runtime's own sockets and
-    // honours /etc/hosts, so a lookup is cancellable mid-flight and occupies no
-    // blocking-pool thread.
-    //
-    // Set this false on a machine that resolves names through NSS modules the
-    // built-in resolver cannot see — LDAP, NIS, mDNS — or whenever answers must
-    // agree with `getent hosts`.
-    bool prefer_builtin = true;
-};
-
 // Name resolution runs on the blocking pool: getaddrinfo has no async form, and
 // the system resolver is the source of truth so /etc/hosts, nsswitch.conf and
 // libc policy keep applying. cio implements no DNS protocol and no cache.
@@ -114,10 +97,18 @@ struct LookupOptions {
 // Errc::cancelled while the lookup finishes in the background; its late result
 // is discarded and never resumes the caller a second time. That is why the job
 // owns its own strings and result storage rather than borrowing the frame's.
-class Resolver {
-public:
-    Resolver() = default;
-    explicit Resolver(LookupOptions options) noexcept : options_(options) {}
+// Go's net.Resolver: a plain struct whose fields are the configuration, with
+// the lookups as methods. Fields sit directly on the object, as Go's do —
+// there is no separate options type to wrap and unwrap.
+struct Resolver {
+    AddressFamily family = AddressFamily::any;
+    // Use cio's built-in DNS resolver rather than getaddrinfo(), mirroring
+    // Go's Resolver.PreferGo and defaulting the same way Go does on Unix: a
+    // blocked DNS query costs one task, a blocked C call costs an OS thread.
+    // Set false on a machine that resolves through NSS modules the built-in
+    // resolver cannot see — LDAP, NIS, mDNS — or wherever answers must agree
+    // with `getent hosts`.
+    bool prefer_builtin = true;
 
     Task<Result<std::vector<SocketAddr>>> lookup_host(
         std::string host, std::uint16_t port, CancelToken cancel = {}) const;
@@ -125,19 +116,20 @@ public:
     // Reverse lookup. Returns the names for an address, longest-standing first.
     Task<Result<std::vector<std::string>>> lookup_addr(
         SocketAddr address, CancelToken cancel = {}) const;
-
-    const LookupOptions& options() const noexcept { return options_; }
-
-private:
-    LookupOptions options_{};
 };
 
 // Delegates to a default-constructed Resolver.
 Task<Result<std::vector<SocketAddr>>> resolve(std::string host, std::uint16_t port);
 
-// Base for the socket types: owns the fd and its reactor registration.
+// Implementation base for the socket types: owns the fd and its reactor
+// registration.
+//
+// Everything here is protected, and each derived type re-exports exactly the
+// set its Go counterpart has. Go has no exported base class, and a public base
+// would hand every derived type every method — which is how a listener grows a
+// remote_addr() that can never mean anything.
 class Socket {
-public:
+protected:
     Socket() = default;
     ~Socket() { close(); }
 
@@ -191,7 +183,6 @@ public:
     // back exactly what it found.
     TimePoint deadline(bool write_direction) const;
 
-protected:
     // Takes ownership of `fd` and registers it with the reactor.
     //
     // `already_nonblocking` is not an optimisation flag to be guessed at: every
@@ -218,6 +209,16 @@ protected:
 class TcpConn : public Socket {
 public:
     TcpConn() = default;
+
+    // Go's TCPConn surface, re-exported piece by piece from the protected base.
+    using Socket::valid;
+    using Socket::native_handle;
+    using Socket::close;
+    using Socket::local_addr;
+    using Socket::remote_addr;
+    using Socket::set_cancel;
+    using Socket::clear_cancel;
+    using Socket::deadline;
 
     // Already-resolved connect. With a cancel token, a cancellation resumes the
     // caller with Errc::cancelled; the abandoned socket is closed once its
@@ -287,6 +288,16 @@ class TcpListener : public Socket {
 public:
     TcpListener() = default;
 
+    // Go's TCPListener surface: accept, addr, close, a deadline. Deliberately
+    // no local_addr()/remote_addr() — addr() is the listener's name for its
+    // address, and a listener has no peer.
+    using Socket::valid;
+    using Socket::native_handle;
+    using Socket::close;
+    using Socket::set_cancel;
+    using Socket::clear_cancel;
+    using Socket::deadline;
+
     static Result<TcpListener> listen(SocketAddr addr, int backlog = 1024);
     static Result<TcpListener> listen(std::string_view host, std::uint16_t port,
                                     int backlog = 1024);
@@ -333,6 +344,15 @@ class UnixConn : public Socket {
 public:
     UnixConn() = default;
 
+    using Socket::valid;
+    using Socket::native_handle;
+    using Socket::close;
+    using Socket::local_addr;
+    using Socket::remote_addr;
+    using Socket::set_cancel;
+    using Socket::clear_cancel;
+    using Socket::deadline;
+
     static Task<Result<UnixConn>> dial(UnixAddr addr);
     static Task<Result<UnixConn>> dial(UnixAddr addr, CancelToken cancel);
 
@@ -372,6 +392,12 @@ private:
 class UnixListener : public Socket {
 public:
     UnixListener() = default;
+
+    using Socket::valid;
+    using Socket::native_handle;
+    using Socket::set_cancel;
+    using Socket::clear_cancel;
+    using Socket::deadline;
 
     // Socket::close() is deliberately non-virtual — a vtable on a socket is not
     // worth one cold path — so destruction alone would never remove the bound
@@ -421,19 +447,6 @@ private:
     bool owns_path_ = false;
 };
 
-struct DialOptions {
-    // Covers resolution and every connection attempt. Zero means no overall
-    // timeout.
-    Duration timeout{};
-    // How long one address gets before the next is tried. Zero selects 300ms.
-    Duration fallback_delay{};
-    bool nodelay = true;
-    AddressFamily family = AddressFamily::any;
-    // Resolution backend for this dialer, mirroring Go's Dialer.Resolver.
-    // See LookupOptions::prefer_builtin.
-    bool prefer_builtin_resolver = true;
-};
-
 // Name resolution and address selection live here, not on TcpConn.
 //
 // Addresses are tried with the families interleaved (v6, v4, v6, ...) rather
@@ -441,18 +454,21 @@ struct DialOptions {
 // route is a blackhole does not have to fail every v6 address first. Attempts
 // run one at a time, each bounded by fallback_delay; cio does not yet race
 // attempts concurrently the way RFC 8305 does.
-class Dialer {
-public:
-    Dialer() = default;
-    explicit Dialer(DialOptions options) noexcept : options_(options) {}
+struct Dialer {
+    // Covers resolution and every connection attempt. Zero means no overall
+    // timeout. Go's Dialer.Timeout.
+    Duration timeout{};
+    // How long one address gets before the next is tried. Zero selects 300ms.
+    // Go's Dialer.FallbackDelay.
+    Duration fallback_delay{};
+    bool nodelay = true;
+    AddressFamily family = AddressFamily::any;
+    // Resolution backend, mirroring Go's Dialer.Resolver; see
+    // Resolver::prefer_builtin.
+    bool prefer_builtin_resolver = true;
 
     Task<Result<TcpConn>> dial_tcp(std::string host, std::uint16_t port,
                                      CancelToken cancel = {}) const;
-
-    const DialOptions& options() const noexcept { return options_; }
-
-private:
-    DialOptions options_{};
 };
 
 // Delegates to a default-constructed Dialer.
@@ -462,6 +478,15 @@ Task<Result<TcpConn>> dial_tcp(std::string host, std::uint16_t port,
 class UdpConn : public Socket {
 public:
     UdpConn() = default;
+
+    using Socket::valid;
+    using Socket::native_handle;
+    using Socket::close;
+    using Socket::local_addr;
+    using Socket::remote_addr;
+    using Socket::set_cancel;
+    using Socket::clear_cancel;
+    using Socket::deadline;
 
     static Result<UdpConn> listen(SocketAddr addr);
 

@@ -127,7 +127,7 @@ cio::Task<int> run(std::uint16_t port) {
         co_return 1;
     }
     std::printf("cio echo server on %s\n",
-                listener->local_addr().value().to_string().c_str());
+                listener->addr().value().to_string().c_str());
     std::fflush(stdout);
 
     cio::go(accept_loop(std::move(*listener)));

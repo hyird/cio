@@ -44,7 +44,7 @@ CIO_MAIN_ARGS(argc, argv) {
         std::fprintf(stderr, "bind failed: %s\n", listener.error().message().c_str());
         co_return 1;
     }
-    std::printf("listening on %s\n", listener->local_addr().value().to_string().c_str());
+    std::printf("listening on %s\n", listener->addr().value().to_string().c_str());
     std::fflush(stdout);
 
     for (;;) {

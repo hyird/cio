@@ -204,7 +204,7 @@ cio::Task<bool> soak(std::chrono::seconds duration) {
     auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
     CIO_CHECK(listener.has_value());
     if (!listener) co_return false;
-    const auto addr = listener->local_addr().value();
+    const auto addr = listener->addr().value();
 
     cio::CancelSource stop;
     auto server = cio::spawn(echo_server(std::move(*listener), stop.token()));

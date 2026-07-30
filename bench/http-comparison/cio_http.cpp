@@ -40,7 +40,7 @@ cio::Task<int> run(std::uint16_t port) {
         co_return 1;
     }
     std::printf("cio http server on %s\n",
-                listener->local_addr().value().to_string().c_str());
+                listener->addr().value().to_string().c_str());
     std::fflush(stdout);
 
     for (;;) {

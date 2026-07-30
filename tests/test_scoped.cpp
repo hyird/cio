@@ -29,7 +29,7 @@ struct Pair {
 cio::Task<cio::Result<Pair>> make_pair() {
     auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
     if (!listener) co_return listener.error();
-    const auto addr = listener->local_addr().value();
+    const auto addr = listener->addr().value();
 
     auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
         auto conn = co_await l.accept();
@@ -262,7 +262,7 @@ void test_timeout_scope_on_a_listener() {
         CIO_CHECK(listener->deadline(/*write_direction=*/false) == outer);
 
         // The restored deadline has not elapsed, so accept works again.
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
         auto connecting = cio::spawn([](net::SocketAddr target)
                                          -> cio::Task<bool> {
             auto conn = co_await net::TcpConn::dial(target);

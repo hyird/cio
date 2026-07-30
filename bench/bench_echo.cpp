@@ -77,7 +77,7 @@ cio::Task<long> run_benchmark(int connections, long requests) {
         std::fprintf(stderr, "bind failed: %s\n", listener.error().message().c_str());
         co_return 0;
     }
-    const auto addr = listener->local_addr().value();
+    const auto addr = listener->addr().value();
 
     cio::CancelSource stop;
     cio::go(accept_loop(std::move(*listener), stop.token()));
@@ -112,7 +112,7 @@ cio::Task<int> run_server(std::uint16_t port) {
         co_return 1;
     }
     std::printf("echo server on %s — ctrl-c to stop\n",
-                listener->local_addr().value().to_string().c_str());
+                listener->addr().value().to_string().c_str());
     // stdout is block-buffered when redirected, and a driver script waiting for
     // this line to know the server is up would otherwise wait forever.
     std::fflush(stdout);

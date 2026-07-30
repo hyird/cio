@@ -101,6 +101,11 @@ go test ./...
   `sync.WaitGroup`/`Mutex`，`os.File`，`tls.Config`/`tls.Conn`，
   `Resolver.PreferGo`。Go 没有对应物的地方——`Task`、`Runtime`、`Result`——
   不要发明虚假的对应。
+- **每个公开类型只暴露其 Go 对应物的方法集。** `net::Socket` 是实现基类：成
+  员全部 protected，由各具体类型逐个重导出自己那份——监听器因此没有
+  `remote_addr()`。Go 没有导出基类，公开继承一个「什么都有」的基类正是方法集
+  漂移的来源。配置字段直接挂在对象上（`Resolver::prefer_builtin`、
+  `Dialer::timeout`），不做单独的 options 结构去包一层。
 - **用 concept，不用虚接口。** Go 用得起运行时接口；socket 快速路径背不起虚
   表。泛型在编译期完成。
 - **截止时间与取消活在连接上，不在调用上。** 这是 `read`、`write` 与

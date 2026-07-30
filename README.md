@@ -140,7 +140,7 @@ ctest --test-dir build-tls --output-on-failure
 | `cio::net::TcpListener` / `TcpConn` / `UdpConn` | 带截止时间的非阻塞 socket |
 | `cio::net::UnixListener` / `UnixConn` / `UnixAddr` | Unix 域 socket，文件系统或抽象命名空间 |
 | `cio::bufio::Reader` / `Writer` | 缓冲 I/O、按行与分帧（`bufio`） |
-| `cio::net::Resolver` / `resolve()` | 名字解析统一入口 |
+| `cio::net::Resolver` / `resolve()` | 名字解析统一入口；字段即配置，如 Go 的 `net.Resolver` |
 | `cio::dns::Resolver` | 内置 DNS 后端；经 `prefer_builtin` 选择 |
 | `cio::Timeout` | 作用域化、可嵌套、退出时还原外层的截止时间 |
 | `cio::PollableFd` | 收养外来 fd（eventfd、timerfd、inotify、C 库） |
@@ -367,6 +367,9 @@ taskset -c 23 python3 bench/http-comparison/matrix_wrk.py \
 | `Command::working_dir` | `dir` | `Cmd.Dir` |
 | `Child::in/out/err()`、`close_in()` | `stdin_pipe()` 等、`close_stdin()` | `Cmd.StdinPipe` 等 |
 | `File::read_at` 允许短读 | 填满或到 EOF | `io.ReaderAt` 契约 |
+| `net::LookupOptions` / `DialOptions` | 删除；字段直接挂在 `Resolver` / `Dialer` 上 | `net.Resolver{PreferGo: …}` 的形状 |
+| 监听器的 `local_addr()` / `remote_addr()` | 只有 `addr()`；监听器没有对端 | `Listener.Addr` |
+| `net::Socket` 作为公开基类 | 变为实现基类；每个类型只重导出其 Go 对应物的方法集 | Go 无导出基类 |
 
 语义变更（会静默编译通过）：所有 `write()`——socket、文件、`PollableFd`、
 bufio——现在写满才返回，短写必然伴随错误；`File::read_at` 短返回只意味着

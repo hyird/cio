@@ -221,14 +221,24 @@ static_assert(std::same_as<
               decltype(cio::net::resolve(std::declval<std::string>(),
                                          std::uint16_t{})),
               cio::Task<cio::Result<std::vector<cio::net::SocketAddr>>>>);
-static_assert(!std::is_copy_constructible_v<cio::net::Socket>);
-static_assert(std::is_nothrow_move_constructible_v<cio::net::Socket>);
+// Socket is an implementation base, not public API: each concrete type
+// re-exports exactly its Go counterpart's surface. The move/copy contracts are
+// asserted on the concrete types.
+static_assert(!std::is_copy_constructible_v<cio::net::TcpConn>);
+static_assert(std::is_nothrow_move_constructible_v<cio::net::TcpConn>);
 static_assert(std::same_as<
-              decltype(std::declval<const cio::net::Socket&>().valid()),
+              decltype(std::declval<const cio::net::TcpConn&>().valid()),
               bool>);
 static_assert(std::same_as<
-              decltype(std::declval<const cio::net::Socket&>().native_handle()),
+              decltype(std::declval<const cio::net::TcpConn&>().native_handle()),
               int>);
+// A listener has no peer: remote_addr() must not exist on it, and addr() is
+// the listener's name for its own address, as Go's Listener.Addr is.
+template <typename T>
+concept HasRemoteAddr = requires(const T& t) { t.remote_addr(); };
+static_assert(HasRemoteAddr<cio::net::TcpConn>);
+static_assert(!HasRemoteAddr<cio::net::TcpListener>);
+static_assert(!HasRemoteAddr<cio::net::UnixListener>);
 static_assert(std::same_as<
               decltype(cio::net::TcpConn::dial(
                   std::declval<cio::net::SocketAddr>())),
@@ -447,8 +457,8 @@ cio::Task<int> exercise_concurrency_surface() {
 
     // Resolver and dialer: the object forms plus the free-function shorthands.
     cio::CancelSource stop;
-    const cio::net::Resolver resolver{
-        cio::net::LookupOptions{cio::net::AddressFamily::ipv4}};
+    cio::net::Resolver resolver;
+    resolver.family = cio::net::AddressFamily::ipv4;
     const auto looked_up =
         co_await resolver.lookup_host("localhost", 80, stop.token());
     (void)looked_up;
@@ -457,12 +467,11 @@ cio::Task<int> exercise_concurrency_surface() {
     const auto resolved = co_await cio::net::resolve("localhost", 80);
     (void)resolved;
 
-    cio::net::DialOptions dial_options;
-    dial_options.timeout = 5s;
-    dial_options.fallback_delay = 300ms;
-    dial_options.nodelay = true;
-    dial_options.family = cio::net::AddressFamily::any;
-    const cio::net::Dialer dialer{dial_options};
+    cio::net::Dialer dialer;
+    dialer.timeout = 5s;
+    dialer.fallback_delay = 300ms;
+    dialer.nodelay = true;
+    dialer.family = cio::net::AddressFamily::any;
     const auto dialed = co_await dialer.dial_tcp("localhost", 80, stop.token());
     (void)dialed;
     const auto dialed_free = co_await cio::net::dial_tcp("localhost", 80);

@@ -621,15 +621,15 @@ Task<std::invoke_result_t<Work&>> cancellable_blocking(Work work,
 
 Task<Result<std::vector<SocketAddr>>> Resolver::lookup_host(
     std::string host, std::uint16_t port, CancelToken cancel) const {
-    if (options_.prefer_builtin) {
+    if (prefer_builtin) {
         dns::Config config;
-        config.ipv4 = options_.family != AddressFamily::ipv6;
-        config.ipv6 = options_.family != AddressFamily::ipv4;
+        config.ipv4 = family != AddressFamily::ipv6;
+        config.ipv6 = family != AddressFamily::ipv4;
         co_return co_await dns::Resolver{std::move(config)}.lookup(
             std::move(host), port, std::move(cancel));
     }
 
-    const int family = af_of(options_.family);
+    const int family = af_of(this->family);
     co_return co_await cancellable_blocking(
         [host = std::move(host), port, family] {
             return lookup_host_blocking(host, port, family);
@@ -1135,18 +1135,17 @@ Task<Result<TcpConn>> Dialer::dial_tcp(std::string host, std::uint16_t port,
                                          CancelToken cancel) const {
     if (cancel && cancel.cancelled()) co_return Error{Errc::cancelled};
 
-    const bool has_overall_timeout = options_.timeout > Duration::zero();
+    const bool has_overall_timeout = timeout > Duration::zero();
     const TimePoint overall_deadline =
-        has_overall_timeout ? Clock::now() + options_.timeout : TimePoint{};
+        has_overall_timeout ? Clock::now() + timeout : TimePoint{};
 
     std::vector<SocketAddr> targets;
     if (auto literal = SocketAddr::parse(host, port); literal) {
         targets.push_back(*literal);
     } else {
-        LookupOptions lookup;
-        lookup.family = options_.family;
-        lookup.prefer_builtin = options_.prefer_builtin_resolver;
-        Resolver resolver{lookup};
+        Resolver resolver;
+        resolver.family = family;
+        resolver.prefer_builtin = prefer_builtin_resolver;
         auto addresses =
             co_await resolver.lookup_host(std::move(host), port, cancel);
         if (!addresses) co_return addresses.error();
@@ -1154,8 +1153,8 @@ Task<Result<TcpConn>> Dialer::dial_tcp(std::string host, std::uint16_t port,
     }
     if (targets.empty()) co_return Error{ENOENT};
 
-    const Duration fallback_delay = options_.fallback_delay > Duration::zero()
-                                        ? options_.fallback_delay
+    const Duration fallback_delay = fallback_delay > Duration::zero()
+                                        ? fallback_delay
                                         : Duration{kDefaultFallbackDelay};
 
     // Attempts are raced, not tried one at a time: a new address is started
@@ -1247,7 +1246,7 @@ Task<Result<TcpConn>> Dialer::dial_tcp(std::string host, std::uint16_t port,
     if (watcher.valid()) co_await watcher;
 
     if (winner) {
-        if (options_.nodelay) (void)winner->set_nodelay(true);
+        if (nodelay) (void)winner->set_nodelay(true);
         co_return winner;
     }
     if (cancel && cancel.cancelled()) co_return Error{Errc::cancelled};

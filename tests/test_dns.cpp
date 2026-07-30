@@ -311,9 +311,8 @@ void test_resolver_backend_selection() {
 
         // The built-in backend resolves localhost from /etc/hosts without
         // sending a query, so it works even with no reachable nameserver.
-        net::LookupOptions options;
-        options.prefer_builtin = true;
-        net::Resolver builtin{options};
+        net::Resolver builtin;
+        builtin.prefer_builtin = true;
         auto via_builtin = co_await builtin.lookup_host("localhost", 80);
         CIO_CHECK(via_builtin.has_value());
         CIO_CHECK(!via_builtin->empty());

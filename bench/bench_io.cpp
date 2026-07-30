@@ -212,7 +212,7 @@ cio::Task<> measure_sequential_spawn_join(long count) {
 cio::Task<int> run(long rounds) {
     auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
     if (!listener) co_return 1;
-    const auto addr = listener->local_addr().value();
+    const auto addr = listener->addr().value();
 
     auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
         auto conn = co_await l.accept();

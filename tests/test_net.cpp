@@ -484,7 +484,7 @@ void test_echo_round_trip() {
     auto body = []() -> cio::Task<std::string> {
         auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         cio::CancelSource stop;
         auto server = cio::spawn(echo_server(std::move(*listener), stop.token()));
@@ -523,7 +523,7 @@ void test_combined_deadline_covers_both_directions() {
     auto body = []() -> cio::Task<bool> {
         auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
             auto conn = co_await l.accept();
@@ -614,7 +614,7 @@ void test_read_deadline() {
     auto body = []() -> cio::Task<bool> {
         auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         // A server that accepts and then stays silent.
         auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
@@ -664,7 +664,7 @@ void test_immediate_deadline_remains_persistent_during_waiter_publication() {
             net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         if (!listener) co_return false;
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         for (int i = 0; i < kIterations; ++i) {
             auto connecting = cio::spawn(net::TcpConn::dial(addr));
@@ -696,7 +696,7 @@ void test_expired_deadline_precedes_ready_data_write_and_eof() {
             net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         if (!listener) co_return false;
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         // Buffered data must not bypass an already-published read deadline.
         auto data_pair = co_await open_tcp_pair(*listener, addr);
@@ -771,7 +771,7 @@ void test_expired_deadline_precedes_ready_accept_and_udp() {
         // Complete the handshake without accepting it, leaving a connection
         // ready in the listener backlog.
         auto client =
-            co_await net::TcpConn::dial(listener->local_addr().value());
+            co_await net::TcpConn::dial(listener->addr().value());
         CIO_CHECK(client.has_value());
         if (!client) co_return false;
         listener->set_deadline(cio::Clock::now());
@@ -831,7 +831,7 @@ void test_connect_refused() {
         {
             auto probe = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
             CIO_CHECK(probe.has_value());
-            port = probe->local_addr().value().port();
+            port = probe->addr().value().port();
         }
         auto result = co_await net::TcpConn::dial(net::SocketAddr::loopback_v4(port));
         CIO_CHECK(!result.has_value());
@@ -848,7 +848,7 @@ void test_connect_completion_survives_descriptor_reuse() {
             net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         if (!listener) co_return false;
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         // Closing every pair immediately leaves plenty of old EPOLLOUT/HUP
         // traffic while the descriptor slabs and native fd numbers are being
@@ -887,7 +887,7 @@ void test_many_concurrent_connections() {
     auto body = []() -> cio::Task<int> {
         auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         cio::CancelSource stop;
         auto server = cio::spawn(echo_server(std::move(*listener), stop.token()));
@@ -943,7 +943,7 @@ void test_accept_distributes_new_streams_across_workers() {
             net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         if (!listener) co_return {};
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         std::vector<bool> seen(kWorkers, false);
         for (int i = 0; i < kConnections; ++i) {
@@ -976,7 +976,7 @@ void test_close_wakes_a_parked_reader() {
     auto body = []() -> cio::Task<bool> {
         auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
             auto conn = co_await l.accept();
@@ -1006,7 +1006,7 @@ void test_local_close_wakes_a_parked_reader() {
     auto body = []() -> cio::Task<bool> {
         auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
             auto conn = co_await l.accept();
@@ -1822,7 +1822,7 @@ void test_socket_returned_from_run_keeps_reactor_alive() {
 
     // The Runtime created by the first run() is already stopped, but the open
     // Socket must still be able to inspect and detach its descriptor safely.
-    CIO_CHECK(listener.local_addr().has_value());
+    CIO_CHECK(listener.addr().has_value());
 
     // Running an async operation on a different Runtime must fail promptly:
     // the descriptor's home reactor has stopped and will never deliver another
@@ -2202,7 +2202,8 @@ void test_resolve_localhost() {
 // filtered afterwards, so an ipv4-only lookup returns no AF_INET6 addresses.
 void test_resolver_family_selection() {
     auto body = []() -> cio::Task<bool> {
-        net::Resolver v4{net::LookupOptions{net::AddressFamily::ipv4}};
+        net::Resolver v4;
+        v4.family = net::AddressFamily::ipv4;
         auto only_v4 = co_await v4.lookup_host("localhost", 80);
         CIO_CHECK(only_v4.has_value());
         CIO_CHECK(!only_v4->empty());
@@ -2228,9 +2229,8 @@ void test_resolver_cancelled_before_submit() {
 
         // Both backends must refuse an already-cancelled token identically.
         for (const bool builtin : {false, true}) {
-            net::LookupOptions options;
-            options.prefer_builtin = builtin;
-            net::Resolver backend{options};
+            net::Resolver backend;
+            backend.prefer_builtin = builtin;
             auto refused =
                 co_await backend.lookup_host("localhost", 80, stop.token());
             CIO_CHECK(!refused.has_value());
@@ -2292,9 +2292,8 @@ void test_cancelled_lookup_leaves_nothing_at_shutdown() {
             // Pinned to the system backend: this test is about its detached
             // job and its admission queue, neither of which the built-in
             // resolver has.
-            net::LookupOptions options;
-            options.prefer_builtin = false;
-            net::Resolver resolver{options};
+            net::Resolver resolver;
+            resolver.prefer_builtin = false;
             auto queued = cio::spawn(
                 [](net::Resolver r, cio::CancelToken token)
                     -> cio::Task<bool> {
@@ -2384,7 +2383,7 @@ void test_dialer_connects_and_times_out() {
     auto body = []() -> cio::Task<bool> {
         auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<bool> {
             auto conn = co_await l.accept();
@@ -2398,10 +2397,9 @@ void test_dialer_connects_and_times_out() {
 
         // A silent address plus a short overall budget must give up rather than
         // wait out the kernel's SYN retries.
-        net::DialOptions options;
-        options.timeout = 80ms;
-        options.fallback_delay = 30ms;
-        net::Dialer bounded{options};
+        net::Dialer bounded;
+        bounded.timeout = 80ms;
+        bounded.fallback_delay = 30ms;
 
         const auto started = cio::Clock::now();
         auto gave_up = co_await bounded.dial_tcp("203.0.113.1", 9);
@@ -2420,7 +2418,7 @@ void test_dialer_races_past_a_silent_address() {
     auto body = []() -> cio::Task<bool> {
         auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<bool> {
             auto conn = co_await l.accept();
@@ -2430,10 +2428,9 @@ void test_dialer_races_past_a_silent_address() {
         // Reach the private dial path directly with a fixed address list by
         // dialling the live port; the silent-first ordering is exercised by the
         // per-attempt stagger below.
-        net::DialOptions options;
-        options.fallback_delay = 40ms;
-        options.timeout = 5s;
-        net::Dialer dialer{options};
+        net::Dialer dialer;
+        dialer.fallback_delay = 40ms;
+        dialer.timeout = 5s;
 
         const auto started = cio::Clock::now();
         auto stream = co_await dialer.dial_tcp("127.0.0.1", addr.port());
@@ -2453,10 +2450,9 @@ void test_dialer_races_past_a_silent_address() {
 // actually enforces this; the test exists to give it something to catch.
 void test_dialer_joins_losing_attempts() {
     auto body = []() -> cio::Task<bool> {
-        net::DialOptions options;
-        options.timeout = 120ms;
-        options.fallback_delay = 25ms;
-        net::Dialer dialer{options};
+        net::Dialer dialer;
+        dialer.timeout = 120ms;
+        dialer.fallback_delay = 25ms;
 
         // TEST-NET-3 is reliably silent, so every attempt is outstanding when
         // the overall budget expires.
@@ -2480,9 +2476,8 @@ void test_dialer_cancellation() {
             source.cancel();
         }(stop));
 
-        net::DialOptions options;
-        options.fallback_delay = 30ms;
-        net::Dialer dialer{options};
+        net::Dialer dialer;
+        dialer.fallback_delay = 30ms;
 
         const auto started = cio::Clock::now();
         auto cancelled = co_await dialer.dial_tcp("203.0.113.1", 9, stop.token());
@@ -2588,7 +2583,7 @@ void test_stream_algorithms_over_tcp() {
     auto body = []() -> cio::Task<bool> {
         auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
-        const auto addr = listener->local_addr().value();
+        const auto addr = listener->addr().value();
 
         auto server = cio::spawn([](net::TcpListener l) -> cio::Task<std::string> {
             auto conn = co_await l.accept();

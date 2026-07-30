@@ -1,16 +1,14 @@
 # cio
 
-Goroutine-style concurrency for C++20 stackless coroutines.
+面向 C++20 无栈协程的 goroutine 风格并发库。
 
-cio provides lazy tasks, detached and joinable spawning, channels, `select`,
-structured task groups, cancellation, synchronization primitives, timers,
-non-blocking sockets and a blocking pool. Applications use coroutine APIs while
-the runtime manages M:N scheduling, worker-local epoll shards, timer shards and
-conditional work stealing.
+cio 提供惰性任务、分离式与可 join 的任务派生、channel、`select`、结构化任务
+组、取消、同步原语、定时器、非阻塞 socket 与阻塞线程池。应用只使用协程 API，
+运行时负责 M:N 调度、worker 本地 epoll 分片、定时器分片与条件化工作窃取。
 
-Linux and C++20 are required. The core library has no external dependencies.
+要求 Linux 与 C++20。核心库没有任何外部依赖。
 
-## Quick start
+## 快速上手
 
 ```cpp
 #include <cio/cio.hpp>
@@ -52,11 +50,10 @@ CIO_MAIN {
 }
 ```
 
-`CIO_MAIN` keeps the user-written body asynchronous while emitting the real
-non-coroutine `main` required by the C++ standard. Use `cio::Runtime` directly
-when worker count or runtime ownership must be configured explicitly.
+`CIO_MAIN` 让用户编写的主体保持异步，同时生成 C++ 标准要求的真正的非协程
+`main`。需要显式配置 worker 数量或运行时所有权时，直接使用 `cio::Runtime`。
 
-## Install and use
+## 安装与使用
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -67,19 +64,19 @@ cmake --install build --prefix /usr/local
 ```cmake
 find_package(cio 0.1.0 REQUIRED)
 target_link_libraries(app PRIVATE cio::cio)
-# and cio::cio_tls when built with -DCIO_TLS=ON
+# 以 -DCIO_TLS=ON 构建时再加 cio::cio_tls
 ```
 
-`add_subdirectory()` works too, and does not inherit this project's tests,
-examples or install rules. `cio/version.hpp` provides `CIO_VERSION_MAJOR`,
-`CIO_VERSION_MINOR`, `CIO_VERSION_PATCH` and a comparable `CIO_VERSION`:
+`add_subdirectory()` 同样可用，且不会继承本项目的测试、示例和安装规则。
+`cio/version.hpp` 提供 `CIO_VERSION_MAJOR`、`CIO_VERSION_MINOR`、
+`CIO_VERSION_PATCH` 以及可比较的 `CIO_VERSION`：
 
 ```cpp
 #if CIO_VERSION >= CIO_VERSION_NUMBER(0, 1, 0)
 #endif
 ```
 
-## Build and test
+## 构建与测试
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -87,10 +84,9 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-The project is tested with GCC 13.3 and Clang 19 on Linux 6.12. CMake 3.20 or
-newer is required.
+项目在 Linux 6.12 上以 GCC 13.3 与 Clang 19 测试。要求 CMake 3.20 及以上。
 
-Sanitizer configurations are first-class CMake builds:
+sanitizer 配置是一等公民的 CMake 构建：
 
 ```sh
 cmake -S . -B build-asan \
@@ -104,11 +100,10 @@ cmake --build build-tsan -j
 ctest --test-dir build-tsan --output-on-failure
 ```
 
-Nineteen test executables cover the public API, scheduler, worker bitmaps,
-directed MPSC inbox, channels, `select`, networking, Unix sockets, DNS, files,
-processes, signals, buffered I/O, timers and pools, scoped deadlines and
-descriptor adoption, synchronization and soak behaviour. The optional TLS module
-adds a twentieth:
+十九个测试可执行文件覆盖公开 API、调度器、worker 位图、定向 MPSC 收件箱、
+channel、`select`、网络、Unix socket、DNS、文件、进程、信号、缓冲 I/O、定时
+器与池、作用域截止时间与描述符收养、同步原语以及浸泡（soak）行为。可选的
+TLS 模块贡献第二十个：
 
 ```sh
 cmake -S . -B build-tls -DCMAKE_BUILD_TYPE=Release -DCIO_TLS=ON
@@ -116,171 +111,152 @@ cmake --build build-tls -j
 ctest --test-dir build-tls --output-on-failure
 ```
 
-For a longer non-sanitized network soak:
+更长的非 sanitizer 网络浸泡：
 
 ```sh
 ./build/test_soak 90
 ```
 
-Long coroutine soaks should not run under ASan or TSan; see
-[Known limits](#known-limits).
+长协程浸泡不应在 ASan 或 TSan 下运行；见[已知限制](#已知限制)。
 
-## Public API
+## 公开 API
 
-| API | Purpose |
+| API | 用途 |
 |---|---|
-| `cio::Task<T>` | Lazy, single-consumer coroutine |
-| `cio::go(task)` | Fire-and-forget task |
-| `cio::spawn(task)` | Joinable task returning `JoinHandle<T>` |
-| `cio::yield()` | Yield the current worker |
-| `cio::Chan<T>` / `make_chan<T>(n)` | Mutex-protected MPMC channel; `n == 0` is rendezvous |
-| `cio::select(...)` | Receive, send, timeout and default cases |
-| `cio::TaskGroup` | Structured child-task scope |
-| `CancelSource` / `CancelToken` | Cooperative cancellation |
-| `cio::with_cancel` / `with_timeout` / `with_deadline` | Nesting, expiring scopes (`context`) |
-| `WaitGroup` / `Mutex` / `RWMutex` / `Once` / `Cond` | Task-suspending synchronization (`sync`) |
-| `cio::sleep(duration)` | Runtime timer |
+| `cio::Task<T>` | 惰性、单消费者协程 |
+| `cio::go(task)` | 发射后不管的分离任务 |
+| `cio::spawn(task)` | 可 join 的任务，返回 `JoinHandle<T>` |
+| `cio::yield()` | 让出当前 worker |
+| `cio::Chan<T>` / `make_chan<T>(n)` | 互斥锁保护的 MPMC channel；`n == 0` 为会合语义 |
+| `cio::select(...)` | 接收、发送、超时与 default 分支 |
+| `cio::TaskGroup` | 结构化子任务作用域 |
+| `CancelSource` / `CancelToken` | 协作式取消 |
+| `cio::with_cancel` / `with_timeout` / `with_deadline` | 可嵌套、可过期的取消作用域（`context`） |
+| `WaitGroup` / `Mutex` / `RWMutex` / `Once` / `Cond` | 挂起任务的同步原语（`sync`） |
+| `cio::sleep(duration)` | 运行时定时器 |
 | `cio::Timer` / `Ticker` / `after_func` | `time.Timer` / `time.Ticker` / `time.AfterFunc` |
-| `cio::buffer_pool()` / `Pool<T>` | Reusable I/O buffers and objects |
-| `cio::blocking(fn)` | Run blocking work outside scheduler workers |
-| `cio::net::TcpListener` / `TcpConn` / `UdpConn` | Non-blocking sockets with deadlines |
-| `cio::net::UnixListener` / `UnixConn` / `UnixAddr` | Unix domain sockets, filesystem or abstract |
-| `cio::bufio::Reader` / `Writer` | Buffered I/O, lines and framing (`bufio`) |
-| `cio::net::Resolver` / `resolve()` | System name resolution on the blocking pool |
-| `cio::dns::Resolver` | Built-in DNS backend; selected via `prefer_builtin` |
-| `cio::Timeout` | Scoped, nestable deadline that restores the enclosing one |
-| `cio::PollableFd` | Adopt a foreign fd (eventfd, timerfd, inotify, a C library) |
-| `cio::net::Dialer` / `dial_tcp()` | Resolution plus raced address selection and timeouts |
-| `cio::fs::File` / `open` / `read_file` / `read_dir` | Files and directories on the blocking pool (`os`) |
-| `cio::process::Command` / `spawn` / `run` | Child processes, awaited through `pidfd` (`os/exec`) |
-| `cio::signal::SignalSet` | `signalfd`-backed signal delivery |
-| `cio::tls::Conn` | Optional TLS (`-DCIO_TLS=ON`, links OpenSSL) |
+| `cio::buffer_pool()` / `Pool<T>` | 可复用的 I/O 缓冲区与对象 |
+| `cio::blocking(fn)` | 把阻塞工作放到调度器 worker 之外执行 |
+| `cio::net::TcpListener` / `TcpConn` / `UdpConn` | 带截止时间的非阻塞 socket |
+| `cio::net::UnixListener` / `UnixConn` / `UnixAddr` | Unix 域 socket，文件系统或抽象命名空间 |
+| `cio::bufio::Reader` / `Writer` | 缓冲 I/O、按行与分帧（`bufio`） |
+| `cio::net::Resolver` / `resolve()` | 名字解析统一入口 |
+| `cio::dns::Resolver` | 内置 DNS 后端；经 `prefer_builtin` 选择 |
+| `cio::Timeout` | 作用域化、可嵌套、退出时还原外层的截止时间 |
+| `cio::PollableFd` | 收养外来 fd（eventfd、timerfd、inotify、C 库） |
+| `cio::net::Dialer` / `dial_tcp()` | 解析加地址竞速与超时 |
+| `cio::fs::File` / `open` / `read_file` / `read_dir` | 阻塞池上的文件与目录操作（`os`） |
+| `cio::process::Command` / `spawn` / `run` | 经 `pidfd` 等待的子进程（`os/exec`） |
+| `cio::signal::SignalSet` | 基于 `signalfd` 的信号投递 |
+| `cio::tls::Conn` | 可选 TLS（`-DCIO_TLS=ON`，链接 OpenSSL） |
 | `cio::io::read_full` / `copy` / `read_all` | `io.ReadFull` / `io.Copy` / `io.ReadAll` |
 | `cio::io::LimitReader` / `TeeReader` | `io.LimitReader` / `io.TeeReader` |
-| `net::Conn` / `PacketConn` / `Listener` | Go's three net interfaces, as concepts |
-| `cio::io::Reader` / `Writer` | `io.Reader` / `io.Writer`, as concepts |
+| `net::Conn` / `PacketConn` / `Listener` | Go net 的三个接口，以 concept 表达 |
+| `cio::io::Reader` / `Writer` | `io.Reader` / `io.Writer`，以 concept 表达 |
 | `net::split_host_port` / `join_host_port` | `net.SplitHostPort` / `net.JoinHostPort` |
-| `cio::Runtime` / `cio::run(task)` / `CIO_MAIN` | Runtime ownership and entry points |
+| `cio::Runtime` / `cio::run(task)` / `CIO_MAIN` | 运行时所有权与入口点 |
 
-`net::Conn`, `net::PacketConn` and `net::Listener` are Go's three net
-interfaces expressed as concepts rather than virtual bases: a protocol library
-can be written once against "anything that behaves like a connection" while the
-concrete socket keeps a non-virtual fast path. `tls::Conn` satisfies
-`net::Conn`, as Go's `tls.Conn` implements `net.Conn`, so a generic helper works
-over plaintext and TLS unchanged. `cio::io::copy` takes its destination first,
-as `io.Copy(dst, src)` does. `Error` carries `is_timeout()`, `is_cancelled()`,
-`is_temporary()`, `is_closed()` and `is_not_found()`, mirroring `net.Error`, so
-callers classify rather than compare codes.
+`net::Conn`、`net::PacketConn` 与 `net::Listener` 是 Go net 的三个接口，以
+concept 而非虚基类表达：协议库可以只针对「行为像连接的任何东西」写一次，而具
+体 socket 保持无虚表的快速路径。`tls::Conn` 满足 `net::Conn`，正如 Go 的
+`tls.Conn` 实现 `net.Conn`，所以泛型辅助函数在明文与 TLS 上通用无改动。
+`cio::io::copy` 目标参数在前，与 `io.Copy(dst, src)` 一致。`Error` 提供
+`is_timeout()`、`is_cancelled()`、`is_temporary()`、`is_closed()` 与
+`is_not_found()`，对应 `net.Error`，调用方按类别判断而不是比对错误码。
 
-Receiving from a closed and drained channel returns `std::nullopt`. Sending to a
-closed channel returns `false`. `select` returns the winning case index and case
-values remain available through `selected.get<I>()`.
+从已关闭且取空的 channel 接收返回 `std::nullopt`。向已关闭的 channel 发送返回
+`false`。`select` 返回胜出分支的下标，分支值仍可经 `selected.get<I>()` 取得。
 
-Socket deadlines are per-direction and persist until reset; the unsuffixed
-`set_deadline()`, `set_timeout()` and `clear_deadline()` apply to both
-directions at once. `cio::Timeout` applies one for a scope and restores the
-enclosing deadline afterwards, so timeouts nest without manual save/restore;
-an inner scope can only tighten an outer one, never extend it.
+socket 截止时间按方向设置、直到重置前持续生效；无后缀的 `set_deadline()`、
+`set_timeout()` 与 `clear_deadline()` 同时作用于两个方向。`cio::Timeout` 在一
+个作用域内施加截止时间、退出时还原外层的值，因此超时可以嵌套而无需手工保存
+恢复；内层作用域只能收紧外层，不能放宽。
 
-`with_cancel`, `with_timeout` and `with_deadline` nest scopes the way
-`context.WithCancel` and `context.WithTimeout` do: cancelling a parent reaches
-every descendant, and a child deadline is clamped to its parent's so a
-sub-operation cannot grant itself more time than the request has. An elapsed
-deadline reports `Errc::timed_out` and an explicit cancel reports
-`Errc::cancelled`, because a caller decides differently on each. There are no
-context values — a map keyed by opaque types is dependency injection, not
-cancellation.
+`with_cancel`、`with_timeout` 与 `with_deadline` 按 `context.WithCancel` 与
+`context.WithTimeout` 的方式嵌套作用域：取消父级会到达每个后代，子作用域的截
+止时间会被钳制到父级之内，子操作无法给自己批比整个请求更多的时间。截止时间
+到期报告 `Errc::timed_out`，显式取消报告 `Errc::cancelled`——两者是不同的结
+果，调用方的决策也不同。不提供 context value：以不透明类型为键的映射是依赖注
+入机制，不是取消机制。
 
-Cancellation binds to a socket rather than to a call: `set_cancel(token)` makes
-every operation in either direction fail with `Errc::cancelled` once the token
-fires, including one already parked, which is woken. That is why `read()`,
-`write()` and `accept()` take no cancel parameter — like deadlines,
-cancellation lives on the connection. `TcpConn::dial()` and the resolver
-and dialer entry points additionally accept a token directly.
+取消绑定在 socket 上而不是调用上：`set_cancel(token)` 之后，一旦令牌触发，两
+个方向上的所有操作都以 `Errc::cancelled` 失败——包括已经 park 的操作，它会被
+唤醒。这就是 `read()`、`write()` 与 `accept()` 不带取消参数的原因——与截止时
+间一样，取消活在连接上。`TcpConn::dial()` 以及解析器和拨号器的入口另外直接
+接受令牌。
 
-`net::Resolver` is the one entry point for name resolution and picks its
-backend with `LookupOptions::prefer_builtin`, mirroring Go's
-`Resolver.PreferGo`; `Dialer` selects the same way through
-`DialOptions::prefer_builtin_resolver`.
+`net::Resolver` 是名字解析的唯一入口，用 `LookupOptions::prefer_builtin` 选择
+后端，对应 Go 的 `Resolver.PreferGo`；`Dialer` 经
+`DialOptions::prefer_builtin_resolver` 做同样的选择。
 
-The default backend calls `getaddrinfo()` on the blocking pool: it honours
-every NSS module, but occupies a pool thread and cannot be interrupted once
-started, so a cancelled lookup resumes its caller while the call finishes in
-the background. The built-in backend speaks DNS over the runtime's own sockets
-and reads `/etc/hosts`: a lookup is cancellable mid-flight and costs no pool
-thread, but it does not consult NSS, so LDAP, NIS and mDNS are invisible to it.
-Go makes the same split for the same reason, and defaults the other way; cio
-keeps the system backend as the default because a minor release should not
-silently change how names resolve.
+默认后端是内置 DNS 解析器，与 Go 在 Unix 上的默认一致，理由也相同：阻塞的
+DNS 查询只占一个任务，阻塞的 C 调用占一个操作系统线程。它在运行时自己的
+socket 上收发 DNS 并读取 `/etc/hosts`：查询可在途中取消、不占用池线程；但它
+不查询 NSS，LDAP、NIS 与 mDNS 对它不可见。系统后端在阻塞池上调用
+`getaddrinfo()`：尊重所有 NSS 模块，但占用一个池线程且一旦开始无法中断，被取
+消的查询会立即恢复调用方、让调用在后台跑完。依赖 NSS 解析名字、或要求结果与
+`getent hosts` 一致的机器，应把 `prefer_builtin` 设为 false。
 
-`cio::blocking(fn)` uses a lazily grown thread pool. `RuntimeOptions` bounds
-its worker count (`max_blocking_threads`, default 512), its FIFO wait queue
-(`max_blocking_queue`, default 1024), and the built-in operation classes
-(`max_file_operations`, default 32; `max_resolver_operations`, default 8).
-Class limits bound concurrently admitted operations, not threads: a task
-waiting for admission is parked and occupies no pool thread, and each class has
-its own wait queue so a burst of file work cannot sit in front of name
-resolution. A submission to a full queue throws
-`cio::SystemError` carrying `Errc::overloaded`. The same error is returned if
-the pool has no service thread and the operating system refuses to create its
-first one; a rejected callable is never run.
+`cio::blocking(fn)` 使用惰性增长的线程池。`RuntimeOptions` 限定其线程数上限
+（`max_blocking_threads`，默认 512）、FIFO 等待队列（`max_blocking_queue`，
+默认 1024），以及内置操作类别（`max_file_operations` 默认 32、
+`max_resolver_operations` 默认 8）。类别限额约束的是并发准入的操作数而非线程
+数：等待准入的任务只是 park，不占池线程；每个类别有独立等待队列，文件操作的
+洪峰不会排在名字解析前面。向已满队列提交会抛出携带 `Errc::overloaded` 的
+`cio::SystemError`。池中没有服务线程且操作系统拒绝创建第一个时返回同样的错
+误；被拒绝的可调用对象绝不会被执行。
 
-## Runtime architecture
+## 运行时架构
 
-Each runtime worker owns:
+每个运行时 worker 拥有：
 
-- a single-slot `runnext` handoff;
-- an owner-produced local FIFO whose published tail can be stolen;
-- a bounded 256-entry MPSC `RemoteInbox` for hard-directed internal work;
-- one edge-triggered epoll instance and eventfd;
-- one 4-ary timer heap.
+- 一个单槽 `runnext` 直接交接位；
+- 一条仅由所有者生产的本地 FIFO，其已发布尾部可被窃取；
+- 一个有界 256 项的 MPSC `RemoteInbox`，只承接硬定向的内部工作；
+- 一个边沿触发的 epoll 实例与 eventfd；
+- 一个 4 叉定时器堆。
 
-The MPSC inbox is deliberately not a general runnable queue. Only submissions
-with a concrete internal ownership target enter it, and only the target worker
-consumes it. Ordinary foreign submissions, soft-affinity completions and inbox
-overflow use a shared mutex-protected fallback so an arbitrary busy worker
-cannot strand them. Public `cio::Chan<T>` remains MPMC and is unrelated to the
-scheduler inbox.
+MPSC 收件箱刻意不做通用可运行队列。只有携带明确内部所有权目标的提交才会进
+入，且只有目标 worker 消费。普通外来提交、软亲和完成与收件箱溢出走共享的互
+斥锁保护回退队列，任意繁忙 worker 都无法把它们困住。公开的 `cio::Chan<T>`
+仍是 MPMC，与调度器收件箱无关。
 
-Workers publish idle and stealable state in scalable bitmaps. Thieves inspect
-only advertised victims, while an epoch handshake closes concurrent
-publish/clear races. Sticky searcher credit preserves load redistribution when
-I/O or another runnable intercepts a newly woken worker.
+worker 在可扩展位图中发布空闲与可窃取状态。窃取者只检查已通告的受害者，一个
+纪元（epoch）握手闭合并发的发布/清除竞争。粘性搜索者信用保证新唤醒的 worker
+即使被 I/O 或其他可运行任务截胡，负载再分配也不会丢失。
 
-Accepted sockets receive a stable home reactor shard. Descriptor generations,
-lifecycle pins and syscall leases make stale epoll events safe while close,
-deadline and cancellation race. Delayed cross-runtime completions use stable
-process-lifetime endpoint identities with counted foreign leases.
+被 accept 的 socket 获得稳定的 home reactor 分片。描述符代号、生命周期钉与系
+统调用租约让陈旧 epoll 事件在 close、截止时间与取消的竞争中保持安全。延迟的
+跨运行时完成使用进程生命周期内唯一的端点身份，配计数的外部租约。
 
-The load-bearing invariants, and the record of designs already measured and
-rejected, are in [AGENTS.md](AGENTS.md).
+承重的不变量在 [AGENTS.md](AGENTS.md)。
 
-## Repository layout
+## 仓库布局
 
-| Path | Contents |
+| 路径 | 内容 |
 |---|---|
-| `include/cio/` | Public headers |
-| `include/cio/detail/` | Internal scheduler, reactor, timer and queue contracts |
-| `src/` | Runtime implementation |
-| `tests/` | Unit, concurrency, API-surface and soak tests |
-| `examples/` | Small buildable programs |
-| `bench/` | Core, I/O, echo, Go and HTTP/`wrk` benchmarks |
-| `include/cio/tls.hpp` | Optional TLS module; built only with `-DCIO_TLS=ON` |
-| `AGENTS.md` | Repository-specific development and verification rules |
+| `include/cio/` | 公开头文件 |
+| `include/cio/detail/` | 内部调度器、reactor、定时器与队列契约 |
+| `src/` | 运行时实现 |
+| `tests/` | 单元、并发、API 表面与浸泡测试 |
+| `examples/` | 可构建的小示例 |
+| `bench/` | 核心、I/O、echo、Go 与 HTTP/`wrk` 基准 |
+| `include/cio/tls.hpp` | 可选 TLS 模块；仅在 `-DCIO_TLS=ON` 时构建 |
+| `AGENTS.md` | 仓库的开发与验证规范 |
 
-Build directories, sanitizer artifacts, benchmark binaries, Python caches and
-raw local result directories are generated locally and must remain untracked.
+构建目录、sanitizer 产物、基准二进制、Python 缓存与本地原始结果目录都是本地
+生成物，必须保持不入库。
 
-## Benchmarks
+## 基准测试
 
-Build the C++ microbenchmarks with the normal Release configuration:
+用常规 Release 配置构建 C++ 微基准：
 
 ```sh
 ./build/bench_core 24
 ./build/bench_io
 ```
 
-The matching Go core workloads are isolated in their own module:
+对应的 Go 核心负载隔离在自己的模块里：
 
 ```sh
 cd bench/go-core
@@ -289,9 +265,9 @@ go build -o go_core .
 taskset -c 0-23 ./go_core -gomaxprocs=24 -warmup=1 -repeat=5
 ```
 
-HTTP before/after measurements use the same third-party `wrk` executable for
-both sides, disjoint server/client CPU sets, warm-up, alternating AB/BA pairs,
-input SHA-256 checks, error rejection and retained raw logs:
+HTTP 前后对比两侧使用同一个第三方 `wrk` 可执行文件、互不相交的服务端/客户端
+CPU 集合、预热、交替的 AB/BA 配对、输入 SHA-256 校验、错误拒绝与保留的原始
+日志：
 
 ```sh
 taskset -c 23 python3 bench/http-comparison/matrix_wrk.py \
@@ -306,16 +282,15 @@ taskset -c 23 python3 bench/http-comparison/matrix_wrk.py \
   --expected-tail-script-sha256 <sha256>
 ```
 
-Frozen local binaries are generated artifacts and are not committed. Record
-their hashes and the `wrk` hash with every result.
+冻结的本地二进制是生成物，不提交入库。每份结果都要记录它们与 `wrk` 的哈希。
 
-### Measured throughput
+### 实测吞吐
 
-A minimal HTTP/1.1 server on eight workers pinned to CPUs 0-7, driven by
-third-party `wrk` on CPUs 8-23. All five cells come from one ten-pair matrix
-against the published v0.0.1 runtime, so they are directly comparable:
+极简 HTTP/1.1 服务器，八个 worker 钉在 CPU 0-7，由钉在 CPU 8-23 的第三方
+`wrk` 驱动。五个格子来自针对已发布 v0.0.1 运行时的同一次十对矩阵，因此可以
+直接互相比较：
 
-| Connections | req/s | median p50 | median p99 |
+| 连接数 | req/s | p50 中位数 | p99 中位数 |
 |---:|---:|---:|---:|
 | 1 | 14,339 | 68 us | 110 us |
 | 8 | 125,598 | 52 us | 644 us |
@@ -323,29 +298,26 @@ against the published v0.0.1 runtime, so they are directly comparable:
 | 256 | 771,416 | 306 us | 2765 us |
 | 1024 | 781,518 | 1125 us | 4635 us |
 
-A later monitor-balance round measured c1024 at 859,820 req/s with median p99
-of 2060 us. That is a separate confirmation against a different baseline and is
-not paired with the table above; do not read the two together as one sweep.
+后来一轮 monitor-balance 测得 c1024 为 859,820 req/s、p99 中位数 2060 us。那
+是针对另一个基线的独立确认，与上表不构成配对；不要把两者当作一次扫描合读。
 
-Absolute numbers are host-specific and are useful mainly as a shape: throughput
-saturates near 64 connections, and tail latency is the axis that moves.
+绝对数字与主机相关，主要用于看形状：吞吐在 64 连接附近饱和，尾延迟才是移动
+的轴。
 
-Comparisons against Boost.Asio and Go live under `bench/`: `http-comparison`
-drives all three runtimes with the same third-party `wrk`, `echo-comparison`
-adds a skew sweep, and `go-core` is the Go counterpart of `bench_core` in its
-own module. The rules any of them has to follow are in
-[AGENTS.md](AGENTS.md#benchmark-rules).
+与 Boost.Asio 和 Go 的对比在 `bench/` 下：`http-comparison` 用同一个第三方
+`wrk` 驱动三个运行时，`echo-comparison` 增加倾斜负载扫描，`go-core` 是
+`bench_core` 的 Go 对应物、独立成模块。它们必须遵守的规则在
+[AGENTS.md](AGENTS.md#基准测试规范)。
 
-Optional runtime counters are enabled with `-DCIO_METRICS=ON`.
-`cio::runtime_metrics()` is always linkable and returns zero-valued counters
-when instrumentation is disabled.
+可选的运行时计数器以 `-DCIO_METRICS=ON` 启用。`cio::runtime_metrics()` 始终
+可链接，未启用插桩时返回全零计数。
 
-## Migrating from 0.0.1
+## 从 0.0.1 迁移
 
-The public API was renamed to match Go's, so a reader who knows `net`, `os` and
-`crypto/tls` can predict cio's spelling. Every 0.0.1 program needs these edits:
+公开 API 已改为 Go 的命名，熟悉 `net`、`os` 与 `crypto/tls` 的读者可以直接推
+断 cio 的拼写。所有 0.0.1 程序需要如下修改：
 
-| 0.0.1 | now | Go |
+| 0.0.1 | 现在 | Go |
 |---|---|---|
 | `net::TcpStream` | `net::TcpConn` | `net.TCPConn` |
 | `net::UdpSocket` | `net::UdpConn` | `net.UDPConn` |
@@ -358,93 +330,79 @@ The public API was renamed to match Go's, so a reader who knows `net`, `os` and
 | `fs::FileInfo::is_directory()` | `is_dir()` | `FileInfo.IsDir` |
 | `cio::AsyncReader` / `AsyncWriter` | `cio::io::Reader` / `Writer` | `io.Reader` / `io.Writer` |
 | `cio::read_exact()` | `cio::io::read_full()` | `io.ReadFull` |
-| `cio::write_all()` / `copy()` | `cio::io::write_all()` / `copy()` | `io` package |
-| `tls::ClientConfig` + `ServerConfig` | one `tls::Config` | `tls.Config` |
+| `cio::write_all()` / `copy()` | `cio::io::write_all()` / `copy()` | `io` 包 |
+| `tls::ClientConfig` + `ServerConfig` | 合并为一个 `tls::Config` | `tls.Config` |
 | `tls::TlsStream` | `tls::Conn` | `tls.Conn` |
 
-Two changes are not renames and will compile silently:
+有两处变更不是改名，会静默编译通过，需要特别注意：
 
-- **`copy()` takes its destination first**, as `io.Copy(dst, src)` does. The old
-  order was `(src, dst)`. A call where both sides are the same type still
-  compiles either way.
-- **Name resolution now defaults to the built-in DNS resolver** rather than
-  `getaddrinfo()`, matching Go's default on Unix. Set
-  `LookupOptions::prefer_builtin` or `DialOptions::prefer_builtin_resolver` to
-  false on a machine that resolves through NSS modules the built-in resolver
-  cannot see — LDAP, NIS, mDNS — or wherever answers must agree with
-  `getent hosts`.
+- **`copy()` 的目标参数在前**，与 `io.Copy(dst, src)` 一致。旧顺序是
+  `(src, dst)`。两侧类型相同的调用无论怎么写都能编译。
+- **名字解析默认改为内置 DNS 解析器**，不再是 `getaddrinfo()`，与 Go 在 Unix
+  上的默认一致。依赖内置解析器看不见的 NSS 模块（LDAP、NIS、mDNS）解析名字
+  的机器，或要求结果与 `getent hosts` 一致的场合，把
+  `LookupOptions::prefer_builtin` 或 `DialOptions::prefer_builtin_resolver`
+  设为 false。
 
-## Known limits
+## 已知限制
 
-Runtime:
+运行时：
 
-- Linux/epoll only; no kqueue, IOCP or io_uring backend is claimed.
-- Scheduling is cooperative. A task that never suspends holds its worker.
-- Cancellation is cooperative and is observed only where the task checks it.
-- A blocking callable that has started cannot be preempted. Runtime shutdown
-  waits for started and already-queued blocking work to finish.
-- Runtime shutdown does not unwind tasks still parked on channels or sockets.
-  Calling `Runtime::shutdown()` from one of its own workers throws
-  `std::logic_error`.
-- A socket object must outlive tasks using it. At most one reader and one writer
-  may wait concurrently on a socket.
-- Symmetric coroutine transfer relies on tail calls. CMake propagates GCC's
-  required `-foptimize-sibling-calls`; sanitizer instrumentation can still turn
-  long non-suspending coroutine chains into deep native stacks.
-- `cio::blocking()` itself has no admission limit; only the built-in file and
-  resolver classes are bounded. A flood of user blocking work is held only by
-  the global queue bound and the thread ceiling.
-- Accepted connections are distributed round-robin, but weight is a property of
-  the traffic a connection later carries, so heavy connections cluster by chance
-  and skewed workloads land unevenly across reactor shards.
+- 仅 Linux/epoll；不声称支持 kqueue、IOCP 或 io_uring 后端。
+- 调度是协作式的。从不挂起的任务会占住它的 worker。
+- 取消是协作式的，只在任务检查它的地方被观察到。
+- 已开始执行的阻塞可调用无法被抢占。运行时关停会等待已开始与已排队的阻塞工
+  作完成。
+- 运行时关停不会展开仍 park 在 channel 或 socket 上的任务。从运行时自己的
+  worker 上调用 `Runtime::shutdown()` 会抛出 `std::logic_error`。
+- socket 对象必须比使用它的任务活得久。每个 socket 同方向至多一个等待者。
+- 对称协程转移依赖尾调用。CMake 传递 GCC 需要的
+  `-foptimize-sibling-calls`；sanitizer 插桩仍可能把长的不挂起协程链变成深原
+  生栈。
+- `cio::blocking()` 本身没有准入上限；只有内置的文件与解析器类别受限。用户
+  阻塞工作的洪峰只受全局队列上限与线程数上限约束。
+- accept 按连接轮询分配，而权重是连接之后承载的流量的属性，因此重连接会随机
+  聚集，倾斜负载在 reactor 分片间落得不均。
 
-Files:
+文件：
 
-- No cancellation and no deadlines, by design: a cancelled read would let a pool
-  thread keep writing into a caller-owned span after it was destroyed.
-- `read()` and `write()` share the file offset and must not run concurrently on
-  the same `File`; `read_at()`/`write_at()` may, with distinct buffers.
-- `close()` is synchronous. On a filesystem where it can block for an unbounded
-  time, call it from `cio::blocking()`.
-- No directory traversal, path mutation or whole-file helpers yet.
+- 无取消、无截止时间，这是设计选择：被取消的 read 会让池线程继续写入调用方
+  已销毁的 span。
+- `read()` 与 `write()` 共享文件偏移量，同一 `File` 上不可并发；
+  `read_at()`/`write_at()` 在缓冲区不同时可以并发。
+- `close()` 是同步的。在 close 本身可能无界阻塞的文件系统上，请放进
+  `cio::blocking()` 调用。
 
-Name resolution:
+名字解析：
 
-- `net::Resolver` uses the system resolver. A cancelled lookup resumes its
-  caller immediately, but `getaddrinfo()` cannot be interrupted and runs to
-  completion; its late result is discarded.
-- The built-in backend reads `/etc/hosts` but not NSS, so LDAP, NIS and mDNS
-  are invisible to it. It also has no cache, no DNSSEC validation, no TCP
-  fallback — a truncated answer with no usable records is reported rather than
-  retried over TCP — and does not implement the `resolv.conf` search list or
-  `ndots`, so names are queried as given.
+- 系统后端使用 `getaddrinfo()`。被取消的查询立即恢复调用方，但
+  `getaddrinfo()` 无法中断、会跑到结束；迟到的结果被丢弃。
+- 内置后端读 `/etc/hosts` 但不查 NSS，LDAP、NIS 与 mDNS 对它不可见。它也没
+  有缓存、没有 DNSSEC 校验、没有 TCP 回退——截断且无可用记录的应答如实报
+  错，而不是改走 TCP 重试——也不实现 `resolv.conf` 的 search 列表和
+  `ndots`，名字按原样查询。
 
-Signals:
+信号：
 
-- `cio::signal::block()` must be called before the runtime starts any thread.
-  `subscribe()` reports `Errc::broken` for a signal that is not blocked, rather
-  than returning a set that could never fire.
-- Identical signals arriving faster than they are consumed may be coalesced by
-  the kernel. Use it for lifecycle events, not as a counter.
+- `cio::signal::block()` 必须在运行时创建任何线程之前调用。对未被屏蔽的信
+  号，`subscribe()` 报告 `Errc::broken`，而不是返回一个永远不会触发的集合。
+- 到达速度快于消费速度的同种信号可能被内核合并。请用于生命周期事件，不要当
+  计数器。
 
-TLS (optional):
+TLS（可选）：
 
-- Requires `-DCIO_TLS=ON` and links OpenSSL; the core library stays
-  dependency-free.
-- TLS 1.2 is the floor. No ALPN, no session resumption and no client
-  certificates.
+- 需要 `-DCIO_TLS=ON` 并链接 OpenSSL；核心库保持零依赖。
+- 下限为 TLS 1.2。无 ALPN、无会话复用、无客户端证书。
 
-Design constraints, the rejected-design record and the remaining open items are
-in [AGENTS.md](AGENTS.md).
+设计约束与运行时不变量在 [AGENTS.md](AGENTS.md)。
 
-## Development
+## 开发
 
-Read [AGENTS.md](AGENTS.md) before changing runtime ownership, waiter lifetime,
-shutdown or benchmark methodology. Public API and observable semantics should
-remain stable unless an API change is explicitly requested and documented.
+改动运行时所有权、等待者生命周期、关停或基准方法之前，先读
+[AGENTS.md](AGENTS.md)。除非任务明确要求 API 变更并写入文档，公开 API 与可观
+察语义应保持稳定。
 
-Before proposing a scheduler mechanism, search the git history: a long list has
-already been implemented, measured against frozen baselines and removed, and the
-commit messages record why.
+提出新的调度器机制之前先搜提交历史：一长串机制已经被实现、对冻结基线测量并
+移除，提交信息记录了各自的否决理由。
 
-Licensed under the [MIT License](LICENSE).
+以 [MIT 许可证](LICENSE)发布。

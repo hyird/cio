@@ -5,6 +5,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/un.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -12,6 +13,7 @@
 #include <atomic>
 #include <cassert>
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <optional>
 #include <vector>
@@ -1315,6 +1317,58 @@ Result<void> TcpConn::set_nodelay(bool on) {
     return ok();
 }
 
+Result<void> TcpConn::set_keepalive(bool on) {
+    const int value = on ? 1 : 0;
+    if (::setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &value, sizeof(value)) != 0) {
+        return Error::from_errno();
+    }
+    return ok();
+}
+
+Result<void> TcpConn::set_keepalive_period(Duration idle) {
+    const auto seconds =
+        std::chrono::duration_cast<std::chrono::seconds>(idle).count();
+    // Go rounds to whole seconds too; the option has no finer resolution.
+    const int value = static_cast<int>(seconds > 0 ? seconds : 1);
+    if (::setsockopt(fd_, IPPROTO_TCP, TCP_KEEPIDLE, &value, sizeof(value)) != 0) {
+        return Error::from_errno();
+    }
+    // Enabling a period without enabling keepalive itself would silently do
+    // nothing, which is not what the call says it does.
+    return set_keepalive(true);
+}
+
+Result<void> TcpConn::set_linger(Duration timeout) {
+    ::linger value{};
+    if (timeout < Duration::zero()) {
+        value.l_onoff = 0;  // system default: flush in the background
+    } else {
+        value.l_onoff = 1;
+        value.l_linger = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::seconds>(timeout).count());
+    }
+    if (::setsockopt(fd_, SOL_SOCKET, SO_LINGER, &value, sizeof(value)) != 0) {
+        return Error::from_errno();
+    }
+    return ok();
+}
+
+Result<void> TcpConn::set_read_buffer(int bytes) {
+    if (bytes <= 0) return Error{EINVAL};
+    if (::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes)) != 0) {
+        return Error::from_errno();
+    }
+    return ok();
+}
+
+Result<void> TcpConn::set_write_buffer(int bytes) {
+    if (bytes <= 0) return Error{EINVAL};
+    if (::setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes)) != 0) {
+        return Error::from_errno();
+    }
+    return ok();
+}
+
 Result<void> TcpConn::close_write() {
     if (::shutdown(fd_, SHUT_WR) != 0) return Error::from_errno();
     return ok();
@@ -1590,6 +1644,315 @@ void UdpConn::clear_read_deadline() {
 
 void UdpConn::clear_write_deadline() {
     apply_deadline(fd_, desc_, false, true, 0);
+}
+
+
+// ------------------------------------------------------------- Unix ---
+
+namespace {
+
+// Fills a sockaddr_un. Returns the length to pass to bind/connect, which for an
+// abstract address is *not* the whole struct: the trailing NULs would become part
+// of the name.
+Result<unsigned> fill_unix_addr(const UnixAddr& addr, sockaddr_un& out) {
+    const std::string path = addr.path();
+    if (path.empty()) return Error{EINVAL};
+
+    out.sun_family = AF_UNIX;
+    if (addr.abstract()) {
+        // Linux abstract namespace: a leading NUL, then the name, with no
+        // terminator.
+        if (path.size() + 1 > sizeof(out.sun_path)) return Error{ENAMETOOLONG};
+        out.sun_path[0] = '\0';
+        std::memcpy(out.sun_path + 1, path.data(), path.size());
+        return static_cast<unsigned>(offsetof(sockaddr_un, sun_path) + 1 +
+                                     path.size());
+    }
+    if (path.size() + 1 > sizeof(out.sun_path)) return Error{ENAMETOOLONG};
+    std::memcpy(out.sun_path, path.data(), path.size() + 1);
+    return static_cast<unsigned>(sizeof(sockaddr_un));
+}
+
+}  // namespace
+
+Result<UnixAddr> UnixAddr::parse(std::string_view path) {
+    if (path.empty()) return Error{EINVAL};
+    UnixAddr addr;
+    if (path.front() == '@') {
+        addr.abstract_ = true;
+        addr.path_ = std::string(path.substr(1));
+        if (addr.path_.empty()) return Error{EINVAL};
+    } else {
+        addr.path_ = std::string(path);
+    }
+    // sun_path is fixed; reject early rather than at bind time.
+    if (addr.path_.size() + 1 > sizeof(sockaddr_un::sun_path)) {
+        return Error{ENAMETOOLONG};
+    }
+    return addr;
+}
+
+std::string UnixAddr::path() const {
+    return abstract_ ? path_ : path_;
+}
+
+Task<Result<UnixConn>> UnixConn::dial(UnixAddr addr) {
+    sockaddr_un raw{};
+    auto length = fill_unix_addr(addr, raw);
+    if (!length) co_return length.error();
+
+    const int fd =
+        ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) co_return Error::from_errno();
+
+    AcceptedFd pending(fd);
+    const int rc = ::connect(pending.get(),
+                             reinterpret_cast<const sockaddr*>(&raw), *length);
+    const int connect_error = rc == 0 ? 0 : errno;
+    if (rc != 0 && connect_error != EINPROGRESS) co_return Error{connect_error};
+
+    UnixConn conn;
+    if (auto adopted = conn.adopt(pending.release(), true); !adopted) {
+        co_return adopted.error();
+    }
+    if (rc == 0) co_return std::move(conn);
+
+    // A Unix connect completes immediately or fails; EINPROGRESS is possible for
+    // a full backlog, and completion is reported as writability just as for TCP.
+    const std::uint32_t generation =
+        conn.desc_->generation.load(std::memory_order_acquire);
+    if (auto ready = co_await detail::IoAwaiter{conn.desc_, detail::Dir::kWrite,
+                                               generation};
+        !ready) {
+        co_return ready.error();
+    }
+    int error = 0;
+    socklen_t error_length = sizeof(error);
+    if (::getsockopt(conn.fd_, SOL_SOCKET, SO_ERROR, &error, &error_length) != 0) {
+        co_return Error::from_errno();
+    }
+    if (error != 0) co_return Error{error};
+    co_return std::move(conn);
+}
+
+Task<Result<UnixConn>> UnixConn::dial(UnixAddr addr, CancelToken cancel) {
+    if (!cancel) co_return co_await UnixConn::dial(addr);
+    if (cancel.cancelled()) co_return Error{Errc::cancelled};
+
+    // Same rule as a cancellable TCP dial: cancellation closes the descriptor
+    // rather than abandoning the attempt.
+    auto out = make_chan<Result<UnixConn>>(1);
+    auto attempt = spawn([](UnixAddr target,
+                            Chan<Result<UnixConn>> channel) -> Task<void> {
+        auto conn = co_await UnixConn::dial(target);
+        co_await channel.send(std::move(conn));
+    }(addr, out));
+
+    auto selected = cio::select(cio::recv(out), cio::recv(cancel.done()));
+    const bool cancelled = (co_await selected) == 1;
+    if (cancelled) {
+        co_await attempt;
+        co_return Error{Errc::cancelled};
+    }
+    co_await attempt;
+    auto received = selected.get<0>();
+    if (!received) co_return Error{Errc::broken};
+    co_return std::move(*received);
+}
+
+Task<Result<std::size_t>> UnixConn::read(std::span<std::byte> buffer) {
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) co_return operation.error;
+    co_return co_await tcp_read_some(operation.desc, operation.generation, buffer);
+}
+
+Task<Result<std::size_t>> UnixConn::write(std::span<const std::byte> buffer) {
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) co_return operation.error;
+    co_return co_await tcp_write_some(operation.desc, operation.generation,
+                                      buffer);
+}
+
+Task<Result<void>> UnixConn::write_all(std::span<const std::byte> buffer) {
+    while (!buffer.empty()) {
+        auto n = co_await write(buffer);
+        if (!n) co_return n.error();
+        buffer = buffer.subspan(*n);
+    }
+    co_return ok();
+}
+
+Result<std::size_t> UnixConn::try_read(std::span<std::byte> buffer) {
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return operation.error;
+
+    detail::FdUseGuard fd_use{operation.desc, detail::Dir::kRead,
+                              operation.generation};
+    if (!fd_use) return fd_use.error();
+
+    const ssize_t n = ::recv(fd_use.fd(), buffer.data(), buffer.size(), 0);
+    const int syscall_error = n < 0 ? errno : 0;
+    if (n >= 0) {
+        if (static_cast<std::size_t>(n) < buffer.size()) {
+            operation.desc->note_would_block(detail::Dir::kRead);
+        }
+        return static_cast<std::size_t>(n);
+    }
+    if (syscall_error == EAGAIN || syscall_error == EWOULDBLOCK) {
+        operation.desc->note_would_block(detail::Dir::kRead);
+    }
+    return Error{syscall_error};
+}
+
+Result<std::size_t> UnixConn::try_write(std::span<const std::byte> buffer) {
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) return operation.error;
+
+    detail::FdUseGuard fd_use{operation.desc, detail::Dir::kWrite,
+                              operation.generation};
+    if (!fd_use) return fd_use.error();
+
+    // MSG_NOSIGNAL for the same reason as TCP: a write to a closed peer must be
+    // an EPIPE return, not a process-wide SIGPIPE.
+    const ssize_t n =
+        ::send(fd_use.fd(), buffer.data(), buffer.size(), MSG_NOSIGNAL);
+    const int syscall_error = n < 0 ? errno : 0;
+    if (n >= 0) {
+        if (static_cast<std::size_t>(n) < buffer.size()) {
+            operation.desc->note_would_block(detail::Dir::kWrite);
+        }
+        return static_cast<std::size_t>(n);
+    }
+    if (syscall_error == EAGAIN || syscall_error == EWOULDBLOCK) {
+        operation.desc->note_would_block(detail::Dir::kWrite);
+    }
+    return Error{syscall_error};
+}
+
+void UnixConn::set_deadline(TimePoint d) {
+    apply_deadline(fd_, desc_, true, true, absolute_ns(d));
+}
+void UnixConn::set_read_deadline(TimePoint d) {
+    apply_deadline(fd_, desc_, true, false, absolute_ns(d));
+}
+void UnixConn::set_write_deadline(TimePoint d) {
+    apply_deadline(fd_, desc_, false, true, absolute_ns(d));
+}
+void UnixConn::set_timeout(Duration t) {
+    apply_deadline(fd_, desc_, true, true, deadline_from_now(t));
+}
+void UnixConn::set_read_timeout(Duration t) {
+    apply_deadline(fd_, desc_, true, false, deadline_from_now(t));
+}
+void UnixConn::set_write_timeout(Duration t) {
+    apply_deadline(fd_, desc_, false, true, deadline_from_now(t));
+}
+void UnixConn::clear_deadline() { apply_deadline(fd_, desc_, true, true, 0); }
+void UnixConn::clear_read_deadline() {
+    apply_deadline(fd_, desc_, true, false, 0);
+}
+void UnixConn::clear_write_deadline() {
+    apply_deadline(fd_, desc_, false, true, 0);
+}
+
+Result<void> UnixConn::close_write() {
+    if (::shutdown(fd_, SHUT_WR) != 0) return Error::from_errno();
+    return ok();
+}
+
+Result<UnixListener> UnixListener::listen(UnixAddr addr, int backlog,
+                                         bool unlink_existing) {
+    sockaddr_un raw{};
+    auto length = fill_unix_addr(addr, raw);
+    if (!length) return length.error();
+
+    // A filesystem socket left behind by a previous run makes bind() fail with
+    // EADDRINUSE even when nothing is listening, which is the single most common
+    // way a Unix-socket service fails to restart.
+    if (unlink_existing && !addr.abstract()) {
+        ::unlink(addr.path().c_str());
+    }
+
+    const int fd =
+        ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) return Error::from_errno();
+
+    AcceptedFd pending(fd);
+    if (::bind(pending.get(), reinterpret_cast<const sockaddr*>(&raw),
+               *length) != 0) {
+        return Error::from_errno();
+    }
+    if (::listen(pending.get(), backlog) != 0) return Error::from_errno();
+
+    UnixListener listener;
+    if (auto adopted = listener.adopt(pending.release(), true); !adopted) {
+        return adopted.error();
+    }
+    listener.bound_ = addr;
+    listener.owns_path_ = !addr.abstract();
+    return listener;
+}
+
+Task<Result<UnixConn>> UnixListener::accept() {
+    for (;;) {
+        const IoOperation operation = capture_operation(fd_, desc_);
+        if (!operation) co_return operation.error;
+
+        int accepted = -1;
+        {
+            detail::FdUseGuard fd_use{operation.desc, detail::Dir::kRead,
+                                      operation.generation};
+            if (!fd_use) co_return fd_use.error();
+            accepted = ::accept4(fd_use.fd(), nullptr, nullptr,
+                                 SOCK_CLOEXEC | SOCK_NONBLOCK);
+        }
+        if (accepted >= 0) {
+            AcceptedFd owned(accepted);
+            UnixConn conn;
+            if (auto adopted = conn.adopt(owned.release(), true); !adopted) {
+                co_return adopted.error();
+            }
+            co_return std::move(conn);
+        }
+        const int error = errno;
+        // ECONNABORTED means a pending connection went away before accept saw
+        // it; that is not this listener failing, so retry rather than report.
+        if (error == EINTR || error == ECONNABORTED) continue;
+        if (error != EAGAIN && error != EWOULDBLOCK) co_return Error{error};
+
+        operation.desc->note_would_block(detail::Dir::kRead);
+        if (auto ready = co_await detail::IoAwaiter{
+                operation.desc, detail::Dir::kRead, operation.generation};
+            !ready) {
+            co_return ready.error();
+        }
+    }
+}
+
+Result<UnixAddr> UnixListener::addr() const {
+    if (!bound_.valid()) return Error{EBADF};
+    return bound_;
+}
+
+void UnixListener::set_deadline(TimePoint d) {
+    apply_deadline(fd_, desc_, true, false, absolute_ns(d));
+}
+
+void UnixListener::clear_deadline() {
+    apply_deadline(fd_, desc_, true, false, 0);
+}
+
+void UnixListener::unlink() {
+    if (!owns_path_ || !bound_.valid()) return;
+    ::unlink(bound_.path().c_str());
+    owns_path_ = false;
+}
+
+void UnixListener::close() {
+    // Remove the path this listener created; bind(2) leaves it behind, and a
+    // stale path is what blocks the next start.
+    unlink();
+    Socket::close();
 }
 
 }  // namespace cio::net

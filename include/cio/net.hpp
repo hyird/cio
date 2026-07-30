@@ -261,6 +261,17 @@ public:
     void clear_write_deadline();
 
     Result<void> set_nodelay(bool on);
+    // Go's SetKeepAlive and SetKeepAlivePeriod. The period sets the idle time
+    // before the first probe; the count and interval are left to the system.
+    Result<void> set_keepalive(bool on);
+    Result<void> set_keepalive_period(Duration idle);
+    // Go's SetLinger. A negative duration restores the default (close returns
+    // immediately and the kernel flushes in the background); zero discards
+    // unsent data and sends RST.
+    Result<void> set_linger(Duration timeout);
+    // Go's SetReadBuffer and SetWriteBuffer.
+    Result<void> set_read_buffer(int bytes);
+    Result<void> set_write_buffer(int bytes);
     Result<void> close_write();
 
 private:
@@ -289,6 +300,126 @@ public:
 
     void set_deadline(TimePoint deadline);
     void clear_deadline();
+};
+
+// A filesystem or abstract Unix socket address.
+//
+// Go models this as UnixAddr with a Name and a Net; here the path is the whole
+// address and the socket type is the class that owns it. An abstract address —
+// Linux's leading NUL, which lives in a namespace rather than the filesystem and
+// disappears with the last reference — is written with a leading '@', matching
+// the convention every Linux tool uses.
+class UnixAddr {
+public:
+    UnixAddr() = default;
+
+    static Result<UnixAddr> parse(std::string_view path);
+
+    std::string path() const;
+    bool abstract() const noexcept { return abstract_; }
+    bool valid() const noexcept { return !path_.empty(); }
+    std::string to_string() const { return path(); }
+
+private:
+    std::string path_;
+    bool abstract_ = false;
+};
+
+// Go's UnixConn: a stream socket over a Unix domain address.
+//
+// The same Conn surface as TcpConn, so a generic helper works over either. There
+// is no address to report for an unnamed peer, so remote_addr() on an accepted
+// connection is usually empty — that is the kernel's behaviour, not an omission.
+class UnixConn : public Socket {
+public:
+    UnixConn() = default;
+
+    static Task<Result<UnixConn>> dial(UnixAddr addr);
+    static Task<Result<UnixConn>> dial(UnixAddr addr, CancelToken cancel);
+
+    Task<Result<std::size_t>> read(std::span<std::byte> buffer);
+    Task<Result<std::size_t>> write(std::span<const std::byte> buffer);
+    Task<Result<void>> write_all(std::span<const std::byte> buffer);
+
+    Result<std::size_t> try_read(std::span<std::byte> buffer);
+    Result<std::size_t> try_write(std::span<const std::byte> buffer);
+    detail::IoAwaiter readable() noexcept {
+        return detail::IoAwaiter{desc_, detail::Dir::kRead};
+    }
+    detail::IoAwaiter writable() noexcept {
+        return detail::IoAwaiter{desc_, detail::Dir::kWrite};
+    }
+
+    void set_deadline(TimePoint deadline);
+    void set_read_deadline(TimePoint deadline);
+    void set_write_deadline(TimePoint deadline);
+    void set_timeout(Duration timeout);
+    void set_read_timeout(Duration timeout);
+    void set_write_timeout(Duration timeout);
+    void clear_deadline();
+    void clear_read_deadline();
+    void clear_write_deadline();
+    TimePoint deadline(bool write_direction) const {
+        return Socket::deadline(write_direction);
+    }
+
+    Result<void> close_write();
+
+private:
+    friend class UnixListener;
+};
+
+// Go's UnixListener.
+class UnixListener : public Socket {
+public:
+    UnixListener() = default;
+
+    // Socket::close() is deliberately non-virtual — a vtable on a socket is not
+    // worth one cold path — so destruction alone would never remove the bound
+    // path. This destructor is what makes the filesystem entry go away when the
+    // listener does, however it is destroyed.
+    ~UnixListener() { unlink(); }
+
+    // The moved-from listener must stop owning the path, or its destructor would
+    // unlink a socket the new owner is still serving.
+    UnixListener(UnixListener&& other) noexcept
+        : Socket(std::move(other)),
+          bound_(std::move(other.bound_)),
+          owns_path_(std::exchange(other.owns_path_, false)) {}
+    UnixListener& operator=(UnixListener&& other) noexcept {
+        if (this != &other) {
+            unlink();
+            Socket::operator=(std::move(other));
+            bound_ = std::move(other.bound_);
+            owns_path_ = std::exchange(other.owns_path_, false);
+        }
+        return *this;
+    }
+    UnixListener(const UnixListener&) = delete;
+    UnixListener& operator=(const UnixListener&) = delete;
+
+    // Binds and listens. A filesystem socket leaves its path behind on close,
+    // exactly as bind(2) does; `unlink_existing` removes a stale path first,
+    // which is what a restarting service almost always wants.
+    static Result<UnixListener> listen(UnixAddr addr, int backlog = 1024,
+                                       bool unlink_existing = true);
+
+    Task<Result<UnixConn>> accept();
+
+    Result<UnixAddr> addr() const;
+
+    void set_deadline(TimePoint deadline);
+    void clear_deadline();
+
+    // Removes the filesystem path this listener bound, if any. Called by close()
+    // when the listener created the path.
+    void unlink();
+
+    void close();
+
+private:
+    UnixAddr bound_;
+    bool owns_path_ = false;
 };
 
 struct DialOptions {
@@ -398,6 +529,7 @@ concept Listener = requires(T& l, TimePoint t) {
 };
 
 static_assert(Conn<TcpConn>);
+static_assert(Conn<UnixConn>);
 static_assert(PacketConn<UdpConn>);
 static_assert(Listener<TcpListener>);
 

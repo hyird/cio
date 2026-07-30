@@ -20,6 +20,7 @@
 #pragma once
 
 #include "cio/blocking.hpp"
+#include "cio/bufio.hpp"
 #include "cio/chan.hpp"
 #include "cio/clock.hpp"
 #include "cio/detail/metrics.hpp"

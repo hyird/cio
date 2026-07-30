@@ -104,10 +104,11 @@ cmake --build build-tsan -j
 ctest --test-dir build-tsan --output-on-failure
 ```
 
-Fourteen test executables cover the public API, scheduler, worker bitmaps,
-directed MPSC inbox, channels, `select`, networking, DNS, files, signals,
-scoped deadlines and descriptor adoption, synchronization, timers and soak
-behaviour. The optional TLS module adds a fifteenth:
+Seventeen test executables cover the public API, scheduler, worker bitmaps,
+directed MPSC inbox, channels, `select`, networking, Unix sockets, DNS, files,
+signals, buffered I/O, timers and pools, scoped deadlines and descriptor
+adoption, synchronization and soak behaviour. The optional TLS module adds an
+eighteenth:
 
 ```sh
 cmake -S . -B build-tls -DCMAKE_BUILD_TYPE=Release -DCIO_TLS=ON
@@ -142,6 +143,8 @@ Long coroutine soaks should not run under ASan or TSan; see
 | `cio::buffer_pool()` / `Pool<T>` | Reusable I/O buffers and objects |
 | `cio::blocking(fn)` | Run blocking work outside scheduler workers |
 | `cio::net::TcpListener` / `TcpConn` / `UdpConn` | Non-blocking sockets with deadlines |
+| `cio::net::UnixListener` / `UnixConn` / `UnixAddr` | Unix domain sockets, filesystem or abstract |
+| `cio::bufio::Reader` / `Writer` | Buffered I/O, lines and framing (`bufio`) |
 | `cio::net::Resolver` / `resolve()` | System name resolution on the blocking pool |
 | `cio::dns::Resolver` | Built-in DNS backend; selected via `prefer_builtin` |
 | `cio::Timeout` | Scoped, nestable deadline that restores the enclosing one |

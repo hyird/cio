@@ -24,10 +24,9 @@ remain part of the compatibility surface.
 - `tests/`: test executables discovered automatically by CMake
 - `examples/`: public API compile and usage examples
 - `bench/`: C++ microbenchmarks and isolated Go/HTTP/echo comparisons
-- `docs/scheduler-v2.md`: implemented scheduler design and its invariants
-- `docs/scheduler-results.md`: benchmark record, rejected variants, hashes
-- `docs/roadmap.md`: open evidence gaps and deferred work
-- `docs/io-infrastructure.md`: future additive design, not implemented API
+
+This file is the only design document. `README.md` introduces the library for
+users; everything a change to the runtime has to respect is here.
 
 Do not commit generated build trees, benchmark executables, sanitizer output,
 Python caches or ad-hoc raw results. The relevant patterns are in `.gitignore`.
@@ -83,6 +82,82 @@ The Go comparison is a separate module:
 cd bench/go-core
 go test ./...
 ```
+
+## Design constraints
+
+These are settled. Reopening one needs new evidence, not a new argument.
+
+- **Linux and epoll only.** No io_uring, kqueue or IOCP backend. Regular-file
+  and system-resolver calls go to the bounded blocking executor instead.
+- **No executor, affinity, shard, completion-token or migration control in a
+  public header.** No processor, shard or thread object appears in the public
+  API; `RuntimeOptions` gains no affinity or queue knob. Internal tuning
+  constants live in `detail` and are selected by benchmarks, not applications.
+- **No Go-style G/M/P processor handoff.** The measured deficit was cache stalls
+  on shared scheduling state, which G/M/P does not remove.
+- **Stackless coroutines.** Not a stackful-fiber runtime; symmetric transfer
+  relies on tail calls.
+- **Public API follows Go.** Go's names and shapes win where Go has an
+  equivalent: `net.Conn`/`PacketConn`/`Listener` as concepts, `io.Reader`/
+  `Writer`/`ReadFull`/`Copy` (destination first), `net.Error` classifiers,
+  `sync.WaitGroup`/`Mutex`, `os.File`, `tls.Config`/`tls.Conn`,
+  `Resolver.PreferGo`. Where Go has no counterpart — `Task`, `Runtime`,
+  `Result` — do not invent a false parallel.
+- **Concepts, not virtual interfaces.** Go can afford runtime interfaces; the
+  socket fast path cannot carry a vtable. Genericity is compile-time.
+- **Deadlines and cancellation live on the connection, not on the call.** That
+  is why `read`, `write` and `accept` take no cancel parameter: cancellation
+  binds to the descriptor and is checked at syscall admission, next to the
+  deadline.
+- **Cancellation closes; it does not merely abandon.** A cancelled operation
+  must close its descriptor and every spawned attempt must be joined before its
+  parent returns. Detaching leaves a task parked on a socket until the kernel
+  gives up, and leaks its frame outright if the runtime shuts down first —
+  shutdown does not unwind tasks parked on channels or sockets.
+- **No DNS cache, DNSSEC or search list** in the built-in resolver, and no
+  userspace protocol beyond stub resolution. It reads `/etc/hosts` and
+  `/etc/resolv.conf` and nothing else; NSS modules are the system backend's job.
+
+## Rejected mechanisms
+
+A long list of scheduler mechanisms has already been implemented, measured
+against frozen baselines and removed. Do not treat an untried-looking idea as
+untried: search the git history for the mechanism before building it, because
+re-deriving one of these costs a benchmark host-day.
+
+The rejected set already covers, at minimum: overload bitmaps and proactive
+donation, soft-affinity completion sharing, several reactor owner-poll and
+deadline protocols, bounded `runnext`, foreign-completion batching and
+prioritization, normal-worker reactor rescue, fixed unconditional-yield
+cooperative budgets, restricting steal-half propagation, a lock-free MPMC ring
+in front of the shared fallback queue, and timer-heap lock removal.
+
+Two standing conclusions follow from it:
+
+- **The rare foreign-monitor dispatch path has had four separate designs
+  rejected.** A fifth needs a diagnosis of why that path is slow, not another
+  policy.
+- **Topology-aware victim selection cannot be validated on a single-socket,
+  single-LLC host**, because a topology-aware thief always takes the same-domain
+  branch there. It needs different hardware before it is worth writing.
+
+## Standing costs
+
+These are properties of the design, not bugs to be fixed opportunistically.
+Disclose them; do not paper over them.
+
+- Detached `go()` is slower than the shared-reactor design this replaced, and
+  tail latency at low and mid connection counts is worse. Throughput at
+  saturation and mixed-load fairness are what was bought with it.
+- The extreme tail — p99.99 and beyond — is worse on rare foreign-monitor
+  dispatch than the common readiness path.
+- **Accept placement is round-robin over connections, not over load.** Weight is
+  a property of the traffic a connection carries later, which is unknowable at
+  accept time, so heavy connections cluster across reactor shards. Descriptor
+  migration between epoll instances is the expensive fix; weight-aware placement
+  at accept time is the cheap one to try first and moves no descriptor.
+- `cio::blocking()` itself has no admission limit; only the built-in file and
+  resolver classes are bounded.
 
 ## Runtime invariants
 
@@ -163,7 +238,8 @@ Performance claims require reproducible evidence:
 - Map each binary to one explicit clean source revision; a byte-reproducible
   hybrid of intermediate source states is still only diagnostic evidence.
 - Record and verify SHA-256 for both server/runtime binaries and the load
-  generator before and after the run.
+  generator before and after the run, and record the compile and link line with
+  any binary hash. A hash with no build command behind it does not reproduce.
 - Pin server and client to disjoint CPU sets.
 - Warm up before the measured window.
 - Pair runs and alternate AB/BA order; do not compare two independent sweeps.
@@ -184,9 +260,31 @@ python3 bench/http-comparison/matrix_wrk.py \
   --pairs 10 --warmup 5 --duration 15
 ```
 
+On the 24-core benchmark host, pin the server to CPUs 0-7, `wrk` to 8-21 and the
+harness itself to 23. `matrix_wrk.py` rejects overlapping CPU sets, an unpinned
+harness, socket/HTTP/server failures, input hash drift, client saturation and an
+incomplete pair; it writes `publication_ready` into its manifest, which validates
+the *measurement*, not the candidate. `mixed_wrk.py` runs a pipelined bulk load
+against a small latency probe in a second, disjointly pinned `wrk`, for the
+fairness tradeoff a single saturated run cannot show. `wrk_tail.lua` adds
+p99.9/p99.99/p99.999/Max; those are diagnostic until they reproduce in both
+orders.
+
+Acceptance for scheduler work is a joint gate, not a throughput headline:
+low-load throughput stays neutral, saturated throughput and p50-p99 do not
+materially regress, and the deep percentiles are checked separately. A rare-tail
+movement that reverses between AB and BA order is noise. "No improvement" is a
+valid result — the change is removed and the previous implementation stands.
+
 Echo A/B may use the cio load generator only when the exact same frozen client
 binary runs on both sides in a separately pinned process. Never rebuild the
-client between sides.
+client between sides. The echo server records which reactor shard `accept()`
+placed each connection on and prints the table on SIGINT, which is what makes a
+skew result placement evidence rather than a hypothesis.
+
+Raw run directories under `bench/*/results/` are local and untracked. Nothing in
+this repository may depend on reading them: state every number a claim relies on
+in the text.
 
 For time-based microbenchmarks, a positive B/A ns/op delta means B is slower.
 For throughput benchmarks, a positive B/A requests/second delta means B is
@@ -204,14 +302,12 @@ faster. State the direction explicitly.
   `tests/test_api_surface.cpp` when changing header-visible code.
 - Add regression tests for the exact race or lifetime failure being fixed, not
   only a broad stress test.
-- Update the relevant document when something changes, and keep the split:
-  invariants go in `docs/scheduler-v2.md`, measurements and rejected variants in
-  `docs/scheduler-results.md`, deferred work and open questions in
-  `docs/roadmap.md`, and released behaviour in `CHANGELOG.md`. Do not reintroduce
-  a benchmark log into a design document.
-- A rejected variant is recorded, not deleted. Add a row to the rejected-designs
-  table with its baseline, headline delta, rejection reason, candidate hash and
-  local run directory.
+- Update this file when an invariant or constraint changes, and `README.md` when
+  user-visible behaviour does. Keep measurement narrative out of both: record the
+  conclusion and the reason, not the run log.
+- When a mechanism is measured and removed, say so in the commit message with
+  the reason it failed. The commit history is the record; a future proposal is
+  expected to search it before rebuilding something already rejected.
 - Preserve unrelated work in a dirty tree. Do not reset, overwrite or delete
   user changes.
 - Do not commit or push unless the user explicitly requests it.

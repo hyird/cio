@@ -212,9 +212,8 @@ lifecycle pins and syscall leases make stale epoll events safe while close,
 deadline and cancellation race. Delayed cross-runtime completions use stable
 process-lifetime endpoint identities with counted foreign leases.
 
-The detailed invariants live in [the runtime v2 design](docs/scheduler-v2.md);
-the frozen gates and every rejected alternative are in
-[the benchmark record](docs/scheduler-results.md).
+The load-bearing invariants, and the record of designs already measured and
+rejected, are in [AGENTS.md](AGENTS.md).
 
 ## Repository layout
 
@@ -226,9 +225,7 @@ the frozen gates and every rejected alternative are in
 | `tests/` | Unit, concurrency, API-surface and soak tests |
 | `examples/` | Small buildable programs |
 | `bench/` | Core, I/O, echo, Go and HTTP/`wrk` benchmarks |
-| `docs/` | Design, benchmark record and roadmap; start at [docs/README.md](docs/README.md) |
 | `include/cio/tls.hpp` | Optional TLS module; built only with `-DCIO_TLS=ON` |
-| `CHANGELOG.md` | Released versions and their known limitations |
 | `AGENTS.md` | Repository-specific development and verification rules |
 
 Build directories, sanitizer artifacts, benchmark binaries, Python caches and
@@ -293,23 +290,55 @@ not paired with the table above; do not read the two together as one sweep.
 Absolute numbers are host-specific and are useful mainly as a shape: throughput
 saturates near 64 connections, and tail latency is the axis that moves.
 
-What this scheduler costs, stated rather than omitted: detached `go()` is about
-6.5% slower than the shared-reactor design it replaced, p99 at 8 and 256
-connections is several times higher than that design's, and 1024-connection
-throughput parity for the final work-aware build was not demonstrated. See
-[the benchmark record](docs/scheduler-results.md) for baselines, intervals,
-CPU data and artifact hashes, and [the roadmap](docs/roadmap.md) for what is
-still open.
+What this scheduler costs, stated rather than omitted: detached `go()` is
+measurably slower than the shared-reactor design it replaced, and tail latency at
+low and mid connection counts is worse. Saturated throughput and mixed-load
+fairness are what was bought with it. The standing costs are listed in
+[AGENTS.md](AGENTS.md#standing-costs).
 
-Comparisons against Boost.Asio and Go, with their methodology and caveats:
-
-- [HTTP comparison driven by wrk](bench/http-comparison/README.md)
-- [Echo comparison](bench/echo-comparison/README.md)
-- [Go core benchmark](bench/go-core/README.md)
+Comparisons against Boost.Asio and Go live under `bench/`: `http-comparison`
+drives all three runtimes with the same third-party `wrk`, `echo-comparison`
+adds a skew sweep, and `go-core` is the Go counterpart of `bench_core` in its
+own module. The rules any of them has to follow are in
+[AGENTS.md](AGENTS.md#benchmark-rules).
 
 Optional runtime counters are enabled with `-DCIO_METRICS=ON`.
 `cio::runtime_metrics()` is always linkable and returns zero-valued counters
 when instrumentation is disabled.
+
+## Migrating from 0.0.1
+
+The public API was renamed to match Go's, so a reader who knows `net`, `os` and
+`crypto/tls` can predict cio's spelling. Every 0.0.1 program needs these edits:
+
+| 0.0.1 | now | Go |
+|---|---|---|
+| `net::TcpStream` | `net::TcpConn` | `net.TCPConn` |
+| `net::UdpSocket` | `net::UdpConn` | `net.UDPConn` |
+| `TcpListener::bind()` | `TcpListener::listen()` | `net.ListenTCP` |
+| `UdpSocket::bind()` | `UdpConn::listen()` | `net.ListenUDP` |
+| `TcpStream::connect()` | `TcpConn::dial()` | `net.DialTCP` |
+| `peer_addr()` | `remote_addr()` | `Conn.RemoteAddr` |
+| `recv_from()` / `send_to()` | `read_from()` / `write_to()` | `PacketConn.ReadFrom` / `WriteTo` |
+| `shutdown_write()` | `close_write()` | `TCPConn.CloseWrite` |
+| `fs::FileInfo::is_directory()` | `is_dir()` | `FileInfo.IsDir` |
+| `cio::AsyncReader` / `AsyncWriter` | `cio::io::Reader` / `Writer` | `io.Reader` / `io.Writer` |
+| `cio::read_exact()` | `cio::io::read_full()` | `io.ReadFull` |
+| `cio::write_all()` / `copy()` | `cio::io::write_all()` / `copy()` | `io` package |
+| `tls::ClientConfig` + `ServerConfig` | one `tls::Config` | `tls.Config` |
+| `tls::TlsStream` | `tls::Conn` | `tls.Conn` |
+
+Two changes are not renames and will compile silently:
+
+- **`copy()` takes its destination first**, as `io.Copy(dst, src)` does. The old
+  order was `(src, dst)`. A call where both sides are the same type still
+  compiles either way.
+- **Name resolution now defaults to the built-in DNS resolver** rather than
+  `getaddrinfo()`, matching Go's default on Unix. Set
+  `LookupOptions::prefer_builtin` or `DialOptions::prefer_builtin_resolver` to
+  false on a machine that resolves through NSS modules the built-in resolver
+  cannot see — LDAP, NIS, mDNS — or wherever answers must agree with
+  `getent hosts`.
 
 ## Known limits
 
@@ -334,11 +363,9 @@ Runtime:
 
 Performance, measured rather than asserted:
 
-- 64-connection tail latency regressed against the previous release: p99 up
-  26-57% and Max up 14-31%, reproducing in both AB and BA order. It is the price
-  of the 1024-connection gains.
-- The p99.99 and beyond are worse on rare foreign-monitor dispatch. Four designs
-  aimed at that path were measured and all four rejected.
+- Tail latency at 64 connections is worse than the previous release's; it is the
+  price of the 1024-connection gains.
+- The p99.99 and beyond are worse on rare foreign-monitor dispatch.
 - Accepted connections are distributed round-robin, but weight is a property of
   the traffic a connection later carries, so heavy connections cluster by chance
   and skewed workloads land unevenly across reactor shards.
@@ -379,8 +406,8 @@ TLS (optional):
 - TLS 1.2 is the floor. No ALPN, no session resumption and no client
   certificates.
 
-Open items that are not inherent — including work blocked on hardware or on
-evidence — are tracked in [the roadmap](docs/roadmap.md).
+Design constraints, the rejected-design record and the remaining open items are
+in [AGENTS.md](AGENTS.md).
 
 ## Development
 
@@ -388,7 +415,6 @@ Read [AGENTS.md](AGENTS.md) before changing runtime ownership, waiter lifetime,
 shutdown or benchmark methodology. Public API and observable semantics should
 remain stable unless an API change is explicitly requested and documented.
 
-[docs/README.md](docs/README.md) indexes the design, the benchmark record and
-the roadmap. Before proposing a scheduler mechanism, check the
-[rejected designs](docs/scheduler-results.md#rejected-designs): more than
-twenty implemented variants have already been measured and removed.
+Before proposing a scheduler mechanism, read
+[Rejected mechanisms](AGENTS.md#rejected-mechanisms) in AGENTS.md and search the
+git history: a long list has already been implemented, measured and removed.

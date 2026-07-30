@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 #include "cio/cio.hpp"
@@ -425,6 +426,48 @@ cio::Task<cio::Result<std::size_t>> echo_once(C& conn) {
     co_return co_await conn.write(std::span<const std::byte>{buffer, *n});
 }
 
+// io.Copy takes the destination first. With distinct reader and writer types a
+// swap will not compile, which is what this pins: the concepts are what make
+// the argument order enforceable rather than merely documented.
+struct OnlyReads {
+    std::string data = "payload";
+    std::size_t at = 0;
+    cio::Task<cio::Result<std::size_t>> read(std::span<std::byte> buffer) {
+        const std::size_t n = std::min(buffer.size(), data.size() - at);
+        for (std::size_t i = 0; i < n; ++i) {
+            buffer[i] = static_cast<std::byte>(data[at + i]);
+        }
+        at += n;
+        co_return n;
+    }
+};
+
+struct OnlyWrites {
+    std::string seen;
+    cio::Task<cio::Result<std::size_t>> write(std::span<const std::byte> buffer) {
+        for (std::byte b : buffer) seen += static_cast<char>(b);
+        co_return buffer.size();
+    }
+};
+
+static_assert(cio::io::Reader<OnlyReads>);
+static_assert(!cio::io::Writer<OnlyReads>);
+static_assert(cio::io::Writer<OnlyWrites>);
+static_assert(!cio::io::Reader<OnlyWrites>);
+
+void test_copy_takes_destination_first() {
+    auto body = []() -> cio::Task<bool> {
+        OnlyReads src;
+        OnlyWrites dst;
+        auto copied = co_await cio::io::copy(dst, src);
+        CIO_CHECK(copied.has_value());
+        CIO_CHECK_EQ(*copied, std::uint64_t{7});
+        CIO_CHECK_EQ(dst.seen, std::string("payload"));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 void test_generic_over_conn_concept() {
     auto body = []() -> cio::Task<bool> {
         auto pair = co_await make_pair();
@@ -456,6 +499,7 @@ void test_generic_over_conn_concept() {
 int main() {
     RUN_TEST(test_address_helpers);
     RUN_TEST(test_error_classifiers);
+    RUN_TEST(test_copy_takes_destination_first);
     RUN_TEST(test_generic_over_conn_concept);
     RUN_TEST(test_cancel_refuses_new_operations);
     RUN_TEST(test_cancel_wakes_a_parked_operation);

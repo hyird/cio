@@ -25,6 +25,11 @@ knows `net`, `os` and `crypto/tls` can predict cio's spelling.
 | `TcpStream::shutdown_write()` | `TcpConn::close_write()` | `TCPConn.CloseWrite` |
 | `fs::FileInfo::is_directory()` | `is_dir()` | `FileInfo.IsDir` |
 | `tls::ClientConfig` + `ServerConfig` | one `tls::Config` | `tls.Config` |
+| `tls::TlsStream` | `tls::Conn` | `tls.Conn` |
+| `cio::AsyncReader` / `AsyncWriter` | `cio::io::Reader` / `Writer` | `io.Reader` / `io.Writer` |
+| `cio::read_exact` | `cio::io::read_full` | `io.ReadFull` |
+| `cio::write_all` / `copy` | `cio::io::write_all` / `copy` | `io` package |
+| `copy(src, dst)` | `copy(dst, src)` | `io.Copy(dst, src)` |
 
 Name resolution now defaults to the built-in DNS resolver rather than
 `getaddrinfo()`, matching Go's default on Unix and for the reason Go documents:
@@ -49,6 +54,7 @@ or mDNS — or wherever answers must agree with `getent hosts`.
   literals and rejection of the ambiguous unbracketed form.
 - `SocketAddr::ip()` and `TcpListener::addr()`, mirroring `TCPAddr.IP` and
   `Listener.Addr`.
+- `CancelToken::err()`, mirroring Go's `ctx.Err()`.
 - `cio::net::Resolver` with `LookupOptions`, `AddressFamily`, `lookup_host()`
   and `lookup_addr()`. `resolve()` is retained and delegates to a default
   `Resolver`.

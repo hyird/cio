@@ -3,12 +3,12 @@
 //     auto tcp = co_await cio::net::TcpConn::dial("example.com", 443);
 //     auto stream = cio::tls::client(std::move(*tcp), {.server_name = "example.com"});
 //     co_await stream.handshake();
-//     co_await cio::write_all(stream, request);
+//     co_await cio::io::write_all(stream, request);
 //
 // This is an optional target: enabling it links OpenSSL, which is why it is not
 // part of the core library. Build with -DCIO_TLS=ON and link cio::tls.
 //
-// TlsStream satisfies the AsyncReader/AsyncWriter concepts, so read_exact(),
+// Conn satisfies the io::Reader/io::Writer concepts, so io::read_full(),
 // write_all() and copy() work on it unchanged. OpenSSL's WANT_READ/WANT_WRITE
 // are translated into waits on the underlying TcpConn; the record layer means
 // one application-level read may drive several socket reads and vice versa.
@@ -51,15 +51,15 @@ struct Config {
     std::string private_key_file;
 };
 
-class TlsStream {
+class Conn {
 public:
-    TlsStream() = default;
-    ~TlsStream();
+    Conn() = default;
+    ~Conn();
 
-    TlsStream(TlsStream&&) noexcept;
-    TlsStream& operator=(TlsStream&&) noexcept;
-    TlsStream(const TlsStream&) = delete;
-    TlsStream& operator=(const TlsStream&) = delete;
+    Conn(Conn&&) noexcept;
+    Conn& operator=(Conn&&) noexcept;
+    Conn(const Conn&) = delete;
+    Conn& operator=(const Conn&) = delete;
 
     bool valid() const noexcept { return state_ != nullptr; }
 
@@ -73,7 +73,7 @@ public:
     Task<Result<void>> shutdown();
 
     // The full net.Conn surface, delegated to the underlying socket, so a
-    // TlsStream satisfies net::Conn exactly as Go's tls.Conn implements
+    // Conn satisfies net::Conn exactly as Go's tls.Conn implements
     // net.Conn and a generic helper works over plaintext and TLS unchanged.
     Result<net::SocketAddr> local_addr() const;
     Result<net::SocketAddr> remote_addr() const;
@@ -94,17 +94,17 @@ public:
     struct State;
 
 private:
-    friend TlsStream client(net::TcpConn stream, Config config);
-    friend TlsStream server(net::TcpConn stream, Config config);
+    friend Conn client(net::TcpConn stream, Config config);
+    friend Conn server(net::TcpConn stream, Config config);
 
     std::unique_ptr<State> state_;
 };
 
 // Wrap an already-connected stream. Errors in the configuration surface from
 // handshake(), not here, so both factories stay non-throwing and non-suspending.
-TlsStream client(net::TcpConn stream, Config config = {});
-TlsStream server(net::TcpConn stream, Config config);
+Conn client(net::TcpConn stream, Config config = {});
+Conn server(net::TcpConn stream, Config config);
 
-static_assert(net::Conn<TlsStream>);
+static_assert(net::Conn<Conn>);
 
 }  // namespace cio::tls

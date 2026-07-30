@@ -438,15 +438,15 @@ cio::Task<int> exercise_concurrency_surface() {
     static_assert(std::is_same_v<decltype(deadline.is_timeout()), bool>);
 
     // Generic stream algorithms apply to the concrete socket types.
-    static_assert(cio::AsyncReader<cio::net::TcpConn>);
-    static_assert(cio::AsyncWriter<cio::net::TcpConn>);
-    const auto exact = co_await cio::read_exact(stream, input);
+    static_assert(cio::io::Reader<cio::net::TcpConn>);
+    static_assert(cio::io::Writer<cio::net::TcpConn>);
+    const auto exact = co_await cio::io::read_full(stream, input);
     (void)exact;
-    const auto all_written = co_await cio::write_all(stream, output);
+    const auto all_written = co_await cio::io::write_all(stream, output);
     (void)all_written;
-    const auto copied = co_await cio::copy(stream, stream);
+    const auto copied = co_await cio::io::copy(stream, stream);
     (void)copied;
-    const auto copied_scratch = co_await cio::copy(stream, stream, input);
+    const auto copied_scratch = co_await cio::io::copy(stream, stream, input);
     (void)copied_scratch;
 
     // Resolver and dialer: the object forms plus the free-function shorthands.

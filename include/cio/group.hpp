@@ -108,9 +108,15 @@ public:
     }
 
     // A channel that is closed when cancellation is requested. Put it in a
-    // select to make any blocking operation cancellable.
+    // select to make any blocking operation cancellable. Go's ctx.Done().
     Chan<Unit> done() const {
         return state_ != nullptr ? state_->done : Chan<Unit>{};
+    }
+
+    // Why the token fired, or a success Error while it has not. Go's ctx.Err().
+    // A token with no source never fires, so it reports success.
+    Error err() const noexcept {
+        return cancelled() ? Error{Errc::cancelled} : Error{};
     }
 
     explicit operator bool() const noexcept { return state_ != nullptr; }

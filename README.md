@@ -124,18 +124,20 @@ Long coroutine soaks should not run under ASan or TSan; see
 | `cio::net::Dialer` / `dial_tcp()` | Resolution plus raced address selection and timeouts |
 | `cio::fs::File` / `open()` / `stat()` | Regular-file I/O on the blocking pool |
 | `cio::signal::SignalSet` | `signalfd`-backed signal delivery |
-| `cio::tls::TlsStream` | Optional TLS (`-DCIO_TLS=ON`, links OpenSSL) |
-| `cio::read_exact` / `write_all` / `copy` | Generic algorithms over `AsyncReader`/`AsyncWriter` |
+| `cio::tls::Conn` | Optional TLS (`-DCIO_TLS=ON`, links OpenSSL) |
+| `cio::io::read_full` / `write_all` / `copy` | `io.ReadFull` / `io.Copy` over `io::Reader`/`io::Writer` |
 | `net::Conn` / `PacketConn` / `Listener` | Go's three net interfaces, as concepts |
+| `cio::io::Reader` / `Writer` | `io.Reader` / `io.Writer`, as concepts |
 | `net::split_host_port` / `join_host_port` | `net.SplitHostPort` / `net.JoinHostPort` |
 | `cio::Runtime` / `cio::run(task)` / `CIO_MAIN` | Runtime ownership and entry points |
 
 `net::Conn`, `net::PacketConn` and `net::Listener` are Go's three net
 interfaces expressed as concepts rather than virtual bases: a protocol library
 can be written once against "anything that behaves like a connection" while the
-concrete socket keeps a non-virtual fast path. `tls::TlsStream` satisfies
-`Conn`, as Go's `tls.Conn` implements `net.Conn`, so a generic helper works over
-plaintext and TLS unchanged. `Error` carries `is_timeout()`, `is_cancelled()`,
+concrete socket keeps a non-virtual fast path. `tls::Conn` satisfies
+`net::Conn`, as Go's `tls.Conn` implements `net.Conn`, so a generic helper works
+over plaintext and TLS unchanged. `cio::io::copy` takes its destination first,
+as `io.Copy(dst, src)` does. `Error` carries `is_timeout()`, `is_cancelled()`,
 `is_temporary()`, `is_closed()` and `is_not_found()`, mirroring `net.Error`, so
 callers classify rather than compare codes.
 

@@ -1,13 +1,13 @@
-// Generic stream algorithms.
+// Generic stream algorithms, shaped like Go's io package.
 //
-//     co_await cio::read_exact(stream, header);
-//     co_await cio::copy(client, upstream);
+//     co_await cio::io::read_full(stream, header);
+//     co_await cio::io::copy(upstream, client);   // (dst, src), as io.Copy is
 //
-// These are constrained free functions, not members of a virtual Conn base
-// class: a protocol library can accept any type that reads and writes bytes —
-// a TcpConn, a TLS stream, a test double — without either side inheriting
-// from a common runtime-polymorphic type, and without the concrete socket fast
-// path paying for a vtable.
+// The concepts are Go's io.Reader and io.Writer. They are constraints rather
+// than virtual interfaces: a protocol library can accept any type that reads
+// and writes bytes — a TcpConn, a TLS connection, a test double — without
+// either side inheriting from a runtime-polymorphic base, and without the
+// concrete socket fast path paying for a vtable.
 //
 // The concepts describe operations that already exist. They deliberately do not
 // introduce an executor association, allocator association or callback
@@ -24,30 +24,30 @@
 #include "cio/result.hpp"
 #include "cio/task.hpp"
 
-namespace cio {
+namespace cio::io {
 
-// A type that can read some bytes into a caller-owned span. A short read is
-// normal; zero means end of stream.
+// io.Reader: reads some bytes into a caller-owned span. A short read is normal;
+// zero means end of stream.
 template <typename T>
-concept AsyncReader = requires(T& reader, std::span<std::byte> buffer) {
+concept Reader = requires(T& reader, std::span<std::byte> buffer) {
     { reader.read(buffer) } -> std::same_as<Task<Result<std::size_t>>>;
 };
 
-// A type that can write some bytes from a caller-owned span. A short write is
+// io.Writer: writes some bytes from a caller-owned span. A short write is
 // normal.
 template <typename T>
-concept AsyncWriter = requires(T& writer, std::span<const std::byte> buffer) {
+concept Writer = requires(T& writer, std::span<const std::byte> buffer) {
     { writer.write(buffer) } -> std::same_as<Task<Result<std::size_t>>>;
 };
 
-// Fills `buffer` completely.
+// io.ReadFull: fills `buffer` completely.
 //
 // End of stream before the buffer is full is Errc::closed, not a short result:
 // a caller asking for exactly n bytes cannot do anything useful with n-1, and
 // silently returning fewer is how framing bugs start. A partially filled buffer
 // on error holds whatever arrived; its contents are unspecified.
-template <AsyncReader Reader>
-Task<Result<void>> read_exact(Reader& reader, std::span<std::byte> buffer) {
+template <Reader R>
+Task<Result<void>> read_full(R& reader, std::span<std::byte> buffer) {
     while (!buffer.empty()) {
         auto n = co_await reader.read(buffer);
         if (!n) co_return n.error();
@@ -58,8 +58,11 @@ Task<Result<void>> read_exact(Reader& reader, std::span<std::byte> buffer) {
 }
 
 // Writes every byte, looping over short writes.
-template <AsyncWriter Writer>
-Task<Result<void>> write_all(Writer& writer, std::span<const std::byte> buffer) {
+//
+// Go has no io.WriteAll — its callers loop, or use io.Copy — but a socket write
+// that stops short is common enough to be worth naming.
+template <Writer W>
+Task<Result<void>> write_all(W& writer, std::span<const std::byte> buffer) {
     while (!buffer.empty()) {
         auto n = co_await writer.write(buffer);
         if (!n) co_return n.error();
@@ -70,23 +73,27 @@ Task<Result<void>> write_all(Writer& writer, std::span<const std::byte> buffer) 
     co_return ok();
 }
 
-// Copies until `from` reports end of stream, returning the byte count.
+// io.Copy: copies from `src` into `dst` until end of stream, returning the byte
+// count.
+//
+// Destination first, as io.Copy(dst, src) is. The order is worth stating
+// explicitly because it is the opposite of how it reads in English, and getting
+// it backwards still compiles whenever both sides are the same type.
 //
 // `scratch` is caller-owned so a proxy can size it for its workload and reuse
 // it across connections. On error the count copied so far is lost with the
 // error; callers that need it should loop themselves.
-template <AsyncReader Reader, AsyncWriter Writer>
-Task<Result<std::uint64_t>> copy(Reader& from, Writer& to,
-                                 std::span<std::byte> scratch) {
+template <Writer W, Reader R>
+Task<Result<std::uint64_t>> copy(W& dst, R& src, std::span<std::byte> scratch) {
     if (scratch.empty()) co_return Error{EINVAL};
 
     std::uint64_t total = 0;
     for (;;) {
-        auto n = co_await from.read(scratch);
+        auto n = co_await src.read(scratch);
         if (!n) co_return n.error();
         if (*n == 0) co_return total;
 
-        if (auto written = co_await write_all(to, scratch.first(*n)); !written) {
+        if (auto written = co_await write_all(dst, scratch.first(*n)); !written) {
             co_return written.error();
         }
         total += *n;
@@ -96,12 +103,12 @@ Task<Result<std::uint64_t>> copy(Reader& from, Writer& to,
 // Same, with an internally owned 64 KiB buffer. The buffer is heap-allocated
 // rather than held in the coroutine frame, which keeps this usable from deep
 // task chains where frame size matters.
-template <AsyncReader Reader, AsyncWriter Writer>
-Task<Result<std::uint64_t>> copy(Reader& from, Writer& to) {
+template <Writer W, Reader R>
+Task<Result<std::uint64_t>> copy(W& dst, R& src) {
     std::vector<std::byte> scratch(64 * 1024);
     // Qualified: an unqualified call would also find std::copy by ADL, because
     // the argument types come from namespace std.
-    co_return co_await cio::copy(from, to, std::span<std::byte>{scratch});
+    co_return co_await cio::io::copy(dst, src, std::span<std::byte>{scratch});
 }
 
-}  // namespace cio
+}  // namespace cio::io

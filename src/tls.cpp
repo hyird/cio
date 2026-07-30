@@ -45,7 +45,7 @@ void discard_openssl_errors() {
 // descriptor itself. Ciphertext moves between the network BIO and the socket
 // here, which is what lets every wait go through the runtime's reactor instead
 // of a blocking socket callback.
-struct TlsStream::State {
+struct Conn::State {
     net::TcpConn socket;
     SSL_CTX* context = nullptr;
     SSL* ssl = nullptr;
@@ -68,7 +68,7 @@ struct TlsStream::State {
 
 namespace {
 
-Result<void> configure(TlsStream::State& state) {
+Result<void> configure(Conn::State& state) {
     if (state.configured) return ok();
     ensure_initialized();
 
@@ -146,7 +146,7 @@ Result<void> configure(TlsStream::State& state) {
 }
 
 // Pushes any ciphertext OpenSSL has produced out to the socket.
-Task<Result<void>> flush_network(TlsStream::State& state) {
+Task<Result<void>> flush_network(Conn::State& state) {
     for (;;) {
         // BIO_pending is a macro, so it cannot be qualified.
         const int pending = BIO_pending(state.network);
@@ -158,7 +158,7 @@ Task<Result<void>> flush_network(TlsStream::State& state) {
                                     static_cast<int>(want));
         if (read <= 0) co_return take_openssl_error();
 
-        auto written = co_await cio::write_all(
+        auto written = co_await cio::io::write_all(
             state.socket,
             std::span<const std::byte>{state.transfer.data(),
                                        static_cast<std::size_t>(read)});
@@ -168,7 +168,7 @@ Task<Result<void>> flush_network(TlsStream::State& state) {
 
 // Pulls one batch of ciphertext from the socket into OpenSSL. Reports
 // Errc::closed at EOF so a truncated stream is not mistaken for success.
-Task<Result<void>> fill_network(TlsStream::State& state) {
+Task<Result<void>> fill_network(Conn::State& state) {
     auto n = co_await state.socket.read(state.transfer);
     if (!n) co_return n.error();
     if (*n == 0) co_return Error{Errc::closed};
@@ -187,7 +187,7 @@ Task<Result<void>> fill_network(TlsStream::State& state) {
 // Runs one OpenSSL operation to completion, servicing its I/O demands.
 // `attempt` returns the raw OpenSSL return code.
 template <typename Attempt>
-Task<Result<int>> pump(TlsStream::State& state, Attempt attempt) {
+Task<Result<int>> pump(Conn::State& state, Attempt attempt) {
     for (;;) {
         discard_openssl_errors();
         const int rc = attempt();
@@ -223,29 +223,29 @@ Task<Result<int>> pump(TlsStream::State& state, Attempt attempt) {
 
 }  // namespace
 
-TlsStream::~TlsStream() = default;
-TlsStream::TlsStream(TlsStream&&) noexcept = default;
-TlsStream& TlsStream::operator=(TlsStream&&) noexcept = default;
+Conn::~Conn() = default;
+Conn::Conn(Conn&&) noexcept = default;
+Conn& Conn::operator=(Conn&&) noexcept = default;
 
-TlsStream client(net::TcpConn stream, Config config) {
-    TlsStream tls;
-    tls.state_ = std::make_unique<TlsStream::State>();
+Conn client(net::TcpConn stream, Config config) {
+    Conn tls;
+    tls.state_ = std::make_unique<Conn::State>();
     tls.state_->socket = std::move(stream);
     tls.state_->config = std::move(config);
     tls.state_->is_client = true;
     return tls;
 }
 
-TlsStream server(net::TcpConn stream, Config config) {
-    TlsStream tls;
-    tls.state_ = std::make_unique<TlsStream::State>();
+Conn server(net::TcpConn stream, Config config) {
+    Conn tls;
+    tls.state_ = std::make_unique<Conn::State>();
     tls.state_->socket = std::move(stream);
     tls.state_->config = std::move(config);
     tls.state_->is_client = false;
     return tls;
 }
 
-Task<Result<void>> TlsStream::handshake() {
+Task<Result<void>> Conn::handshake() {
     if (state_ == nullptr) co_return Error{EBADF};
     if (state_->handshake_done) co_return ok();
     if (auto configured = configure(*state_); !configured) {
@@ -261,7 +261,7 @@ Task<Result<void>> TlsStream::handshake() {
     co_return ok();
 }
 
-Task<Result<std::size_t>> TlsStream::read(std::span<std::byte> buffer) {
+Task<Result<std::size_t>> Conn::read(std::span<std::byte> buffer) {
     if (state_ == nullptr) co_return Error{EBADF};
     if (buffer.empty()) co_return std::size_t{0};
     if (!state_->handshake_done) {
@@ -282,7 +282,7 @@ Task<Result<std::size_t>> TlsStream::read(std::span<std::byte> buffer) {
     co_return static_cast<std::size_t>(*rc);
 }
 
-Task<Result<std::size_t>> TlsStream::write(std::span<const std::byte> buffer) {
+Task<Result<std::size_t>> Conn::write(std::span<const std::byte> buffer) {
     if (state_ == nullptr) co_return Error{EBADF};
     if (buffer.empty()) co_return std::size_t{0};
     if (!state_->handshake_done) {
@@ -299,7 +299,7 @@ Task<Result<std::size_t>> TlsStream::write(std::span<const std::byte> buffer) {
     co_return static_cast<std::size_t>(*rc);
 }
 
-Task<Result<void>> TlsStream::shutdown() {
+Task<Result<void>> Conn::shutdown() {
     if (state_ == nullptr) co_return ok();
     State& state = *state_;
     if (state.shutdown_sent || !state.handshake_done) {
@@ -318,53 +318,53 @@ Task<Result<void>> TlsStream::shutdown() {
     co_return ok();
 }
 
-Result<net::SocketAddr> TlsStream::local_addr() const {
+Result<net::SocketAddr> Conn::local_addr() const {
     if (state_ == nullptr) return Error{EBADF};
     return state_->socket.local_addr();
 }
 
-Result<net::SocketAddr> TlsStream::remote_addr() const {
+Result<net::SocketAddr> Conn::remote_addr() const {
     if (state_ == nullptr) return Error{EBADF};
     return state_->socket.remote_addr();
 }
 
-void TlsStream::set_deadline(TimePoint deadline) {
+void Conn::set_deadline(TimePoint deadline) {
     if (state_ != nullptr) state_->socket.set_deadline(deadline);
 }
 
-void TlsStream::set_read_deadline(TimePoint deadline) {
+void Conn::set_read_deadline(TimePoint deadline) {
     if (state_ != nullptr) state_->socket.set_read_deadline(deadline);
 }
 
-void TlsStream::set_write_deadline(TimePoint deadline) {
+void Conn::set_write_deadline(TimePoint deadline) {
     if (state_ != nullptr) state_->socket.set_write_deadline(deadline);
 }
 
-void TlsStream::clear_deadline() {
+void Conn::clear_deadline() {
     if (state_ != nullptr) state_->socket.clear_deadline();
 }
 
-void TlsStream::clear_read_deadline() {
+void Conn::clear_read_deadline() {
     if (state_ != nullptr) state_->socket.clear_read_deadline();
 }
 
-void TlsStream::clear_write_deadline() {
+void Conn::clear_write_deadline() {
     if (state_ != nullptr) state_->socket.clear_write_deadline();
 }
 
-void TlsStream::set_cancel(CancelToken token) {
+void Conn::set_cancel(CancelToken token) {
     if (state_ != nullptr) state_->socket.set_cancel(std::move(token));
 }
 
-void TlsStream::clear_cancel() {
+void Conn::clear_cancel() {
     if (state_ != nullptr) state_->socket.clear_cancel();
 }
 
-void TlsStream::close() {
+void Conn::close() {
     if (state_ != nullptr) state_->socket.close();
 }
 
-std::string TlsStream::protocol_version() const {
+std::string Conn::protocol_version() const {
     if (state_ == nullptr || state_->ssl == nullptr) return {};
     const char* name = ::SSL_get_version(state_->ssl);
     return name != nullptr ? std::string(name) : std::string{};

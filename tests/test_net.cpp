@@ -2522,10 +2522,10 @@ struct MemoryStream {
     }
 };
 
-static_assert(cio::AsyncReader<MemoryStream>);
-static_assert(cio::AsyncWriter<MemoryStream>);
-static_assert(cio::AsyncReader<net::TcpConn>);
-static_assert(cio::AsyncWriter<net::TcpConn>);
+static_assert(cio::io::Reader<MemoryStream>);
+static_assert(cio::io::Writer<MemoryStream>);
+static_assert(cio::io::Reader<net::TcpConn>);
+static_assert(cio::io::Writer<net::TcpConn>);
 
 void test_stream_algorithms_over_short_io() {
     auto body = []() -> cio::Task<bool> {
@@ -2536,16 +2536,17 @@ void test_stream_algorithms_over_short_io() {
             reinterpret_cast<const std::byte*>(payload.data()),
             reinterpret_cast<const std::byte*>(payload.data()) + payload.size());
 
-        // read_exact must reassemble across one-byte reads.
+        // read_full must reassemble across one-byte reads.
         std::vector<std::byte> exact(9);
-        auto filled = co_await cio::read_exact(source, std::span<std::byte>{exact});
+        auto filled = co_await cio::io::read_full(source, std::span<std::byte>{exact});
         CIO_CHECK(filled.has_value());
         CIO_CHECK_EQ(std::string(reinterpret_cast<const char*>(exact.data()), 9),
                      std::string("the quick"));
 
-        // copy drains the rest through two-byte writes.
+        // copy drains the rest through two-byte writes. Destination first,
+        // as io.Copy(dst, src) is.
         MemoryStream sink;
-        auto copied = co_await cio::copy(source, sink);
+        auto copied = co_await cio::io::copy(sink, source);
         CIO_CHECK(copied.has_value());
         CIO_CHECK_EQ(*copied, static_cast<std::uint64_t>(payload.size() - 9));
         CIO_CHECK_EQ(
@@ -2557,7 +2558,7 @@ void test_stream_algorithms_over_short_io() {
         // success.
         std::vector<std::byte> too_much(4);
         auto truncated =
-            co_await cio::read_exact(source, std::span<std::byte>{too_much});
+            co_await cio::io::read_full(source, std::span<std::byte>{too_much});
         CIO_CHECK(!truncated.has_value());
         CIO_CHECK(truncated.error().is(cio::Errc::closed));
         co_return true;
@@ -2577,7 +2578,7 @@ void test_stream_algorithms_over_tcp() {
             if (!conn) co_return std::string{};
             std::vector<std::byte> buffer(11);
             auto filled =
-                co_await cio::read_exact(*conn, std::span<std::byte>{buffer});
+                co_await cio::io::read_full(*conn, std::span<std::byte>{buffer});
             if (!filled) co_return std::string{};
             co_return std::string(reinterpret_cast<const char*>(buffer.data()),
                                   buffer.size());
@@ -2585,7 +2586,7 @@ void test_stream_algorithms_over_tcp() {
 
         auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
-        auto sent = co_await cio::write_all(*client, bytes_of("hello world"));
+        auto sent = co_await cio::io::write_all(*client, bytes_of("hello world"));
         CIO_CHECK(sent.has_value());
 
         const auto received = co_await server;

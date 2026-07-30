@@ -2,12 +2,12 @@
 //
 //     {
 //         cio::Timeout overall(stream, 5s);   // whole exchange
-//         co_await cio::write_all(stream, request);
+//         co_await cio::io::write_all(stream, request);
 //         {
 //             cio::Timeout first_byte(stream, 200ms);   // tighter, nested
 //             co_await stream.read(header);
 //         }                                   // restores the 5s deadline
-//         co_await cio::read_exact(stream, body);
+//         co_await cio::io::read_full(stream, body);
 //     }
 //
 //     auto fd = cio::PollableFd::adopt(::inotify_init1(IN_NONBLOCK));

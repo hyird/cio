@@ -132,13 +132,13 @@ void test_handshake_and_round_trip() {
                 }
 
                 std::vector<std::byte> buffer(5);
-                if (auto filled = co_await cio::read_exact(
+                if (auto filled = co_await cio::io::read_full(
                         stream, std::span<std::byte>{buffer});
                     !filled) {
                     co_return std::string{"server read failed"};
                 }
                 if (auto written =
-                        co_await cio::write_all(stream, bytes_of("world"));
+                        co_await cio::io::write_all(stream, bytes_of("world"));
                     !written) {
                     co_return std::string{"server write failed"};
                 }
@@ -159,11 +159,11 @@ void test_handshake_and_round_trip() {
         CIO_CHECK(shaken.has_value());
         CIO_CHECK(!stream.protocol_version().empty());
 
-        auto sent = co_await cio::write_all(stream, bytes_of("hello"));
+        auto sent = co_await cio::io::write_all(stream, bytes_of("hello"));
         CIO_CHECK(sent.has_value());
 
         std::vector<std::byte> reply(5);
-        auto filled = co_await cio::read_exact(stream, std::span<std::byte>{reply});
+        auto filled = co_await cio::io::read_full(stream, std::span<std::byte>{reply});
         CIO_CHECK(filled.has_value());
         CIO_CHECK_EQ(string_of(reply), std::string("world"));
 
@@ -251,7 +251,7 @@ void test_large_transfer_spans_records() {
 
                 const std::string payload(kSize, 'z');
                 const auto written =
-                    co_await cio::write_all(stream, bytes_of(payload));
+                    co_await cio::io::write_all(stream, bytes_of(payload));
                 (void)co_await stream.shutdown();
                 co_return written.has_value();
             }(std::move(*listener), certificate.cert.get(),
@@ -268,7 +268,7 @@ void test_large_transfer_spans_records() {
 
         std::vector<std::byte> received(kSize);
         auto filled =
-            co_await cio::read_exact(stream, std::span<std::byte>{received});
+            co_await cio::io::read_full(stream, std::span<std::byte>{received});
         CIO_CHECK(filled.has_value());
         CIO_CHECK_EQ(static_cast<char>(received.front()), 'z');
         CIO_CHECK_EQ(static_cast<char>(received.back()), 'z');

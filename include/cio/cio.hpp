@@ -23,6 +23,7 @@
 #include "cio/bufio.hpp"
 #include "cio/chan.hpp"
 #include "cio/clock.hpp"
+#include "cio/context.hpp"
 #include "cio/detail/metrics.hpp"
 #include "cio/dns.hpp"
 #include "cio/fs.hpp"

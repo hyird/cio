@@ -22,10 +22,12 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 #include <utility>
 
 #include "cio/chan.hpp"
+#include "cio/clock.hpp"
 #include "cio/spawn.hpp"
 #include "cio/sync.hpp"
 #include "cio/task.hpp"
@@ -51,6 +53,14 @@ struct CancelHook {
 struct CancelState {
     std::atomic<bool> cancelled{false};
     Chan<Unit> done = make_chan<Unit>(0);
+
+    // When this state was given a deadline, the instant it fires. Zero means
+    // none. Stored here so a token can report it without a second handle.
+    std::atomic<std::int64_t> deadline_ns{0};
+    // Type-erased slot for whatever a derived construction needs to keep alive —
+    // a timer, a link to a parent. Held here rather than in the source so a
+    // moved or copied token cannot outlive it.
+    std::shared_ptr<void> keepalive;
 
     std::mutex hooks_mutex;
     std::vector<std::shared_ptr<CancelHook>> hooks;
@@ -115,8 +125,27 @@ public:
 
     // Why the token fired, or a success Error while it has not. Go's ctx.Err().
     // A token with no source never fires, so it reports success.
+    //
+    // A deadline that has elapsed reports Errc::timed_out rather than
+    // Errc::cancelled, matching context.DeadlineExceeded: the two are different
+    // outcomes and a caller decides differently on each.
     Error err() const noexcept {
-        return cancelled() ? Error{Errc::cancelled} : Error{};
+        if (!cancelled()) return Error{};
+        const std::int64_t at =
+            state_ != nullptr
+                ? state_->deadline_ns.load(std::memory_order_acquire)
+                : 0;
+        if (at != 0 && now_ns() >= at) return Error{Errc::timed_out};
+        return Error{Errc::cancelled};
+    }
+
+    // The deadline this token carries, if any. Go's ctx.Deadline().
+    std::optional<TimePoint> deadline() const noexcept {
+        if (state_ == nullptr) return std::nullopt;
+        const std::int64_t at =
+            state_->deadline_ns.load(std::memory_order_acquire);
+        if (at == 0) return std::nullopt;
+        return TimePoint{std::chrono::nanoseconds{at}};
     }
 
     explicit operator bool() const noexcept { return state_ != nullptr; }
@@ -145,6 +174,12 @@ public:
     CancelSource() : state_(std::make_shared<detail::CancelState>()) {}
 
     CancelToken token() const noexcept { return CancelToken{state_}; }
+
+    // Exposed so the context helpers can attach a deadline and a parent link
+    // without making CancelState public.
+    const std::shared_ptr<detail::CancelState>& state() const noexcept {
+        return state_;
+    }
     void cancel() const { state_->cancel(); }
     bool cancelled() const noexcept {
         return state_->cancelled.load(std::memory_order_acquire);

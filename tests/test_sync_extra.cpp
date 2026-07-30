@@ -261,9 +261,176 @@ void test_cond_notify_one() {
     CIO_CHECK(cio::run(body()));
 }
 
+
+// ------------------------------------------------- cancellation scopes ---
+
+// Cancelling a parent must reach every descendant, which is the whole point of
+// nesting: a request deadline has to arrive at sub-operations without being
+// threaded through by hand.
+void test_cancel_propagates_down_the_chain() {
+    auto body = []() -> cio::Task<bool> {
+        cio::CancelSource root;
+        auto middle = cio::with_cancel(root.token());
+        auto leaf = cio::with_cancel(middle.token());
+
+        CIO_CHECK(!middle.cancelled());
+        CIO_CHECK(!leaf.cancelled());
+
+        root.cancel();
+        // The done channel is what a parked operation selects on, so wait on it
+        // rather than polling.
+        (void)co_await leaf.token().done().recv();
+        CIO_CHECK(middle.cancelled());
+        CIO_CHECK(leaf.cancelled());
+        CIO_CHECK(leaf.token().err().is(cio::Errc::cancelled));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// A child cancel must not travel upward.
+void test_cancel_does_not_propagate_up() {
+    auto body = []() -> cio::Task<bool> {
+        cio::CancelSource root;
+        auto child = cio::with_cancel(root.token());
+        child.cancel();
+        CIO_CHECK(child.cancelled());
+        CIO_CHECK(!root.cancelled());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// Attaching to an already-cancelled parent must fire immediately: no callback is
+// coming, so waiting for one would hang.
+void test_child_of_cancelled_parent_starts_cancelled() {
+    auto body = []() -> cio::Task<bool> {
+        cio::CancelSource root;
+        root.cancel();
+        auto child = cio::with_cancel(root.token());
+        CIO_CHECK(child.cancelled());
+        auto grandchild = cio::with_timeout(child.token(), 10s);
+        CIO_CHECK(grandchild.cancelled());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+void test_timeout_scope_fires_and_reports_deadline() {
+    auto body = []() -> cio::Task<bool> {
+        auto scope = cio::with_timeout(30ms);
+        const auto deadline = scope.token().deadline();
+        CIO_CHECK(deadline.has_value());
+
+        const auto started = cio::Clock::now();
+        (void)co_await scope.token().done().recv();
+        const auto elapsed = cio::Clock::now() - started;
+        CIO_CHECK(elapsed >= 25ms);
+        CIO_CHECK(scope.cancelled());
+
+        // An elapsed deadline reports timed_out, not cancelled: they are
+        // different outcomes and a caller decides differently on each.
+        CIO_CHECK(scope.token().err().is(cio::Errc::timed_out));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// A child must not be able to grant itself more time than its parent has.
+void test_child_deadline_is_clamped_to_the_parent() {
+    auto body = []() -> cio::Task<bool> {
+        auto parent = cio::with_timeout(40ms);
+        auto child = cio::with_timeout(parent.token(), 10s);
+
+        const auto parent_deadline = parent.token().deadline();
+        const auto child_deadline = child.token().deadline();
+        CIO_CHECK(parent_deadline.has_value());
+        CIO_CHECK(child_deadline.has_value());
+        // Clamped, not honoured as asked.
+        CIO_CHECK(*child_deadline <= *parent_deadline);
+
+        const auto started = cio::Clock::now();
+        (void)co_await child.token().done().recv();
+        CIO_CHECK(cio::Clock::now() - started < 5s);
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// An explicit cancel before the deadline still reports cancellation.
+void test_explicit_cancel_beats_the_deadline() {
+    auto body = []() -> cio::Task<bool> {
+        auto scope = cio::with_timeout(10s);
+        scope.cancel();
+        CIO_CHECK(scope.cancelled());
+        CIO_CHECK(scope.token().err().is(cio::Errc::cancelled));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// A scope must integrate with the operations that take a token, which is what it
+// exists for.
+void test_scope_cancels_a_socket_operation() {
+    auto body = []() -> cio::Task<bool> {
+        auto listener =
+            cio::net::TcpListener::listen(cio::net::SocketAddr::loopback_v4(0));
+        CIO_CHECK(listener.has_value());
+        const auto addr = listener->addr().value();
+
+        auto accepted = cio::spawn([](cio::net::TcpListener l)
+                                       -> cio::Task<cio::net::TcpConn> {
+            auto conn = co_await l.accept();
+            co_return conn ? std::move(*conn) : cio::net::TcpConn{};
+        }(std::move(*listener)));
+
+        auto client = co_await cio::net::TcpConn::dial(addr);
+        CIO_CHECK(client.has_value());
+        auto server = co_await accepted;
+
+        // A 30ms request budget, applied to the socket.
+        auto request = cio::with_timeout(30ms);
+        client->set_cancel(request.token());
+
+        std::byte buffer[8];
+        auto read = co_await client->read(buffer);
+        CIO_CHECK(!read.has_value());
+        CIO_CHECK(read.error().is_cancelled());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// Many finished children must not accumulate hooks on a long-lived parent.
+void test_finished_children_deregister() {
+    auto body = []() -> cio::Task<bool> {
+        cio::CancelSource root;
+        for (int i = 0; i < 500; ++i) {
+            auto child = cio::with_cancel(root.token());
+            CIO_CHECK(!child.cancelled());
+        }
+        // The parent still works; if the hooks had leaked this would be the
+        // point where ASan or the run time showed it.
+        auto last = cio::with_cancel(root.token());
+        root.cancel();
+        (void)co_await last.token().done().recv();
+        CIO_CHECK(last.cancelled());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 }  // namespace
 
 int main() {
+    RUN_TEST(test_cancel_propagates_down_the_chain);
+    RUN_TEST(test_cancel_does_not_propagate_up);
+    RUN_TEST(test_child_of_cancelled_parent_starts_cancelled);
+    RUN_TEST(test_timeout_scope_fires_and_reports_deadline);
+    RUN_TEST(test_child_deadline_is_clamped_to_the_parent);
+    RUN_TEST(test_explicit_cancel_beats_the_deadline);
+    RUN_TEST(test_scope_cancels_a_socket_operation);
+    RUN_TEST(test_finished_children_deregister);
     RUN_TEST(test_readers_share_writers_exclude);
     RUN_TEST(test_writer_is_not_starved);
     RUN_TEST(test_try_lock_variants);

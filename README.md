@@ -137,6 +137,7 @@ Long coroutine soaks should not run under ASan or TSan; see
 | `cio::select(...)` | Receive, send, timeout and default cases |
 | `cio::TaskGroup` | Structured child-task scope |
 | `CancelSource` / `CancelToken` | Cooperative cancellation |
+| `cio::with_cancel` / `with_timeout` / `with_deadline` | Nesting, expiring scopes (`context`) |
 | `WaitGroup` / `Mutex` / `RWMutex` / `Once` / `Cond` | Task-suspending synchronization (`sync`) |
 | `cio::sleep(duration)` | Runtime timer |
 | `cio::Timer` / `Ticker` / `after_func` | `time.Timer` / `time.Ticker` / `time.AfterFunc` |
@@ -180,6 +181,15 @@ Socket deadlines are per-direction and persist until reset; the unsuffixed
 directions at once. `cio::Timeout` applies one for a scope and restores the
 enclosing deadline afterwards, so timeouts nest without manual save/restore;
 an inner scope can only tighten an outer one, never extend it.
+
+`with_cancel`, `with_timeout` and `with_deadline` nest scopes the way
+`context.WithCancel` and `context.WithTimeout` do: cancelling a parent reaches
+every descendant, and a child deadline is clamped to its parent's so a
+sub-operation cannot grant itself more time than the request has. An elapsed
+deadline reports `Errc::timed_out` and an explicit cancel reports
+`Errc::cancelled`, because a caller decides differently on each. There are no
+context values — a map keyed by opaque types is dependency injection, not
+cancellation.
 
 Cancellation binds to a socket rather than to a call: `set_cancel(token)` makes
 every operation in either direction fail with `Errc::cancelled` once the token

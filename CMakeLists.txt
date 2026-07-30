@@ -57,6 +57,7 @@ set(CIO_SOURCES
   src/runtime.cpp
   src/net.cpp
   src/pool.cpp
+  src/context.cpp
   src/process.cpp
   src/metrics.cpp
 )

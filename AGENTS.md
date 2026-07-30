@@ -118,6 +118,9 @@ These are settled. Reopening one needs new evidence, not a new argument.
   parent returns. Detaching leaves a task parked on a socket until the kernel
   gives up, and leaks its frame outright if the runtime shuts down first —
   shutdown does not unwind tasks parked on channels or sockets.
+- **No context values.** Cancellation scopes carry a done signal, an error and a
+  deadline. A map keyed by opaque types is a dependency-injection mechanism, not
+  a cancellation one.
 - **No DNS cache, DNSSEC or search list** in the built-in resolver, and no
   userspace protocol beyond stub resolution. It reads `/etc/hosts` and
   `/etc/resolv.conf` and nothing else; NSS modules are the system backend's job.

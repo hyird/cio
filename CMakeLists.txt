@@ -47,6 +47,7 @@ endif()
 set(CIO_SOURCES
   src/scheduler.cpp
   src/timer.cpp
+  src/timer_handle.cpp
   src/reactor_common.cpp
   src/reactor_epoll.cpp
   src/blocking_pool.cpp
@@ -55,6 +56,7 @@ set(CIO_SOURCES
   src/signal.cpp
   src/runtime.cpp
   src/net.cpp
+  src/pool.cpp
   src/metrics.cpp
 )
 

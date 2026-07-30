@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "cio/pool.hpp"
 #include "cio/result.hpp"
 #include "cio/task.hpp"
 
@@ -100,15 +101,18 @@ Task<Result<std::uint64_t>> copy(W& dst, R& src, std::span<std::byte> scratch) {
     }
 }
 
-// Same, with an internally owned 64 KiB buffer. The buffer is heap-allocated
-// rather than held in the coroutine frame, which keeps this usable from deep
-// task chains where frame size matters.
+// Same, borrowing a 64 KiB buffer from the runtime pool.
+//
+// Pooled rather than a local vector: this overload exists to be convenient, and
+// a convenient function that heap-allocates 64 KiB per call is a trap. The
+// buffer is out of the coroutine frame either way, which keeps this usable from
+// deep task chains where frame size matters.
 template <Writer W, Reader R>
 Task<Result<std::uint64_t>> copy(W& dst, R& src) {
-    std::vector<std::byte> scratch(64 * 1024);
+    auto scratch = buffer_pool().take(64 * 1024);
     // Qualified: an unqualified call would also find std::copy by ADL, because
     // the argument types come from namespace std.
-    co_return co_await cio::io::copy(dst, src, std::span<std::byte>{scratch});
+    co_return co_await cio::io::copy(dst, src, scratch.bytes());
 }
 
 }  // namespace cio::io

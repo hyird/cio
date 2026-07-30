@@ -138,6 +138,8 @@ Long coroutine soaks should not run under ASan or TSan; see
 | `CancelSource` / `CancelToken` | Cooperative cancellation |
 | `WaitGroup` / `Mutex` | Task-suspending synchronization |
 | `cio::sleep(duration)` | Runtime timer |
+| `cio::Timer` / `Ticker` / `after_func` | `time.Timer` / `time.Ticker` / `time.AfterFunc` |
+| `cio::buffer_pool()` / `Pool<T>` | Reusable I/O buffers and objects |
 | `cio::blocking(fn)` | Run blocking work outside scheduler workers |
 | `cio::net::TcpListener` / `TcpConn` / `UdpConn` | Non-blocking sockets with deadlines |
 | `cio::net::Resolver` / `resolve()` | System name resolution on the blocking pool |

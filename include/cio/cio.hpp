@@ -29,6 +29,7 @@
 #include "cio/io.hpp"
 #include "cio/main.hpp"
 #include "cio/net.hpp"
+#include "cio/pool.hpp"
 #include "cio/result.hpp"
 #include "cio/runtime.hpp"
 #include "cio/scoped.hpp"
@@ -39,3 +40,4 @@
 #include "cio/task.hpp"
 #include "cio/version.hpp"
 #include "cio/time.hpp"
+#include "cio/timer.hpp"

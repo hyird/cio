@@ -67,6 +67,12 @@ target_link_libraries(app PRIVATE cio::cio)
 # 以 -DCIO_TLS=ON 构建时再加 cio::cio_tls
 ```
 
+不用 CMake 的项目可经 pkg-config 发现（TLS 模块是 CMake 专属）：
+
+```sh
+pkg-config --cflags --libs cio
+```
+
 `add_subdirectory()` 同样可用，且不会继承本项目的测试、示例和安装规则。
 `cio/version.hpp` 提供 `CIO_VERSION_MAJOR`、`CIO_VERSION_MINOR`、
 `CIO_VERSION_PATCH` 以及可比较的 `CIO_VERSION`：

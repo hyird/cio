@@ -22,7 +22,8 @@ socket 与阻塞线程池。实现使用 worker 本地调度与 reactor 所有�
 - `tests/`：由 CMake 自动发现的测试可执行文件
 - `examples/`：公开 API 的编译与用法示例
 - `bench/`：C++ 微基准与相互隔离的 Go/HTTP/echo 对比
-- `cmake/`：`find_package(cio)` 消费的包配置模板
+- `cmake/`：`find_package(cio)` 的包配置模板与 pkg-config 的 `cio.pc` 模板
+- `fuzz/`：消费不可信字节的解析器的 libFuzzer harness 与语料
 - `.github/workflows/ci.yml`：下述验证门，每次推送都会运行
 
 本文件是唯一的设计文档。`README.md` 面向用户介绍这个库；改动运行时必须遵守
@@ -55,9 +56,10 @@ cmake --build build-tsan -j
 ctest --test-dir build-tsan --output-on-failure
 ```
 
-CI 在 GCC 与 Clang 上运行 Release 加两套 sanitizer、一次非 sanitizer 浸泡、
-一次安装并 `find_package` 的往返、一个 `add_subdirectory` 消费方以及空白检
-查。本地验证与改动的规模成比例：
+CI 在 GCC 与 Clang 上运行 Release 加两套 sanitizer、shared 与 metrics 两个构
+建变体、一个 arm64 构建、解析器的短时 fuzz、一次非 sanitizer 浸泡、安装并
+`find_package` 的往返、一个 `add_subdirectory` 消费方以及空白检查。GitHub
+Actions 按提交 SHA 钉定，由 dependabot 推进。本地验证与改动的规模成比例：
 
 - 文档或脚本：语法/帮助/冒烟检查，加 `git diff --check`。
 - 公开头文件：Release 构建、完整 CTest 与 `test_api_surface`。
@@ -248,7 +250,8 @@ echo A/B 只有在完全相同的冻结客户端二进制在独立钉核的进�
   会在 configure 阶段报错。两处一起升。
 - `.clang-format` 是风格本身，不是建议。新增或移动的代码应与它的输出一致。
 - 为被修复的确切竞争或生命周期故障添加回归测试，而不是只加一个宽泛的压力测
-  试。
+  试。解析不可信字节的新代码要在 `fuzz/` 加一个 harness；fuzz 发现的崩溃样本
+  放进 `fuzz/corpus/`，从此永久回归。
 - 不变量或约束变化时更新本文件，用户可见行为变化时更新 `README.md`。两者都
   不写测量叙事：记录结论与理由，不记录运行日志。
 - 一个机制被测量并移除时，在提交信息里写明它失败的原因。提交历史就是记录；

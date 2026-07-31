@@ -20,6 +20,10 @@ endif()
 option(CIO_BUILD_TESTS "Build cio tests" ${CIO_IS_TOP_LEVEL})
 option(CIO_BUILD_EXAMPLES "Build cio examples" ${CIO_IS_TOP_LEVEL})
 option(CIO_BUILD_BENCHMARKS "Build cio benchmarks" ${CIO_IS_TOP_LEVEL})
+# libFuzzer harnesses over the untrusted-input parsers. Clang only, and only
+# meaningful with a sanitizer; off by default because it changes how everything
+# links.
+option(CIO_FUZZ "Build fuzz targets (Clang + a sanitizer)" OFF)
 option(CIO_METRICS "Count scheduler/reactor events (see detail/metrics.hpp)" OFF)
 # Not option(): that declares a BOOL, so the "none" default lands in the cache as
 # OFF, no UI can offer the real choices, and a misspelled value silently
@@ -165,6 +169,21 @@ if(CIO_BUILD_TESTS)
   endforeach()
 endif()
 
+if(CIO_FUZZ)
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    message(FATAL_ERROR "CIO_FUZZ requires Clang (-fsanitize=fuzzer).")
+  endif()
+  file(GLOB CIO_FUZZ_FILES ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/fuzz_*.cpp)
+  foreach(fuzz_file ${CIO_FUZZ_FILES})
+    get_filename_component(fuzz_name ${fuzz_file} NAME_WE)
+    add_executable(${fuzz_name} ${fuzz_file})
+    target_link_libraries(${fuzz_name} PRIVATE cio)
+    # The harness links libFuzzer; the sanitizer itself comes from CIO_SANITIZE.
+    target_compile_options(${fuzz_name} PRIVATE -fsanitize=fuzzer-no-link)
+    target_link_options(${fuzz_name} PRIVATE -fsanitize=fuzzer)
+  endforeach()
+endif()
+
 if(CIO_BUILD_EXAMPLES)
   file(GLOB CIO_EXAMPLE_FILES RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/examples ${CMAKE_CURRENT_SOURCE_DIR}/examples/*.cpp)
   foreach(example_file ${CIO_EXAMPLE_FILES})
@@ -235,4 +254,12 @@ if(CIO_IS_TOP_LEVEL)
 
   install(FILES LICENSE
     DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/licenses/cio)
+
+  # A pkg-config file, so a Meson or bare-make consumer can find cio without
+  # CMake. The TLS module is CMake-only: it is optional and links OpenSSL, and
+  # a .pc that named it would fail for the common consumer who did not build it.
+  configure_file(cmake/cio.pc.in
+    "${CMAKE_CURRENT_BINARY_DIR}/cio.pc" @ONLY)
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/cio.pc"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 endif()

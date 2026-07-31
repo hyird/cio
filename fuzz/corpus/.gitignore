@@ -1,0 +1,3 @@
+# Keep the hand-written seeds; ignore anything libFuzzer derives from them,
+# which is named by content hash and regenerated on every run.
+*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*

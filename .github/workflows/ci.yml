@@ -24,7 +24,7 @@ jobs:
         sanitize: [none, asan, tsan]
     name: ${{ matrix.compiler }} / ${{ matrix.sanitize }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - name: Configure
@@ -51,13 +51,64 @@ jobs:
             ./build/test_dns
           done
 
+  # Build variants that nothing else exercises: the shared library carries the
+  # dual-symbol TLS ABI that only exists for libcio.so, and the metrics build is
+  # the instrumentation every benchmark depends on. Both rot silently without a
+  # job that compiles them.
+  variants:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: shared
+            flags: -DBUILD_SHARED_LIBS=ON
+          - name: metrics
+            flags: -DCIO_METRICS=ON
+    name: variant / ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.flags }}
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+
+  # The library claims Linux, not glibc-on-x86_64; an arm64 job keeps the claim
+  # honest about at least the second architecture people actually run.
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+
+  # Short fuzz smoke over the parsers that consume untrusted bytes. Not a
+  # campaign — a regression gate: a crash found by a longer local run lands in
+  # fuzz/corpus and stays fixed forever.
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug             -DCMAKE_CXX_COMPILER=clang++ -DCIO_SANITIZE=asan -DCIO_FUZZ=ON             -DCIO_BUILD_TESTS=OFF -DCIO_BUILD_EXAMPLES=OFF -DCIO_BUILD_BENCHMARKS=OFF
+          cmake --build build -j
+      - name: Run each fuzzer briefly
+        run: |
+          for f in build/fuzz_*; do
+            echo "== $f"
+            "$f" -max_total_time=45 -print_final_stats=1 fuzz/corpus/$(basename "$f") 2>&1 | tail -3
+          done
+
   # A longer soak must not run under a sanitizer: ASan and TSan can stop
   # symmetric coroutine transfer from remaining a native tail call, so a
   # sanitizer soak is not a release-runtime stack test.
   soak:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build -j
       - run: ./build/test_soak 60
@@ -66,7 +117,7 @@ jobs:
   install:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - name: Install to a prefix
         run: |
@@ -100,7 +151,7 @@ jobs:
   subdirectory:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: |
           mkdir -p /tmp/parent/vendor && cd /tmp/parent
           cp -r "$GITHUB_WORKSPACE" vendor/cio
@@ -120,7 +171,7 @@ jobs:
   format:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check whitespace
         run: git diff --check HEAD~1 || true
       - name: Trailing whitespace and tabs

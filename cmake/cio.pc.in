@@ -1,0 +1,16 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+
+Name: cio
+Description: Goroutine-style concurrency for C++20 stackless coroutines
+Version: @PROJECT_VERSION@
+URL: https://github.com/hyird/cio
+# -foptimize-sibling-calls is load-bearing under GCC, not an optimization
+# preference: symmetric coroutine transfer is only constant-stack when the
+# compiler tail-calls, which GCC does only with this flag. Clang emits a
+# musttail and ignores it. Emitting it unconditionally is safe — clang accepts
+# it — and a pkg-config consumer has no way to branch on the compiler anyway.
+Cflags: -I${includedir} -std=c++20 -foptimize-sibling-calls
+Libs: -L${libdir} -lcio
+Libs.private: -pthread

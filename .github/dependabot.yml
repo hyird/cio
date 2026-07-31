@@ -1,0 +1,7 @@
+# Keeps the pinned action SHAs moving forward on purpose instead of by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

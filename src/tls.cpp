@@ -117,13 +117,39 @@ std::shared_ptr<SessionCache> new_lru_client_session_cache(
     return std::make_shared<SessionCache>(capacity);
 }
 
+// Everything a Config compiles to once, then shares with every connection made
+// from it: the OpenSSL contexts and the ALPN wire list. Held by shared_ptr, so
+// it outlives any one connection and the callbacks may point at it.
+struct SharedContext {
+    SSL_CTX* context = nullptr;
+
+    // One SSL_CTX per server certificate, for SNI. The servername callback
+    // switches the live SSL onto the one whose certificate matches the client's
+    // name. Entry 0 is `context`, the default.
+    std::vector<SSL_CTX*> sni_contexts;
+
+    // ALPN wire form: each protocol as a length-prefixed byte string, which is
+    // both what a client advertises and what a server's callback compares
+    // against.
+    std::vector<unsigned char> alpn_wire;
+
+    ~SharedContext() {
+        for (SSL_CTX* ctx : sni_contexts) {
+            if (ctx != context) ::SSL_CTX_free(ctx);
+        }
+        if (context != nullptr) ::SSL_CTX_free(context);
+    }
+};
+
 // The BIO pair keeps OpenSSL entirely in memory: it never touches the
 // descriptor itself. Ciphertext moves between the network BIO and the socket
 // here, which is what lets every wait go through the runtime's reactor instead
 // of a blocking socket callback.
 struct Conn::State {
+    // Declared first so it is destroyed last: the contexts must outlive the SSL
+    // built from them.
+    std::shared_ptr<SharedContext> shared;
     net::TcpConn socket;
-    SSL_CTX* context = nullptr;
     SSL* ssl = nullptr;
     BIO* network = nullptr;  // owned by us; the internal BIO is owned by SSL
     Config config;
@@ -133,25 +159,11 @@ struct Conn::State {
     bool shutdown_sent = false;
     std::vector<std::byte> transfer;
 
-    // ALPN wire form: each protocol as a length-prefixed byte string, which is
-    // both what a client advertises and what a server's callback compares
-    // against. Built once from config.next_protos.
-    std::vector<unsigned char> alpn_wire;
-
-    // One SSL_CTX per additional server certificate for SNI. The servername
-    // callback switches the live SSL onto the one whose certificate matches the
-    // client's name. context above is the default (certificates[0]).
-    std::vector<SSL_CTX*> sni_contexts;
-
     State() : transfer(16 * 1024) {}
 
     ~State() {
         if (ssl != nullptr) ::SSL_free(ssl);
         if (network != nullptr) ::BIO_free(network);
-        for (SSL_CTX* ctx : sni_contexts) {
-            if (ctx != context) ::SSL_CTX_free(ctx);
-        }
-        if (context != nullptr) ::SSL_CTX_free(context);
     }
 };
 
@@ -175,10 +187,10 @@ Result<std::vector<unsigned char>> build_alpn_wire(
 // offered. OpenSSL does the intersection given both wire lists.
 int alpn_select_cb(SSL*, const unsigned char** out, unsigned char* outlen,
                    const unsigned char* in, unsigned int inlen, void* arg) {
-    auto* state = static_cast<Conn::State*>(arg);
+    auto* shared = static_cast<SharedContext*>(arg);
     if (::SSL_select_next_proto(const_cast<unsigned char**>(out), outlen,
-                                state->alpn_wire.data(),
-                                static_cast<unsigned int>(state->alpn_wire.size()),
+                                shared->alpn_wire.data(),
+                                static_cast<unsigned int>(shared->alpn_wire.size()),
                                 in, inlen) != OPENSSL_NPN_NEGOTIATED) {
         // No overlap. Declining lets the handshake continue on HTTP/1.1 rather
         // than failing it, which is what a browser expects.
@@ -190,12 +202,12 @@ int alpn_select_cb(SSL*, const unsigned char** out, unsigned char* outlen,
 // Server SNI callback: switch to the certificate whose subjectAltNames match
 // the name the client sent. No match keeps the default context.
 int servername_cb(SSL* ssl, int*, void* arg) {
-    auto* state = static_cast<Conn::State*>(arg);
+    auto* shared = static_cast<SharedContext*>(arg);
     const char* name = ::SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-    if (name == nullptr || state->sni_contexts.empty()) {
+    if (name == nullptr || shared->sni_contexts.empty()) {
         return SSL_TLSEXT_ERR_OK;
     }
-    for (SSL_CTX* ctx : state->sni_contexts) {
+    for (SSL_CTX* ctx : shared->sni_contexts) {
         X509* cert = ::SSL_CTX_get0_certificate(ctx);
         // X509_check_host does the wildcard and SAN matching, so cio does not
         // parse the certificate itself.
@@ -289,7 +301,7 @@ int verify_callback_allow_any(int /*preverify*/, X509_STORE_CTX*) { return 1; }
 // Loads a cert+key pair into a fresh SSL_CTX sharing the base's protocol and
 // ALPN settings.
 Result<SSL_CTX*> make_cert_context(const Certificate& cert,
-                                   Conn::State& state) {
+                                   SharedContext& shared) {
     SSL_CTX* ctx = ::SSL_CTX_new(::TLS_server_method());
     if (ctx == nullptr) return take_openssl_error();
     if (::SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) != 1 ||
@@ -301,61 +313,67 @@ Result<SSL_CTX*> make_cert_context(const Certificate& cert,
         ::SSL_CTX_free(ctx);
         return take_openssl_error();
     }
-    if (!state.alpn_wire.empty()) {
-        ::SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, &state);
+    if (!shared.alpn_wire.empty()) {
+        ::SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, &shared);
     }
     return ctx;
 }
 
-Result<void> configure(Conn::State& state) {
-    if (state.configured) return ok();
+// Compiles a Config into the contexts every connection from it will share.
+// Called once per Config, under its lock.
+Result<std::shared_ptr<SharedContext>> build_shared(const Config& config,
+                                                    bool is_client) {
     ensure_initialized();
+    auto shared = std::make_shared<SharedContext>();
 
-    if (auto wire = build_alpn_wire(state.config.next_protos); wire) {
-        state.alpn_wire = std::move(*wire);
+    if (auto wire = build_alpn_wire(config.next_protos); wire) {
+        shared->alpn_wire = std::move(*wire);
     } else {
         return wire.error();
     }
 
-    state.context = ::SSL_CTX_new(state.is_client ? ::TLS_client_method()
-                                                  : ::TLS_server_method());
-    if (state.context == nullptr) return take_openssl_error();
+    shared->context = ::SSL_CTX_new(is_client ? ::TLS_client_method()
+                                              : ::TLS_server_method());
+    if (shared->context == nullptr) return take_openssl_error();
 
     // TLS 1.2 is the floor: everything below it is broken in ways that are not
     // this library's to work around.
-    if (::SSL_CTX_set_min_proto_version(state.context, TLS1_2_VERSION) != 1) {
+    if (::SSL_CTX_set_min_proto_version(shared->context, TLS1_2_VERSION) != 1) {
         return take_openssl_error();
     }
 
-    if (state.is_client) {
-        const Config& config = state.config;
+    if (is_client) {
         if (config.verify_peer) {
-            ::SSL_CTX_set_verify(state.context, SSL_VERIFY_PEER, nullptr);
+            ::SSL_CTX_set_verify(shared->context, SSL_VERIFY_PEER, nullptr);
             if (config.ca_file.empty()) {
-                if (::SSL_CTX_set_default_verify_paths(state.context) != 1) {
+                if (::SSL_CTX_set_default_verify_paths(shared->context) != 1) {
                     return take_openssl_error();
                 }
             } else if (::SSL_CTX_load_verify_locations(
-                           state.context, config.ca_file.c_str(), nullptr) != 1) {
+                           shared->context, config.ca_file.c_str(),
+                           nullptr) != 1) {
                 return take_openssl_error();
             }
         } else {
-            ::SSL_CTX_set_verify(state.context, SSL_VERIFY_NONE, nullptr);
+            ::SSL_CTX_set_verify(shared->context, SSL_VERIFY_NONE, nullptr);
         }
 
         // A client certificate, presented only if the server asks for one.
         const std::string& client_cert =
-            config.certificates.empty() ? config.certificate_file
-                                        : config.certificates.front().certificate_file;
+            config.certificates.empty()
+                ? config.certificate_file
+                : config.certificates.front().certificate_file;
         const std::string& client_key =
-            config.certificates.empty() ? config.private_key_file
-                                        : config.certificates.front().private_key_file;
+            config.certificates.empty()
+                ? config.private_key_file
+                : config.certificates.front().private_key_file;
         if (!client_cert.empty() && !client_key.empty()) {
             if (::SSL_CTX_use_certificate_chain_file(
-                    state.context, client_cert.c_str()) != 1 ||
-                ::SSL_CTX_use_PrivateKey_file(state.context, client_key.c_str(),
+                    shared->context, client_cert.c_str()) != 1 ||
+                ::SSL_CTX_use_PrivateKey_file(shared->context,
+                                              client_key.c_str(),
                                               SSL_FILETYPE_PEM) != 1 ||
-                ::SSL_CTX_check_private_key(state.context) != 1) {
+                ::SSL_CTX_check_private_key(shared->context) != 1) {
                 return take_openssl_error();
             }
         }
@@ -364,15 +382,12 @@ Result<void> configure(Conn::State& state) {
         // our back, so the shared cache is the only place sessions live.
         if (config.session_cache) {
             ::SSL_CTX_set_session_cache_mode(
-                state.context,
+                shared->context,
                 SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
-            ::SSL_CTX_sess_set_new_cb(state.context, new_session_cb);
+            ::SSL_CTX_sess_set_new_cb(shared->context, new_session_cb);
         }
-        // A client advertises its ALPN protocols directly on the SSL later; the
-        // wire list is built above and applied after SSL_new.
+        // A client advertises its ALPN protocols per connection, on the SSL.
     } else {
-        const Config& config = state.config;
-
         // The default certificate is certificates[0] if present, else the
         // single certificate_file/private_key_file pair.
         std::vector<Certificate> certs = config.certificates;
@@ -385,48 +400,49 @@ Result<void> configure(Conn::State& state) {
         }
 
         if (::SSL_CTX_use_certificate_chain_file(
-                state.context, certs.front().certificate_file.c_str()) != 1 ||
+                shared->context, certs.front().certificate_file.c_str()) != 1 ||
             ::SSL_CTX_use_PrivateKey_file(
-                state.context, certs.front().private_key_file.c_str(),
+                shared->context, certs.front().private_key_file.c_str(),
                 SSL_FILETYPE_PEM) != 1 ||
-            ::SSL_CTX_check_private_key(state.context) != 1) {
+            ::SSL_CTX_check_private_key(shared->context) != 1) {
             return take_openssl_error();
         }
-        state.sni_contexts.push_back(state.context);
+        shared->sni_contexts.push_back(shared->context);
 
         // Additional certificates each get their own context, and the
         // servername callback selects among all of them by SNI.
         for (std::size_t i = 1; i < certs.size(); ++i) {
-            auto ctx = make_cert_context(certs[i], state);
+            auto ctx = make_cert_context(certs[i], *shared);
             if (!ctx) return ctx.error();
-            state.sni_contexts.push_back(*ctx);
+            shared->sni_contexts.push_back(*ctx);
         }
         if (certs.size() > 1) {
-            ::SSL_CTX_set_tlsext_servername_callback(state.context,
+            ::SSL_CTX_set_tlsext_servername_callback(shared->context,
                                                      servername_cb);
-            ::SSL_CTX_set_tlsext_servername_arg(state.context, &state);
+            ::SSL_CTX_set_tlsext_servername_arg(shared->context, shared.get());
         }
 
-        if (!state.alpn_wire.empty()) {
-            ::SSL_CTX_set_alpn_select_cb(state.context, alpn_select_cb, &state);
+        if (!shared->alpn_wire.empty()) {
+            ::SSL_CTX_set_alpn_select_cb(shared->context, alpn_select_cb,
+                                         shared.get());
         }
 
         // Client certificates.
         if (config.client_auth != ClientAuth::none) {
             const int mode = verify_mode_for(config.client_auth);
             if (config.client_auth == ClientAuth::require_any) {
-                ::SSL_CTX_set_verify(state.context, mode,
+                ::SSL_CTX_set_verify(shared->context, mode,
                                      verify_callback_allow_any);
             } else {
-                ::SSL_CTX_set_verify(state.context, mode, nullptr);
+                ::SSL_CTX_set_verify(shared->context, mode, nullptr);
             }
             if (config.client_ca_file.empty()) {
-                if (::SSL_CTX_set_default_verify_paths(state.context) != 1) {
+                if (::SSL_CTX_set_default_verify_paths(shared->context) != 1) {
                     return take_openssl_error();
                 }
             } else {
                 if (::SSL_CTX_load_verify_locations(
-                        state.context, config.client_ca_file.c_str(),
+                        shared->context, config.client_ca_file.c_str(),
                         nullptr) != 1) {
                     return take_openssl_error();
                 }
@@ -435,32 +451,54 @@ Result<void> configure(Conn::State& state) {
                 STACK_OF(X509_NAME)* names =
                     ::SSL_load_client_CA_file(config.client_ca_file.c_str());
                 if (names == nullptr) return take_openssl_error();
-                ::SSL_CTX_set_client_CA_list(state.context, names);
+                ::SSL_CTX_set_client_CA_list(shared->context, names);
             }
         }
 
-        // Session tickets.
+        // Session tickets. Connections sharing this context already share its
+        // ticket key; an explicit key is for tickets that must survive the
+        // process.
         if (config.session_tickets_disabled) {
-            ::SSL_CTX_set_options(state.context, SSL_OP_NO_TICKET);
+            ::SSL_CTX_set_options(shared->context, SSL_OP_NO_TICKET);
         } else if (!config.session_ticket_key.empty()) {
             // A secret shorter than this would weaken every ticket sealed with
             // it, so it is refused rather than stretched.
             if (config.session_ticket_key.size() < 32) return Error{EINVAL};
             // Passing no buffer asks OpenSSL how much key material it wants.
             const long needed =
-                ::SSL_CTX_set_tlsext_ticket_keys(state.context, nullptr, 0);
+                ::SSL_CTX_set_tlsext_ticket_keys(shared->context, nullptr, 0);
             if (needed <= 0) return take_openssl_error();
             auto derived = derive_ticket_key(config.session_ticket_key,
                                              static_cast<std::size_t>(needed));
             if (!derived) return derived.error();
-            if (::SSL_CTX_set_tlsext_ticket_keys(state.context, derived->data(),
-                                                 needed) != 1) {
+            if (::SSL_CTX_set_tlsext_ticket_keys(shared->context,
+                                                 derived->data(), needed) != 1) {
                 return take_openssl_error();
             }
         }
     }
 
-    state.ssl = ::SSL_new(state.context);
+    return shared;
+}
+
+Result<void> configure(Conn::State& state) {
+    if (state.configured) return ok();
+
+    // Compile once per Config; every connection from that Config, or any copy
+    // of it, reuses the result. This is what keeps certificate files off the
+    // accept path and gives a server one ticket key across its connections.
+    {
+        detail::ConfigState& slot = *state.config.shared_state;
+        std::lock_guard<std::mutex> guard(slot.mutex);
+        if (!slot.compiled) {
+            auto built = build_shared(state.config, state.is_client);
+            if (!built) return built.error();
+            slot.compiled = *built;
+        }
+        state.shared = std::static_pointer_cast<SharedContext>(slot.compiled);
+    }
+
+    state.ssl = ::SSL_new(state.shared->context);
     if (state.ssl == nullptr) return take_openssl_error();
     // Callbacks receive only the SSL, so the state has to be reachable from it.
     ::SSL_set_ex_data(state.ssl, state_ex_index(), &state);
@@ -482,11 +520,12 @@ Result<void> configure(Conn::State& state) {
                 return take_openssl_error();
             }
         }
+
         // A client offers its ALPN protocols in the ClientHello.
-        if (!state.alpn_wire.empty() &&
-            ::SSL_set_alpn_protos(state.ssl, state.alpn_wire.data(),
-                                  static_cast<unsigned int>(
-                                      state.alpn_wire.size())) != 0) {
+        if (!state.shared->alpn_wire.empty() &&
+            ::SSL_set_alpn_protos(
+                state.ssl, state.shared->alpn_wire.data(),
+                static_cast<unsigned int>(state.shared->alpn_wire.size())) != 0) {
             return take_openssl_error();
         }
 

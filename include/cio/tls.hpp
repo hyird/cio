@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -31,6 +32,16 @@
 #include "cio/task.hpp"
 
 namespace cio::tls {
+
+namespace detail {
+// Where a Config keeps the OpenSSL context it compiles on first use. Every copy
+// of a Config shares one of these, which is what lets the connections of one
+// server share a context instead of each building its own.
+struct ConfigState {
+    std::mutex mutex;
+    std::shared_ptr<void> compiled;
+};
+}  // namespace detail
 
 // A certificate: a PEM chain and its private key, as Go's tls.Certificate is
 // (paths here rather than DER bytes, because cio has no certificate-loading API
@@ -88,6 +99,19 @@ std::shared_ptr<SessionCache> new_lru_client_session_cache(
 // One configuration for both roles, as Go's tls.Config is. Which fields matter
 // depends on the role: a client reads server_name, verify_peer, ca_file and
 // next_protos; a server reads the certificate list and next_protos.
+//
+// REUSE ONE CONFIG. The first connection made from a Config compiles it into an
+// OpenSSL context; every connection made from that Config or a copy of it then
+// shares that context. Sharing is what keeps certificate files off the accept
+// path — they are read once, not once per connection — and what lets clients
+// resume sessions, since a session ticket key belongs to the context that issued
+// it. Building a fresh Config per connection gives each its own context and
+// loses both, silently.
+//
+// As in Go, the fields are read when that first connection is made. Changing
+// them afterwards does not affect connections made from the Config; make a new
+// one instead. server_name is the exception: it is applied per connection, so
+// one client Config can dial many hosts.
 struct Config {
     // SNI and certificate hostname to verify against. Empty disables both,
     // which is only appropriate when the peer is identified some other way.
@@ -128,11 +152,12 @@ struct Config {
     // whatever length the OpenSSL in use wants, which is not the same across
     // versions, so one configuration keeps working when the library moves.
     //
-    // Every connection builds its own OpenSSL context, so without this each
-    // would invent its own ticket key and no client could ever resume against a
-    // later connection. Setting the same secret on every connection of one
-    // server is what makes server-side resumption work. Keep it secret and
-    // rotate it: it protects every ticket issued under it. Server only.
+    // Not needed to resume within one process: connections sharing a Config
+    // share its context and therefore its ticket key already. Set this when
+    // tickets must outlive the process — several servers behind a load
+    // balancer, or a restart that should not invalidate every client's session.
+    // Keep it secret and rotate it: it protects every ticket issued under it.
+    // Server only.
     std::string session_ticket_key;
 
     // Go's Config.ClientSessionCache: enables resumption when set, and is where
@@ -146,6 +171,12 @@ struct Config {
     // else: without "h2" in this list on both ends, a peer must fall back to
     // HTTP/1.1. Empty disables ALPN.
     std::vector<std::string> next_protos;
+
+    // Internal: the compiled context, shared by every copy of this Config. Not
+    // meant to be touched by consumers; it is public only so that Config stays
+    // an aggregate and designated initializers keep working.
+    std::shared_ptr<detail::ConfigState> shared_state =
+        std::make_shared<detail::ConfigState>();
 };
 
 class Conn {

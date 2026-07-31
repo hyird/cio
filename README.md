@@ -447,9 +447,16 @@ TLS（可选）：
   因为证书类型不是这个库该长出来的东西，而 subject 正是鉴权要读的。
 - 会话复用经 `Config::session_cache`（对应 `Config.ClientSessionCache`，用
   `new_lru_client_session_cache()` 创建并在连接间共享）；`Conn::did_resume()`
-  读取结果。服务端必须设 `Config::session_ticket_key`（≥32 字节密钥，内部用
-  HKDF-SHA256 扩展到当前 OpenSSL 要求的长度）：**每条连接各自建立 OpenSSL
-  上下文，不共享这个密钥就没有任何客户端能复用到后续连接**。
+  读取结果。`Config::session_ticket_key` 只在 ticket 需要跨进程存活时才需要
+  （负载均衡后的多台服务器、或不想让重启作废所有客户端会话），进程内复用靠
+  复用同一个 `Config` 即可。
+- **请复用同一个 `Config`。** 第一条连接会把 `Config` 编译成一个 OpenSSL 上下
+  文，此后由该 `Config` 及其副本创建的所有连接共享它。共享是证书文件不落在
+  accept 路径上（只读一次而非每连接一次）、以及客户端能复用会话（ticket 密钥
+  属于签发它的那个上下文）的前提。每条连接新建一个 `Config` 会让各自拥有独立
+  上下文，两者都会静默失效。字段在首次使用时读取，之后修改不影响已由该
+  `Config` 创建的连接——`server_name` 例外，它按连接生效，所以一个客户端
+  `Config` 可以连很多主机。
 
 设计约束与运行时不变量在 [AGENTS.md](AGENTS.md)。
 

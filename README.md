@@ -154,7 +154,7 @@ ctest --test-dir build-tls --output-on-failure
 | `cio::fs::File` / `open` / `read_file` / `read_dir` | 阻塞池上的文件与目录操作（`os`） |
 | `cio::process::Command` / `start` / `run` / `output` | 经 `pidfd` 等待的子进程（`os/exec`） |
 | `cio::signal::SignalSet` | 基于 `signalfd` 的信号投递 |
-| `cio::tls::Conn` | 可选 TLS（`-DCIO_TLS=ON`，链接 OpenSSL） |
+| `cio::tls::Conn` / `Config` / `Certificate` | 可选 TLS，含 ALPN 与 SNI 多证书（`-DCIO_TLS=ON`，链接 OpenSSL） |
 | `cio::io::read_full` / `copy` / `read_all` | `io.ReadFull` / `io.Copy` / `io.ReadAll` |
 | `cio::io::LimitReader` / `TeeReader` | `io.LimitReader` / `io.TeeReader` |
 | `net::Conn` / `PacketConn` / `Listener` | Go net 的三个接口，以 concept 表达 |
@@ -432,7 +432,14 @@ EOF。保留的刻意偏差：`Once::call`（`do` 是 C++ 关键字）、`Timer:
 TLS（可选）：
 
 - 需要 `-DCIO_TLS=ON` 并链接 OpenSSL；核心库保持零依赖。
-- 下限为 TLS 1.2。无 ALPN、无会话复用、无客户端证书。
+- 下限为 TLS 1.2。无会话复用、无客户端证书（mTLS）。
+- ALPN 经 `Config::next_protos` 协商（对应 Go 的 `Config.NextProtos`），
+  `Conn::negotiated_protocol()` 读取结果——HTTP/2 over TLS 只能在这里协商，
+  两端都要有 `"h2"`，否则必须回落 HTTP/1.1。双方无交集时握手照常成功、协商
+  结果为空，而不是失败。
+- 服务端多证书经 `Config::certificates` 按 SNI 选择，匹配的是证书自身的
+  subjectAltName（对应 Go 拿 ClientHello 的 ServerName 比对每张证书），无匹
+  配时用第一张作默认。`Conn::server_name()` 读取客户端发来的 SNI 名。
 
 设计约束与运行时不变量在 [AGENTS.md](AGENTS.md)。
 

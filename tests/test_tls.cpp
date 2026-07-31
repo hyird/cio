@@ -49,8 +49,9 @@ std::atomic<unsigned> TempFile::counter_{0};
 
 // A self-signed certificate for "localhost", written to PEM files so the
 // public config surface (which takes paths) is what the test exercises.
-bool write_self_signed(const std::string& cert_path,
-                       const std::string& key_path) {
+bool write_self_signed(const std::string& cert_path, const std::string& key_path,
+                       const std::string& cn = "localhost",
+                       const std::string& san = "DNS:localhost,IP:127.0.0.1") {
     EVP_PKEY* key = ::EVP_RSA_gen(2048);
     if (key == nullptr) return false;
 
@@ -68,12 +69,12 @@ bool write_self_signed(const std::string& cert_path,
     X509_NAME* name = ::X509_get_subject_name(cert);
     ::X509_NAME_add_entry_by_txt(
         name, "CN", MBSTRING_ASC,
-        reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
+        reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1, 0);
     ::X509_set_issuer_name(cert, name);
 
     // Verification matches on subjectAltName, so the CN alone is not enough.
-    X509_EXTENSION* alt = ::X509V3_EXT_conf_nid(
-        nullptr, nullptr, NID_subject_alt_name, "DNS:localhost,IP:127.0.0.1");
+    X509_EXTENSION* alt = ::X509V3_EXT_conf_nid(nullptr, nullptr,
+                                                NID_subject_alt_name, san.c_str());
     if (alt != nullptr) {
         ::X509_add_ext(cert, alt, -1);
         ::X509_EXTENSION_free(alt);
@@ -105,6 +106,10 @@ struct Certificate {
     bool ready = false;
 
     Certificate() { ready = write_self_signed(cert.get(), key.get()); }
+    // A certificate for a specific name, for the SNI test.
+    explicit Certificate(const std::string& name) {
+        ready = write_self_signed(cert.get(), key.get(), name, "DNS:" + name);
+    }
 };
 
 void test_handshake_and_round_trip() {
@@ -281,9 +286,178 @@ void test_large_transfer_spans_records() {
 
 }  // namespace
 
+// ALPN: the h2 negotiation an HTTP/2 server depends on. Both ends offer a list;
+// the server picks the client's highest that it also supports.
+void test_alpn_negotiates_h2() {
+    Certificate certificate;
+    CIO_CHECK(certificate.ready);
+
+    auto body = [&certificate]() -> cio::Task<bool> {
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        CIO_CHECK(listener.has_value());
+        const auto addr = listener->addr().value();
+
+        auto serving = cio::spawn(
+            [](net::TcpListener l, std::string cert,
+               std::string key) -> cio::Task<std::string> {
+                auto conn = co_await l.accept();
+                if (!conn) co_return std::string{"accept failed"};
+                cio::tls::Config config;
+                config.certificate_file = std::move(cert);
+                config.private_key_file = std::move(key);
+                config.next_protos = {"h2", "http/1.1"};
+                auto stream = cio::tls::server(std::move(*conn), config);
+                if (auto shaken = co_await stream.handshake(); !shaken) {
+                    co_return std::string{"server handshake failed"};
+                }
+                // The server dispatches its protocol stack on this.
+                co_return stream.negotiated_protocol();
+            }(std::move(*listener), certificate.cert.get(),
+              certificate.key.get()));
+
+        auto tcp = co_await net::TcpConn::dial(addr);
+        CIO_CHECK(tcp.has_value());
+        cio::tls::Config config;
+        config.server_name = "localhost";
+        config.ca_file = certificate.cert.get();
+        // The client prefers http/1.1 but offers h2; the server prefers h2, and
+        // the server's preference wins, as in Go and OpenSSL.
+        config.next_protos = {"http/1.1", "h2"};
+        auto stream = cio::tls::client(std::move(*tcp), config);
+        auto shaken = co_await stream.handshake();
+        CIO_CHECK(shaken.has_value());
+
+        CIO_CHECK_EQ(stream.negotiated_protocol(), std::string("h2"));
+        CIO_CHECK_EQ(co_await serving, std::string("h2"));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// No overlap must not fail the handshake — the connection continues with no
+// negotiated protocol, which a server treats as HTTP/1.1.
+void test_alpn_no_overlap_is_not_fatal() {
+    Certificate certificate;
+    CIO_CHECK(certificate.ready);
+
+    auto body = [&certificate]() -> cio::Task<bool> {
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        CIO_CHECK(listener.has_value());
+        const auto addr = listener->addr().value();
+
+        auto serving = cio::spawn(
+            [](net::TcpListener l, std::string cert,
+               std::string key) -> cio::Task<bool> {
+                auto conn = co_await l.accept();
+                if (!conn) co_return false;
+                cio::tls::Config config;
+                config.certificate_file = std::move(cert);
+                config.private_key_file = std::move(key);
+                config.next_protos = {"h2"};
+                auto stream = cio::tls::server(std::move(*conn), config);
+                if (auto shaken = co_await stream.handshake(); !shaken) {
+                    co_return false;
+                }
+                co_return stream.negotiated_protocol().empty();
+            }(std::move(*listener), certificate.cert.get(),
+              certificate.key.get()));
+
+        auto tcp = co_await net::TcpConn::dial(addr);
+        CIO_CHECK(tcp.has_value());
+        cio::tls::Config config;
+        config.server_name = "localhost";
+        config.ca_file = certificate.cert.get();
+        config.next_protos = {"spdy/3"};  // no overlap with the server's "h2"
+        auto stream = cio::tls::client(std::move(*tcp), config);
+        auto shaken = co_await stream.handshake();
+        CIO_CHECK(shaken.has_value());  // handshake still succeeds
+        CIO_CHECK(stream.negotiated_protocol().empty());
+        CIO_CHECK(co_await serving);
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+struct SniOutcome {
+    bool client_ok = false;
+    std::string server_saw;  // the SNI name the server observed
+};
+
+// SNI: one server, two certificates, selected by the name the client sends —
+// what lets a single listener terminate many domains.
+void test_sni_selects_certificate_by_name() {
+    Certificate alpha("alpha.example");
+    Certificate beta("beta.example");
+    CIO_CHECK(alpha.ready);
+    CIO_CHECK(beta.ready);
+
+    auto connect_as = [&](const std::string& sni,
+                          const std::string& ca) -> cio::Task<SniOutcome> {
+        SniOutcome outcome;
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        if (!listener) co_return outcome;
+        const auto addr = listener->addr().value();
+
+        auto serving = cio::spawn(
+            [](net::TcpListener l, std::string ac, std::string ak,
+               std::string bc, std::string bk) -> cio::Task<std::string> {
+                auto conn = co_await l.accept();
+                if (!conn) co_return std::string{};
+                cio::tls::Config config;
+                // alpha is first, so it is the default certificate; beta is
+                // only ever presented if SNI selection actually runs.
+                config.certificates = {{std::move(ac), std::move(ak)},
+                                       {std::move(bc), std::move(bk)}};
+                auto stream = cio::tls::server(std::move(*conn), config);
+                // Fails on the mismatch case, when the client rejects our
+                // certificate; the observed SNI name is recorded either way.
+                (void)co_await stream.handshake();
+                co_return stream.server_name();
+            }(std::move(*listener), alpha.cert.get(), alpha.key.get(),
+              beta.cert.get(), beta.key.get()));
+
+        auto tcp = co_await net::TcpConn::dial(addr);
+        if (!tcp) co_return outcome;
+        cio::tls::Config config;
+        config.server_name = sni;
+        config.ca_file = ca;
+        auto stream = cio::tls::client(std::move(*tcp), config);
+        outcome.client_ok = (co_await stream.handshake()).has_value();
+        // Close before joining. A client that rejected the certificate leaves
+        // the server parked mid-handshake, and only the hang-up ends that wait.
+        stream.close();
+        outcome.server_saw = co_await serving;
+        co_return outcome;
+    };
+
+    auto body = [&]() -> cio::Task<bool> {
+        // The discriminating case. beta is not the default certificate, so this
+        // can only verify against beta's CA if SNI selection actually switched
+        // the server onto beta — a server stuck on the default fails here.
+        auto to_beta = co_await connect_as("beta.example", beta.cert.get());
+        CIO_CHECK(to_beta.client_ok);
+        CIO_CHECK_EQ(to_beta.server_saw, std::string("beta.example"));
+
+        // The default certificate still serves its own name.
+        auto to_alpha = co_await connect_as("alpha.example", alpha.cert.get());
+        CIO_CHECK(to_alpha.client_ok);
+        CIO_CHECK_EQ(to_alpha.server_saw, std::string("alpha.example"));
+
+        // Asking for beta while trusting only alpha must fail: the server
+        // presents beta's certificate, which alpha's CA does not vouch for.
+        auto mismatch = co_await connect_as("beta.example", alpha.cert.get());
+        CIO_CHECK(!mismatch.client_ok);
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 int main() {
     RUN_TEST(test_handshake_and_round_trip);
     RUN_TEST(test_verification_rejects_untrusted_certificate);
     RUN_TEST(test_large_transfer_spans_records);
+    RUN_TEST(test_alpn_negotiates_h2);
+    RUN_TEST(test_alpn_no_overlap_is_not_fatal);
+    RUN_TEST(test_sni_selects_certificate_by_name);
     return cio_test::summary();
 }

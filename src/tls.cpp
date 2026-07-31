@@ -57,20 +57,111 @@ struct Conn::State {
     bool shutdown_sent = false;
     std::vector<std::byte> transfer;
 
+    // ALPN wire form: each protocol as a length-prefixed byte string, which is
+    // both what a client advertises and what a server's callback compares
+    // against. Built once from config.next_protos.
+    std::vector<unsigned char> alpn_wire;
+
+    // One SSL_CTX per additional server certificate for SNI. The servername
+    // callback switches the live SSL onto the one whose certificate matches the
+    // client's name. context above is the default (certificates[0]).
+    std::vector<SSL_CTX*> sni_contexts;
+
     State() : transfer(16 * 1024) {}
 
     ~State() {
         if (ssl != nullptr) ::SSL_free(ssl);
         if (network != nullptr) ::BIO_free(network);
+        for (SSL_CTX* ctx : sni_contexts) {
+            if (ctx != context) ::SSL_CTX_free(ctx);
+        }
         if (context != nullptr) ::SSL_CTX_free(context);
     }
 };
 
 namespace {
 
+// Encodes next_protos into ALPN wire form: one length byte then the bytes, per
+// protocol. Returns EINVAL for a name that is empty or over 255 bytes, which the
+// wire format cannot represent.
+Result<std::vector<unsigned char>> build_alpn_wire(
+    const std::vector<std::string>& protos) {
+    std::vector<unsigned char> wire;
+    for (const std::string& proto : protos) {
+        if (proto.empty() || proto.size() > 255) return Error{EINVAL};
+        wire.push_back(static_cast<unsigned char>(proto.size()));
+        wire.insert(wire.end(), proto.begin(), proto.end());
+    }
+    return wire;
+}
+
+// Server ALPN callback: pick the first of our protocols that the client also
+// offered. OpenSSL does the intersection given both wire lists.
+int alpn_select_cb(SSL*, const unsigned char** out, unsigned char* outlen,
+                   const unsigned char* in, unsigned int inlen, void* arg) {
+    auto* state = static_cast<Conn::State*>(arg);
+    if (::SSL_select_next_proto(const_cast<unsigned char**>(out), outlen,
+                                state->alpn_wire.data(),
+                                static_cast<unsigned int>(state->alpn_wire.size()),
+                                in, inlen) != OPENSSL_NPN_NEGOTIATED) {
+        // No overlap. Declining lets the handshake continue on HTTP/1.1 rather
+        // than failing it, which is what a browser expects.
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+    return SSL_TLSEXT_ERR_OK;
+}
+
+// Server SNI callback: switch to the certificate whose subjectAltNames match
+// the name the client sent. No match keeps the default context.
+int servername_cb(SSL* ssl, int*, void* arg) {
+    auto* state = static_cast<Conn::State*>(arg);
+    const char* name = ::SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    if (name == nullptr || state->sni_contexts.empty()) {
+        return SSL_TLSEXT_ERR_OK;
+    }
+    for (SSL_CTX* ctx : state->sni_contexts) {
+        X509* cert = ::SSL_CTX_get0_certificate(ctx);
+        // X509_check_host does the wildcard and SAN matching, so cio does not
+        // parse the certificate itself.
+        if (cert != nullptr &&
+            ::X509_check_host(cert, name, 0, 0, nullptr) == 1) {
+            ::SSL_set_SSL_CTX(ssl, ctx);
+            return SSL_TLSEXT_ERR_OK;
+        }
+    }
+    return SSL_TLSEXT_ERR_OK;  // default certificate
+}
+
+// Loads a cert+key pair into a fresh SSL_CTX sharing the base's protocol and
+// ALPN settings.
+Result<SSL_CTX*> make_cert_context(const Certificate& cert,
+                                   Conn::State& state) {
+    SSL_CTX* ctx = ::SSL_CTX_new(::TLS_server_method());
+    if (ctx == nullptr) return take_openssl_error();
+    if (::SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) != 1 ||
+        ::SSL_CTX_use_certificate_chain_file(
+            ctx, cert.certificate_file.c_str()) != 1 ||
+        ::SSL_CTX_use_PrivateKey_file(ctx, cert.private_key_file.c_str(),
+                                      SSL_FILETYPE_PEM) != 1 ||
+        ::SSL_CTX_check_private_key(ctx) != 1) {
+        ::SSL_CTX_free(ctx);
+        return take_openssl_error();
+    }
+    if (!state.alpn_wire.empty()) {
+        ::SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, &state);
+    }
+    return ctx;
+}
+
 Result<void> configure(Conn::State& state) {
     if (state.configured) return ok();
     ensure_initialized();
+
+    if (auto wire = build_alpn_wire(state.config.next_protos); wire) {
+        state.alpn_wire = std::move(*wire);
+    } else {
+        return wire.error();
+    }
 
     state.context = ::SSL_CTX_new(state.is_client ? ::TLS_client_method()
                                                   : ::TLS_server_method());
@@ -97,22 +188,47 @@ Result<void> configure(Conn::State& state) {
         } else {
             ::SSL_CTX_set_verify(state.context, SSL_VERIFY_NONE, nullptr);
         }
+        // A client advertises its ALPN protocols directly on the SSL later; the
+        // wire list is built above and applied after SSL_new.
     } else {
         const Config& config = state.config;
-        if (config.certificate_file.empty() || config.private_key_file.empty()) {
-            return Error{EINVAL};
+
+        // The default certificate is certificates[0] if present, else the
+        // single certificate_file/private_key_file pair.
+        std::vector<Certificate> certs = config.certificates;
+        if (certs.empty()) {
+            if (config.certificate_file.empty() ||
+                config.private_key_file.empty()) {
+                return Error{EINVAL};
+            }
+            certs.push_back({config.certificate_file, config.private_key_file});
         }
+
         if (::SSL_CTX_use_certificate_chain_file(
-                state.context, config.certificate_file.c_str()) != 1) {
+                state.context, certs.front().certificate_file.c_str()) != 1 ||
+            ::SSL_CTX_use_PrivateKey_file(
+                state.context, certs.front().private_key_file.c_str(),
+                SSL_FILETYPE_PEM) != 1 ||
+            ::SSL_CTX_check_private_key(state.context) != 1) {
             return take_openssl_error();
         }
-        if (::SSL_CTX_use_PrivateKey_file(state.context,
-                                          config.private_key_file.c_str(),
-                                          SSL_FILETYPE_PEM) != 1) {
-            return take_openssl_error();
+        state.sni_contexts.push_back(state.context);
+
+        // Additional certificates each get their own context, and the
+        // servername callback selects among all of them by SNI.
+        for (std::size_t i = 1; i < certs.size(); ++i) {
+            auto ctx = make_cert_context(certs[i], state);
+            if (!ctx) return ctx.error();
+            state.sni_contexts.push_back(*ctx);
         }
-        if (::SSL_CTX_check_private_key(state.context) != 1) {
-            return take_openssl_error();
+        if (certs.size() > 1) {
+            ::SSL_CTX_set_tlsext_servername_callback(state.context,
+                                                     servername_cb);
+            ::SSL_CTX_set_tlsext_servername_arg(state.context, &state);
+        }
+
+        if (!state.alpn_wire.empty()) {
+            ::SSL_CTX_set_alpn_select_cb(state.context, alpn_select_cb, &state);
         }
     }
 
@@ -135,6 +251,13 @@ Result<void> configure(Conn::State& state) {
                 ::SSL_set1_host(state.ssl, name.c_str()) != 1) {
                 return take_openssl_error();
             }
+        }
+        // A client offers its ALPN protocols in the ClientHello.
+        if (!state.alpn_wire.empty() &&
+            ::SSL_set_alpn_protos(state.ssl, state.alpn_wire.data(),
+                                  static_cast<unsigned int>(
+                                      state.alpn_wire.size())) != 0) {
+            return take_openssl_error();
         }
         ::SSL_set_connect_state(state.ssl);
     } else {
@@ -368,6 +491,23 @@ void Conn::close() {
 std::string Conn::protocol_version() const {
     if (state_ == nullptr || state_->ssl == nullptr) return {};
     const char* name = ::SSL_get_version(state_->ssl);
+    return name != nullptr ? std::string(name) : std::string{};
+}
+
+std::string Conn::negotiated_protocol() const {
+    if (state_ == nullptr || state_->ssl == nullptr) return {};
+    const unsigned char* proto = nullptr;
+    unsigned int len = 0;
+    ::SSL_get0_alpn_selected(state_->ssl, &proto, &len);
+    return proto != nullptr
+               ? std::string(reinterpret_cast<const char*>(proto), len)
+               : std::string{};
+}
+
+std::string Conn::server_name() const {
+    if (state_ == nullptr || state_->ssl == nullptr) return {};
+    const char* name =
+        ::SSL_get_servername(state_->ssl, TLSEXT_NAMETYPE_host_name);
     return name != nullptr ? std::string(name) : std::string{};
 }
 

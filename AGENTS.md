@@ -120,6 +120,10 @@ go test ./...
 - **`io::Writer` 遵循 Go 的 `io.Writer` 契约。** `write()` 无错误即写满；无
   错误的短写是坏 writer，`copy` 对它报 `EIO`。因此库内不存在 `write_all`——
   每个调用方自带重试循环的世界正是这条契约要消灭的。
+- **TLS 每条连接各自建立 OpenSSL 上下文。** 因此服务端要复用会话就必须显式共
+  享 `session_ticket_key`，客户端缓存的必须是会话的**副本**——OpenSSL 在
+  TLS 1.3 下把新 ticket 会话同时设为该连接自己的会话，连接未经 close_notify
+  拆除时会把它标记为不可复用，直接毒化缓存。
 - **不做 context value。** 取消作用域携带完成信号、错误与截止时间。以不透明
   类型为键的映射是依赖注入机制，不是取消机制。
 - **内置解析器不做 DNS 缓存、DNSSEC 与 search 列表**，除 stub 解析外不实现用

@@ -1,12 +1,15 @@
 #include "cio/tls.hpp"
 
 #include <openssl/err.h>
+#include <openssl/kdf.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <list>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 #include <utility>
 
@@ -40,6 +43,79 @@ void discard_openssl_errors() {
 }
 
 }  // namespace
+
+// A bounded LRU of SSL_SESSIONs, keyed by the endpoint they were established
+// with. Guarded by a plain mutex rather than cio::Mutex: the critical section is
+// a map lookup with no I/O in it, so suspending a task around it would cost more
+// than it saves.
+struct SessionCache::Impl {
+    std::mutex mutex;
+    std::size_t capacity;
+    std::list<std::string> order;  // front = most recently used
+    struct Entry {
+        SSL_SESSION* session;
+        std::list<std::string>::iterator position;
+    };
+    std::unordered_map<std::string, Entry> entries;
+
+    explicit Impl(std::size_t cap) : capacity(cap == 0 ? 1 : cap) {}
+
+    ~Impl() {
+        for (auto& [key, entry] : entries) ::SSL_SESSION_free(entry.session);
+    }
+};
+
+SessionCache::SessionCache(std::size_t capacity)
+    : impl_(std::make_unique<Impl>(capacity)) {}
+
+SessionCache::~SessionCache() = default;
+
+void* SessionCache::take(const std::string& key) {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    auto found = impl_->entries.find(key);
+    if (found == impl_->entries.end()) return nullptr;
+    impl_->order.splice(impl_->order.begin(), impl_->order,
+                        found->second.position);
+    found->second.position = impl_->order.begin();
+    // The caller gets its own reference; the cache keeps its entry so a second
+    // concurrent connection can resume from the same session.
+    SSL_SESSION* session = found->second.session;
+    ::SSL_SESSION_up_ref(session);
+    return session;
+}
+
+void SessionCache::store(const std::string& key, void* session) {
+    auto* fresh = static_cast<SSL_SESSION*>(session);
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+
+    if (auto found = impl_->entries.find(key); found != impl_->entries.end()) {
+        ::SSL_SESSION_free(found->second.session);
+        found->second.session = fresh;
+        impl_->order.splice(impl_->order.begin(), impl_->order,
+                            found->second.position);
+        found->second.position = impl_->order.begin();
+        return;
+    }
+
+    if (impl_->entries.size() >= impl_->capacity && !impl_->order.empty()) {
+        const std::string& oldest = impl_->order.back();
+        if (auto stale = impl_->entries.find(oldest);
+            stale != impl_->entries.end()) {
+            ::SSL_SESSION_free(stale->second.session);
+            impl_->entries.erase(stale);
+        }
+        impl_->order.pop_back();
+    }
+
+    impl_->order.push_front(key);
+    impl_->entries.emplace(key, SessionCache::Impl::Entry{
+                                    fresh, impl_->order.begin()});
+}
+
+std::shared_ptr<SessionCache> new_lru_client_session_cache(
+    std::size_t capacity) {
+    return std::make_shared<SessionCache>(capacity);
+}
 
 // The BIO pair keeps OpenSSL entirely in memory: it never touches the
 // descriptor itself. Ciphertext moves between the network BIO and the socket
@@ -132,6 +208,84 @@ int servername_cb(SSL* ssl, int*, void* arg) {
     return SSL_TLSEXT_ERR_OK;  // default certificate
 }
 
+// Expands the user's ticket secret to the length this OpenSSL wants. The length
+// is version-dependent — 48 bytes once, 80 now — so asking the library rather
+// than hard-coding it is what keeps one configuration portable. HKDF is being
+// used for exactly what it is for: turning one secret into fixed-size key
+// material.
+Result<std::vector<unsigned char>> derive_ticket_key(const std::string& secret,
+                                                     std::size_t length) {
+    std::vector<unsigned char> derived(length);
+    EVP_PKEY_CTX* kdf = ::EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
+    if (kdf == nullptr) return take_openssl_error();
+
+    static const char kInfo[] = "cio tls session ticket";
+    std::size_t out = length;
+    const bool ok =
+        ::EVP_PKEY_derive_init(kdf) == 1 &&
+        ::EVP_PKEY_CTX_set_hkdf_md(kdf, ::EVP_sha256()) == 1 &&
+        ::EVP_PKEY_CTX_set1_hkdf_key(
+            kdf, reinterpret_cast<const unsigned char*>(secret.data()),
+            static_cast<int>(secret.size())) == 1 &&
+        ::EVP_PKEY_CTX_add1_hkdf_info(
+            kdf, reinterpret_cast<const unsigned char*>(kInfo),
+            static_cast<int>(sizeof(kInfo) - 1)) == 1 &&
+        ::EVP_PKEY_derive(kdf, derived.data(), &out) == 1;
+    ::EVP_PKEY_CTX_free(kdf);
+
+    if (!ok || out != length) return take_openssl_error();
+    return derived;
+}
+
+// A registered ex_data slot so a callback can find the connection state from
+// the SSL it was handed.
+int state_ex_index() {
+    static const int index =
+        ::SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+    return index;
+}
+
+// Client resumption: OpenSSL hands us each session the server issues. Under
+// TLS 1.3 tickets arrive after the handshake, during a later read, which is why
+// a client that never reads never caches anything.
+int new_session_cb(SSL* ssl, SSL_SESSION* session) {
+    auto* state = static_cast<Conn::State*>(
+        ::SSL_get_ex_data(ssl, state_ex_index()));
+    if (state == nullptr || !state->config.session_cache) return 0;
+
+    // Cache a copy, not the session OpenSSL handed us. Under TLS 1.3 that
+    // session is also the connection's own, and tearing the connection down
+    // without a clean close_notify marks it not-resumable — which would poison
+    // the cached entry and silently cost every later connection its resumption.
+    SSL_SESSION* copy = ::SSL_SESSION_dup(session);
+    if (copy == nullptr) return 0;
+    state->config.session_cache->store(state->config.server_name, copy);
+    return 0;  // OpenSSL keeps its own reference; ours is the copy
+}
+
+// Translates Go's ClientAuthType into OpenSSL's verify flags.
+int verify_mode_for(ClientAuth auth) {
+    switch (auth) {
+        case ClientAuth::none:
+            return SSL_VERIFY_NONE;
+        case ClientAuth::request:
+            return SSL_VERIFY_PEER;
+        case ClientAuth::require_any:
+            // Demand a certificate but do not check who signed it.
+            return SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+        case ClientAuth::verify_if_given:
+            return SSL_VERIFY_PEER;
+        case ClientAuth::require_and_verify:
+            return SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+    }
+    return SSL_VERIFY_NONE;
+}
+
+// require_any accepts a certificate it cannot chain to a trusted root, which is
+// what Go's RequireAnyClientCert means; every other mode leaves OpenSSL's own
+// verdict alone.
+int verify_callback_allow_any(int /*preverify*/, X509_STORE_CTX*) { return 1; }
+
 // Loads a cert+key pair into a fresh SSL_CTX sharing the base's protocol and
 // ALPN settings.
 Result<SSL_CTX*> make_cert_context(const Certificate& cert,
@@ -188,6 +342,32 @@ Result<void> configure(Conn::State& state) {
         } else {
             ::SSL_CTX_set_verify(state.context, SSL_VERIFY_NONE, nullptr);
         }
+
+        // A client certificate, presented only if the server asks for one.
+        const std::string& client_cert =
+            config.certificates.empty() ? config.certificate_file
+                                        : config.certificates.front().certificate_file;
+        const std::string& client_key =
+            config.certificates.empty() ? config.private_key_file
+                                        : config.certificates.front().private_key_file;
+        if (!client_cert.empty() && !client_key.empty()) {
+            if (::SSL_CTX_use_certificate_chain_file(
+                    state.context, client_cert.c_str()) != 1 ||
+                ::SSL_CTX_use_PrivateKey_file(state.context, client_key.c_str(),
+                                              SSL_FILETYPE_PEM) != 1 ||
+                ::SSL_CTX_check_private_key(state.context) != 1) {
+                return take_openssl_error();
+            }
+        }
+
+        // Resumption. NO_INTERNAL_STORE keeps OpenSSL from also caching behind
+        // our back, so the shared cache is the only place sessions live.
+        if (config.session_cache) {
+            ::SSL_CTX_set_session_cache_mode(
+                state.context,
+                SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+            ::SSL_CTX_sess_set_new_cb(state.context, new_session_cb);
+        }
         // A client advertises its ALPN protocols directly on the SSL later; the
         // wire list is built above and applied after SSL_new.
     } else {
@@ -230,10 +410,60 @@ Result<void> configure(Conn::State& state) {
         if (!state.alpn_wire.empty()) {
             ::SSL_CTX_set_alpn_select_cb(state.context, alpn_select_cb, &state);
         }
+
+        // Client certificates.
+        if (config.client_auth != ClientAuth::none) {
+            const int mode = verify_mode_for(config.client_auth);
+            if (config.client_auth == ClientAuth::require_any) {
+                ::SSL_CTX_set_verify(state.context, mode,
+                                     verify_callback_allow_any);
+            } else {
+                ::SSL_CTX_set_verify(state.context, mode, nullptr);
+            }
+            if (config.client_ca_file.empty()) {
+                if (::SSL_CTX_set_default_verify_paths(state.context) != 1) {
+                    return take_openssl_error();
+                }
+            } else {
+                if (::SSL_CTX_load_verify_locations(
+                        state.context, config.client_ca_file.c_str(),
+                        nullptr) != 1) {
+                    return take_openssl_error();
+                }
+                // Advertising the acceptable CA names is what lets a client
+                // pick the right certificate instead of guessing.
+                STACK_OF(X509_NAME)* names =
+                    ::SSL_load_client_CA_file(config.client_ca_file.c_str());
+                if (names == nullptr) return take_openssl_error();
+                ::SSL_CTX_set_client_CA_list(state.context, names);
+            }
+        }
+
+        // Session tickets.
+        if (config.session_tickets_disabled) {
+            ::SSL_CTX_set_options(state.context, SSL_OP_NO_TICKET);
+        } else if (!config.session_ticket_key.empty()) {
+            // A secret shorter than this would weaken every ticket sealed with
+            // it, so it is refused rather than stretched.
+            if (config.session_ticket_key.size() < 32) return Error{EINVAL};
+            // Passing no buffer asks OpenSSL how much key material it wants.
+            const long needed =
+                ::SSL_CTX_set_tlsext_ticket_keys(state.context, nullptr, 0);
+            if (needed <= 0) return take_openssl_error();
+            auto derived = derive_ticket_key(config.session_ticket_key,
+                                             static_cast<std::size_t>(needed));
+            if (!derived) return derived.error();
+            if (::SSL_CTX_set_tlsext_ticket_keys(state.context, derived->data(),
+                                                 needed) != 1) {
+                return take_openssl_error();
+            }
+        }
     }
 
     state.ssl = ::SSL_new(state.context);
     if (state.ssl == nullptr) return take_openssl_error();
+    // Callbacks receive only the SSL, so the state has to be reachable from it.
+    ::SSL_set_ex_data(state.ssl, state_ex_index(), &state);
 
     BIO* internal = nullptr;
     if (::BIO_new_bio_pair(&internal, 0, &state.network, 0) != 1) {
@@ -258,6 +488,18 @@ Result<void> configure(Conn::State& state) {
                                   static_cast<unsigned int>(
                                       state.alpn_wire.size())) != 0) {
             return take_openssl_error();
+        }
+
+        // Offer a cached session, if this endpoint has one. A server that no
+        // longer accepts it simply falls back to a full handshake.
+        if (state.config.session_cache) {
+            auto* cached = static_cast<SSL_SESSION*>(
+                state.config.session_cache->take(state.config.server_name));
+            if (cached != nullptr) {
+                ::SSL_set_session(state.ssl, cached);
+                // set_session takes its own reference.
+                ::SSL_SESSION_free(cached);
+            }
         }
         ::SSL_set_connect_state(state.ssl);
     } else {
@@ -502,6 +744,24 @@ std::string Conn::negotiated_protocol() const {
     return proto != nullptr
                ? std::string(reinterpret_cast<const char*>(proto), len)
                : std::string{};
+}
+
+bool Conn::did_resume() const {
+    if (state_ == nullptr || state_->ssl == nullptr) return false;
+    return ::SSL_session_reused(state_->ssl) == 1;
+}
+
+std::string Conn::peer_certificate_subject() const {
+    if (state_ == nullptr || state_->ssl == nullptr) return {};
+    X509* cert = ::SSL_get1_peer_certificate(state_->ssl);
+    if (cert == nullptr) return {};
+    char buffer[512];
+    const char* line =
+        ::X509_NAME_oneline(::X509_get_subject_name(cert), buffer,
+                            static_cast<int>(sizeof(buffer)));
+    std::string subject = line != nullptr ? std::string(line) : std::string{};
+    ::X509_free(cert);
+    return subject;
 }
 
 std::string Conn::server_name() const {

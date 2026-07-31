@@ -452,6 +452,131 @@ void test_sni_selects_certificate_by_name() {
     CIO_CHECK(cio::run(body()));
 }
 
+// Mutual TLS: the server demands a client certificate and verifies it against a
+// CA it trusts. A client without one must be refused.
+void test_mutual_tls_requires_and_verifies_client_certificate() {
+    Certificate server_cert;                  // for "localhost"
+    Certificate client_cert("client.example");
+    CIO_CHECK(server_cert.ready);
+    CIO_CHECK(client_cert.ready);
+
+    // present == false means the client offers no certificate at all.
+    auto attempt = [&](bool present) -> cio::Task<bool> {
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        if (!listener) co_return false;
+        const auto addr = listener->addr().value();
+
+        auto serving = cio::spawn(
+            [](net::TcpListener l, std::string sc, std::string sk,
+               std::string client_ca) -> cio::Task<std::string> {
+                auto conn = co_await l.accept();
+                if (!conn) co_return std::string{};
+                cio::tls::Config config;
+                config.certificate_file = std::move(sc);
+                config.private_key_file = std::move(sk);
+                config.client_auth = cio::tls::ClientAuth::require_and_verify;
+                config.client_ca_file = std::move(client_ca);
+                auto stream = cio::tls::server(std::move(*conn), config);
+                if (auto shaken = co_await stream.handshake(); !shaken) {
+                    co_return std::string{};
+                }
+                // The identity an authorization check would read.
+                co_return stream.peer_certificate_subject();
+            }(std::move(*listener), server_cert.cert.get(),
+              server_cert.key.get(), client_cert.cert.get()));
+
+        auto tcp = co_await net::TcpConn::dial(addr);
+        if (!tcp) co_return false;
+        cio::tls::Config config;
+        config.server_name = "localhost";
+        config.ca_file = server_cert.cert.get();
+        if (present) {
+            config.certificate_file = client_cert.cert.get();
+            config.private_key_file = client_cert.key.get();
+        }
+        auto stream = cio::tls::client(std::move(*tcp), config);
+        const bool client_ok = (co_await stream.handshake()).has_value();
+        stream.close();
+        const std::string subject = co_await serving;
+
+        if (!present) co_return !client_ok || subject.empty();
+        // With a certificate, both ends succeed and the server sees the name.
+        co_return client_ok && subject.find("client.example") != std::string::npos;
+    };
+
+    auto body = [&]() -> cio::Task<bool> {
+        CIO_CHECK(co_await attempt(true));   // presenting one works
+        CIO_CHECK(co_await attempt(false));  // omitting one is refused
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// Session resumption: a second connection sharing the cache skips the full
+// handshake. The ticket key has to be shared too, because every connection
+// builds its own OpenSSL context.
+void test_session_resumption_across_connections() {
+    Certificate certificate;
+    CIO_CHECK(certificate.ready);
+    auto cache = cio::tls::new_lru_client_session_cache(8);
+    const std::string ticket_key(48, 'k');
+
+    auto once = [&]() -> cio::Task<bool> {
+        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        if (!listener) co_return false;
+        const auto addr = listener->addr().value();
+
+        auto serving = cio::spawn(
+            [](net::TcpListener l, std::string cert, std::string key,
+               std::string tk) -> cio::Task<> {
+                auto conn = co_await l.accept();
+                if (!conn) co_return;
+                cio::tls::Config config;
+                config.certificate_file = std::move(cert);
+                config.private_key_file = std::move(key);
+                config.session_ticket_key = std::move(tk);
+                auto stream = cio::tls::server(std::move(*conn), config);
+                if (auto sh = co_await stream.handshake(); !sh) co_return;
+                // Say something, then close cleanly. TLS 1.3 delivers its
+                // session ticket after the handshake, as its own record, so the
+                // client only sees it by reading past the application data.
+                (void)co_await stream.write(bytes_of("hi"));
+                (void)co_await stream.shutdown();
+            }(std::move(*listener), certificate.cert.get(),
+              certificate.key.get(), ticket_key));
+
+        auto tcp = co_await net::TcpConn::dial(addr);
+        if (!tcp) co_return false;
+        cio::tls::Config config;
+        config.server_name = "localhost";
+        config.ca_file = certificate.cert.get();
+        config.session_cache = cache;
+        auto stream = cio::tls::client(std::move(*tcp), config);
+        if (auto shaken = co_await stream.handshake(); !shaken) co_return false;
+
+        const bool resumed = stream.did_resume();
+        // Read all the way to end of stream. Stopping at the application data
+        // would leave the ticket record unread, and nothing would be cached.
+        std::vector<std::byte> chunk(64);
+        for (;;) {
+            auto n = co_await stream.read(chunk);
+            if (!n || *n == 0) break;
+        }
+        stream.close();
+        co_await serving;
+        co_return resumed;
+    };
+
+    auto body = [&]() -> cio::Task<bool> {
+        // The first connection has nothing to resume from.
+        CIO_CHECK(!(co_await once()));
+        // The second resumes the ticket the first one cached.
+        CIO_CHECK(co_await once());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 int main() {
     RUN_TEST(test_handshake_and_round_trip);
     RUN_TEST(test_verification_rejects_untrusted_certificate);
@@ -459,5 +584,7 @@ int main() {
     RUN_TEST(test_alpn_negotiates_h2);
     RUN_TEST(test_alpn_no_overlap_is_not_fatal);
     RUN_TEST(test_sni_selects_certificate_by_name);
+    RUN_TEST(test_mutual_tls_requires_and_verifies_client_certificate);
+    RUN_TEST(test_session_resumption_across_connections);
     return cio_test::summary();
 }

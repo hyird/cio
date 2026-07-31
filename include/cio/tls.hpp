@@ -32,16 +32,58 @@
 
 namespace cio::tls {
 
-// A server certificate: a PEM chain and its private key, as Go's tls.Certificate
-// is (paths here rather than DER bytes, because cio has no certificate-loading
-// API and a file is the simplest handle). The SNI names it serves are read from
-// the certificate's own subjectAltNames, exactly as Go matches a ClientHello's
-// ServerName against each certificate's Leaf — a certificate already carries the
-// names it is valid for, so they are not repeated in configuration.
+// A certificate: a PEM chain and its private key, as Go's tls.Certificate is
+// (paths here rather than DER bytes, because cio has no certificate-loading API
+// and a file is the simplest handle). A server presents one; a client presents
+// one only when a server asks for it, which is mutual TLS.
+//
+// The SNI names a server certificate serves are read from its own
+// subjectAltNames, exactly as Go matches a ClientHello's ServerName against each
+// certificate's Leaf — a certificate already carries the names it is valid for,
+// so they are not repeated in configuration.
 struct Certificate {
     std::string certificate_file;  // PEM chain
     std::string private_key_file;  // PEM key
 };
+
+// Go's tls.ClientAuthType: what a server asks of a client's certificate.
+enum class ClientAuth {
+    none,                // NoClientCert
+    request,             // RequestClientCert: ask, accept whatever comes back
+    require_any,         // RequireAnyClientCert: demand one, do not verify it
+    verify_if_given,     // VerifyClientCertIfGiven
+    require_and_verify,  // RequireAndVerifyClientCert: mutual TLS
+};
+
+// Go's ClientSessionCache, as a concrete LRU rather than an interface: one
+// implementation does not need a vtable. Share one across the connections that
+// should resume each other's sessions — it is internally synchronized, so
+// several workers may use it at once.
+//
+// Resumption skips the certificate exchange on a reconnect, which is most of a
+// handshake's cost. A client only resumes when it is given a cache; Go's default
+// is likewise no cache.
+class SessionCache {
+public:
+    explicit SessionCache(std::size_t capacity = 64);
+    ~SessionCache();
+
+    SessionCache(const SessionCache&) = delete;
+    SessionCache& operator=(const SessionCache&) = delete;
+
+    // Internal: the void* is an OpenSSL SSL_SESSION, kept opaque so this header
+    // does not drag in OpenSSL. Not meant to be called by consumers.
+    void* take(const std::string& key);
+    void store(const std::string& key, void* session);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Go's NewLRUClientSessionCache.
+std::shared_ptr<SessionCache> new_lru_client_session_cache(
+    std::size_t capacity = 64);
 
 // One configuration for both roles, as Go's tls.Config is. Which fields matter
 // depends on the role: a client reads server_name, verify_peer, ca_file and
@@ -59,15 +101,44 @@ struct Config {
     // Client only.
     std::string ca_file;
 
-    // A single server certificate, the common case. Equivalent to one entry in
-    // `certificates`, and ignored when `certificates` is non-empty. Server only.
+    // A single certificate, the common case. Equivalent to one entry in
+    // `certificates`, and ignored when `certificates` is non-empty. A server
+    // presents it; a client presents it when asked, for mutual TLS.
     std::string certificate_file;
     std::string private_key_file;
-    // Go's Config.Certificates: one or more server certificates, selected by
-    // SNI against each certificate's own DNS names. Server only. When both this
-    // and certificate_file are set, this wins. The first entry is the default,
-    // used when no name matches, as Go uses Certificates[0].
+    // Go's Config.Certificates. On a server, one or more certificates selected
+    // by SNI against each certificate's own DNS names; the first is the default
+    // when no name matches, as Go uses Certificates[0]. On a client, the first
+    // entry is the certificate presented when a server requests one. When both
+    // this and certificate_file are set, this wins.
     std::vector<Certificate> certificates;
+
+    // Go's Config.ClientAuth: whether to ask a client for a certificate, and
+    // whether to insist it verifies. Server only.
+    ClientAuth client_auth = ClientAuth::none;
+    // Go's Config.ClientCAs: PEM bundle that client certificates are verified
+    // against, and whose names are advertised to the client so it knows which
+    // certificate to offer. Server only; empty uses the system store.
+    std::string client_ca_file;
+
+    // Go's Config.SessionTicketsDisabled. Server only.
+    bool session_tickets_disabled = false;
+    // Go's Config.SetSessionTicketKeys: the secret that session tickets are
+    // sealed under. At least 32 bytes; it is expanded with HKDF-SHA256 to
+    // whatever length the OpenSSL in use wants, which is not the same across
+    // versions, so one configuration keeps working when the library moves.
+    //
+    // Every connection builds its own OpenSSL context, so without this each
+    // would invent its own ticket key and no client could ever resume against a
+    // later connection. Setting the same secret on every connection of one
+    // server is what makes server-side resumption work. Keep it secret and
+    // rotate it: it protects every ticket issued under it. Server only.
+    std::string session_ticket_key;
+
+    // Go's Config.ClientSessionCache: enables resumption when set, and is where
+    // resumable sessions are kept. Share one cache across the connections that
+    // should resume each other's sessions. Client only.
+    std::shared_ptr<SessionCache> session_cache;
 
     // Go's Config.NextProtos: ALPN protocol identifiers, in preference order —
     // e.g. {"h2", "http/1.1"}. A client offers them; a server picks the first
@@ -127,6 +198,16 @@ public:
     // empty on a client or when none was sent. This is the name the server
     // certificate was selected for.
     std::string server_name() const;
+
+    // Go's ConnectionState().DidResume: whether this handshake resumed an
+    // earlier session instead of doing the full certificate exchange.
+    bool did_resume() const;
+
+    // The subject name of the peer's certificate, empty when it presented none.
+    // Go returns parsed x509 certificates here; cio returns the subject as a
+    // string, because a certificate type is not something this library should
+    // grow, and the subject is what an authorization check reads.
+    std::string peer_certificate_subject() const;
 
     // Opaque to every consumer: only tls.cpp ever sees the definition.
     struct State;

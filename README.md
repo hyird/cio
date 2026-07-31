@@ -432,7 +432,7 @@ EOF。保留的刻意偏差：`Once::call`（`do` 是 C++ 关键字）、`Timer:
 TLS（可选）：
 
 - 需要 `-DCIO_TLS=ON` 并链接 OpenSSL；核心库保持零依赖。
-- 下限为 TLS 1.2。无会话复用、无客户端证书（mTLS）。
+- 下限为 TLS 1.2。
 - ALPN 经 `Config::next_protos` 协商（对应 Go 的 `Config.NextProtos`），
   `Conn::negotiated_protocol()` 读取结果——HTTP/2 over TLS 只能在这里协商，
   两端都要有 `"h2"`，否则必须回落 HTTP/1.1。双方无交集时握手照常成功、协商
@@ -440,6 +440,16 @@ TLS（可选）：
 - 服务端多证书经 `Config::certificates` 按 SNI 选择，匹配的是证书自身的
   subjectAltName（对应 Go 拿 ClientHello 的 ServerName 比对每张证书），无匹
   配时用第一张作默认。`Conn::server_name()` 读取客户端发来的 SNI 名。
+- 双向认证经 `Config::client_auth`（对应 `Config.ClientAuth` 的五个取值）与
+  `client_ca_file` 配置；客户端把自己的证书放在同样的 `certificate_file` /
+  `certificates` 字段里，仅在服务端索要时出示。`Conn::peer_certificate_subject()`
+  返回对端证书的 subject——Go 在这里给的是解析后的 x509 对象，cio 给字符串，
+  因为证书类型不是这个库该长出来的东西，而 subject 正是鉴权要读的。
+- 会话复用经 `Config::session_cache`（对应 `Config.ClientSessionCache`，用
+  `new_lru_client_session_cache()` 创建并在连接间共享）；`Conn::did_resume()`
+  读取结果。服务端必须设 `Config::session_ticket_key`（≥32 字节密钥，内部用
+  HKDF-SHA256 扩展到当前 OpenSSL 要求的长度）：**每条连接各自建立 OpenSSL
+  上下文，不共享这个密钥就没有任何客户端能复用到后续连接**。
 
 设计约束与运行时不变量在 [AGENTS.md](AGENTS.md)。
 

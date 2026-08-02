@@ -24,33 +24,33 @@ struct SchedulerTestAccess {
         return scheduler.idle_workers_->any();
     }
 
-    static void push_next_private(
-        Scheduler& scheduler,
-        WorkerId worker,
-        void* frame) {
+    static void push_next_private(Scheduler& scheduler, WorkerId worker,
+                                  void* frame) {
         scheduler.workers_[worker]->push_next(frame);
     }
 
-    static void stage_fairness_preselection(
-        Scheduler& scheduler, WorkerId worker_id, void* inbox_frame,
-        void* runnext_frame) {
+    static void stage_fairness_preselection(Scheduler& scheduler,
+                                            WorkerId worker_id,
+                                            void* inbox_frame,
+                                            void* runnext_frame) {
         Worker& worker = *scheduler.workers_[worker_id];
         CIO_CHECK(worker.inbox_.try_push(inbox_frame));
         worker.runnext_.store(runnext_frame, std::memory_order_release);
     }
 
-    static void stage_fairness_with_private_fifo(
-        Scheduler& scheduler, WorkerId worker_id, void* inbox_frame,
-        void* fifo_frame) {
+    static void stage_fairness_with_private_fifo(Scheduler& scheduler,
+                                                 WorkerId worker_id,
+                                                 void* inbox_frame,
+                                                 void* fifo_frame) {
         Worker& worker = *scheduler.workers_[worker_id];
         CIO_CHECK(worker.inbox_.try_push(inbox_frame));
         CIO_CHECK(worker.queue_.push(fifo_frame));
         worker.runnext_.store(nullptr, std::memory_order_release);
     }
 
-    static void stage_global_fairness(
-        Scheduler& scheduler, WorkerId worker_id, void* global_frame,
-        void* runnext_frame, void* fifo_frame) {
+    static void stage_global_fairness(Scheduler& scheduler, WorkerId worker_id,
+                                      void* global_frame, void* runnext_frame,
+                                      void* fifo_frame) {
         Worker& worker = *scheduler.workers_[worker_id];
         scheduler.global_.push(global_frame);
         worker.runnext_.store(runnext_frame, std::memory_order_release);
@@ -58,95 +58,79 @@ struct SchedulerTestAccess {
         worker.fair_cursor_ = 0;
     }
 
-    static void* service_fairness(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static void* service_fairness(Scheduler& scheduler, WorkerId worker_id) {
         return scheduler.workers_[worker_id]->service_fairness();
     }
 
-    static void* service_global_fairness(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static void* service_global_fairness(Scheduler& scheduler,
+                                         WorkerId worker_id) {
         return scheduler.workers_[worker_id]->service_global_fairness();
     }
 
-    static std::uint32_t steal_fifo(
-        Scheduler& scheduler, WorkerId victim_id, void** frames,
-        std::uint32_t capacity) {
-        return scheduler.workers_[victim_id]->queue_.grab(
-            frames, capacity);
+    static std::uint32_t steal_fifo(Scheduler& scheduler, WorkerId victim_id,
+                                    void** frames, std::uint32_t capacity) {
+        return scheduler.workers_[victim_id]->queue_.grab(frames, capacity);
     }
 
-    static bool stealable(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static bool stealable(Scheduler& scheduler, WorkerId worker_id) {
         return scheduler.stealable_workers_->test(worker_id);
     }
 
-    static void publish_fifo(
-        Scheduler& scheduler, WorkerId worker_id, void* frame) {
+    static void publish_fifo(Scheduler& scheduler, WorkerId worker_id,
+                             void* frame) {
         Worker& worker = *scheduler.workers_[worker_id];
         CIO_CHECK(worker.queue_.push(frame));
         scheduler.publish_stealable(worker);
     }
 
-    static void* pop_fifo(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static void* pop_fifo(Scheduler& scheduler, WorkerId worker_id) {
         return scheduler.workers_[worker_id]->queue_.pop();
     }
 
     // Deliberately bypass Worker::repair_stealable(): this models a thief
     // clearing another worker's bit, so the owner-only fast-path flag remains
     // set and the next publication must notice clear_epoch.
-    static bool repair_fifo_as_thief(
-        Scheduler& scheduler, WorkerId worker_id) {
-        return scheduler.repair_stealable(
-            *scheduler.workers_[worker_id]);
+    static bool repair_fifo_as_thief(Scheduler& scheduler, WorkerId worker_id) {
+        return scheduler.repair_stealable(*scheduler.workers_[worker_id]);
     }
 
-    static std::uint64_t clear_epoch(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static std::uint64_t clear_epoch(Scheduler& scheduler, WorkerId worker_id) {
         return scheduler.workers_[worker_id]
             ->stealable_publication_.clear_epoch.load(
                 std::memory_order_seq_cst);
     }
 
-    static void publish_idle(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static void publish_idle(Scheduler& scheduler, WorkerId worker_id) {
         scheduler.idle_workers_->set(worker_id);
     }
 
-    static void clear_idle(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static void clear_idle(Scheduler& scheduler, WorkerId worker_id) {
         scheduler.idle_workers_->clear(worker_id);
     }
 
-    static void park_once(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static void park_once(Scheduler& scheduler, WorkerId worker_id) {
         scheduler.park(*scheduler.workers_[worker_id]);
     }
 
-    static void leave_park(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static void leave_park(Scheduler& scheduler, WorkerId worker_id) {
         scheduler.leave_park(*scheduler.workers_[worker_id]);
     }
 
-    static bool searcher_credit(
-        Scheduler& scheduler, WorkerId worker_id) {
-        return scheduler.workers_[worker_id]
-            ->searcher_credit_.load(std::memory_order_acquire);
+    static bool searcher_credit(Scheduler& scheduler, WorkerId worker_id) {
+        return scheduler.workers_[worker_id]->searcher_credit_.load(
+            std::memory_order_acquire);
     }
 
-    static void* consume_searcher_credit(
-        Scheduler& scheduler, WorkerId worker_id) {
-        return scheduler.workers_[worker_id]
-            ->consume_searcher_credit();
+    static void* consume_searcher_credit(Scheduler& scheduler,
+                                         WorkerId worker_id) {
+        return scheduler.workers_[worker_id]->consume_searcher_credit();
     }
 
-    static void* pop_inbox(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static void* pop_inbox(Scheduler& scheduler, WorkerId worker_id) {
         return scheduler.workers_[worker_id]->inbox_.pop();
     }
 
-    static bool inbox_empty(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static bool inbox_empty(Scheduler& scheduler, WorkerId worker_id) {
         return scheduler.workers_[worker_id]->inbox_.empty();
     }
 
@@ -158,128 +142,110 @@ struct SchedulerTestAccess {
         return scheduler.global_.empty();
     }
 
-    static void* runnext(
-        Scheduler& scheduler, WorkerId worker_id) {
-        return scheduler.workers_[worker_id]
-            ->runnext_.load(std::memory_order_acquire);
+    static void* runnext(Scheduler& scheduler, WorkerId worker_id) {
+        return scheduler.workers_[worker_id]->runnext_.load(
+            std::memory_order_acquire);
     }
 
-    static void stage_runnext(
-        Scheduler& scheduler, WorkerId worker_id,
-        void* runnext_frame) {
+    static void stage_runnext(Scheduler& scheduler, WorkerId worker_id,
+                              void* runnext_frame) {
         scheduler.workers_[worker_id]->runnext_.store(
             runnext_frame, std::memory_order_release);
     }
 
-    static void set_tick(
-        Scheduler& scheduler, WorkerId worker_id,
-        std::uint32_t tick) {
+    static void set_tick(Scheduler& scheduler, WorkerId worker_id,
+                         std::uint32_t tick) {
         scheduler.workers_[worker_id]->tick_ = tick;
     }
 
-    static std::uint32_t tick(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static std::uint32_t tick(Scheduler& scheduler, WorkerId worker_id) {
         return scheduler.workers_[worker_id]->tick_;
     }
 
-    static void stage_inbox(
-        Scheduler& scheduler, WorkerId worker_id,
-        void* frame) {
-        CIO_CHECK(
-            scheduler.workers_[worker_id]->inbox_.try_push(frame));
+    static void stage_inbox(Scheduler& scheduler, WorkerId worker_id,
+                            void* frame) {
+        CIO_CHECK(scheduler.workers_[worker_id]->inbox_.try_push(frame));
     }
 
-    static void stage_global(
-        Scheduler& scheduler, void* frame) {
+    static void stage_global(Scheduler& scheduler, void* frame) {
         scheduler.global_.push(frame);
     }
 
-    static void* select_round(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static void* select_round(Scheduler& scheduler, WorkerId worker_id) {
         Worker& worker = *scheduler.workers_[worker_id];
         void* item = worker.next_local();
         if (item == nullptr) item = worker.find_work();
         return item;
     }
 
-    static void monitor_pass(
-        Scheduler& scheduler, std::int64_t now) {
+    static void monitor_pass(Scheduler& scheduler, std::int64_t now) {
         scheduler.monitor_pass(now);
     }
 
-    static void start_workers_without_monitor(
-        Scheduler& scheduler) {
+    static void start_workers_without_monitor(Scheduler& scheduler) {
         const bool already_started =
-            scheduler.started_.exchange(
-                true, std::memory_order_acq_rel);
+            scheduler.started_.exchange(true, std::memory_order_acq_rel);
         CIO_CHECK(!already_started);
         if (already_started) return;
         for (auto& worker : scheduler.workers_) {
-            worker->thread_ =
-                std::thread([w = worker.get()] { w->run(); });
+            worker->thread_ = std::thread([w = worker.get()] { w->run(); });
         }
     }
 
-    static std::uint64_t driver_requested_epoch(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static std::uint64_t driver_requested_epoch(Scheduler& scheduler,
+                                                WorkerId worker_id) {
         return scheduler.workers_[worker_id]
-            ->reactor_->driver_requested_epoch_.load(
-                std::memory_order_acquire);
+            ->reactor_->driver_requested_epoch_.load(std::memory_order_acquire);
     }
 
-    static std::uint64_t driver_attempted_epoch(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static std::uint64_t driver_attempted_epoch(Scheduler& scheduler,
+                                                WorkerId worker_id) {
         return scheduler.workers_[worker_id]
-            ->reactor_->driver_attempted_epoch_.load(
-                std::memory_order_acquire);
+            ->reactor_->driver_attempted_epoch_.load(std::memory_order_acquire);
     }
 
-    static std::uint64_t driver_covered_epoch(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static std::uint64_t driver_covered_epoch(Scheduler& scheduler,
+                                              WorkerId worker_id) {
         return scheduler.workers_[worker_id]
-            ->reactor_->driver_covered_epoch_.load(
-                std::memory_order_acquire);
+            ->reactor_->driver_covered_epoch_.load(std::memory_order_acquire);
     }
 
-    static std::int64_t driver_requested_at(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static std::int64_t driver_requested_at(Scheduler& scheduler,
+                                            WorkerId worker_id) {
         return scheduler.workers_[worker_id]
-            ->reactor_->driver_requested_at_ns_.load(
-                std::memory_order_acquire);
+            ->reactor_->driver_requested_at_ns_.load(std::memory_order_acquire);
     }
 
-    static int driver_phase(
-        Scheduler& scheduler, WorkerId worker_id) {
+    static int driver_phase(Scheduler& scheduler, WorkerId worker_id) {
         using Phase = Reactor::DriverPhase;
-        const Phase phase = scheduler.workers_[worker_id]
-            ->reactor_->driver_phase_.load(
+        const Phase phase =
+            scheduler.workers_[worker_id]->reactor_->driver_phase_.load(
                 std::memory_order_acquire);
         switch (phase) {
-            case Phase::kUnavailable: return 0;
-            case Phase::kSuspended: return 1;
-            case Phase::kQueued: return 2;
-            case Phase::kRunning: return 3;
+            case Phase::kUnavailable:
+                return 0;
+            case Phase::kSuspended:
+                return 1;
+            case Phase::kQueued:
+                return 2;
+            case Phase::kRunning:
+                return 3;
         }
         return -1;
     }
 
-    static bool request_driver(
-        Scheduler& scheduler, WorkerId worker_id,
-        std::int64_t requested_at) {
-        return scheduler.workers_[worker_id]
-            ->reactor_->request_driver_at(requested_at);
+    static bool request_driver(Scheduler& scheduler, WorkerId worker_id,
+                               std::int64_t requested_at) {
+        return scheduler.workers_[worker_id]->reactor_->request_driver_at(
+            requested_at);
     }
 
-    static bool queue_driver(
-        Scheduler& scheduler, WorkerId worker_id) {
-        return scheduler.workers_[worker_id]
-            ->reactor_->queue_driver();
+    static bool queue_driver(Scheduler& scheduler, WorkerId worker_id) {
+        return scheduler.workers_[worker_id]->reactor_->queue_driver();
     }
 
-    static bool should_use_batch_monitor_policy(
-        int inherited_policy) {
-        return Scheduler::should_use_batch_monitor_policy(
-            inherited_policy);
+    static bool should_use_batch_monitor_policy(int inherited_policy) {
+        return Scheduler::should_use_batch_monitor_policy(inherited_policy);
     }
 };
 
@@ -310,11 +276,12 @@ struct PublishSuspendedFrame {
     void await_resume() const noexcept {}
 };
 
-void schedule_detached_to(
-    cio::detail::Scheduler* scheduler, cio::Task<> task,
-    cio::detail::WorkerId worker);
+void schedule_detached_to(cio::detail::Scheduler* scheduler, cio::Task<> task,
+                          cio::detail::WorkerId worker);
 
-cio::Task<int> add(int a, int b) { co_return a + b; }
+cio::Task<int> add(int a, int b) {
+    co_return a + b;
+}
 
 cio::Task<int> nested(int depth) {
     if (depth == 0) co_return 0;
@@ -424,7 +391,8 @@ void test_join_handle_can_detach_before_completion() {
             completed.store(true, std::memory_order_release);
         }());
         handle.detach();
-        while (!completed.load(std::memory_order_acquire)) co_await cio::yield();
+        while (!completed.load(std::memory_order_acquire))
+            co_await cio::yield();
     };
 
     cio::run(body());
@@ -459,20 +427,17 @@ void test_spawn_preserves_invalid_and_completed_task_semantics() {
         try {
             (void)co_await invalid_join;
         } catch (const std::logic_error& error) {
-            invalid_rethrown =
-                std::string_view(error.what()) ==
-                "cio: awaited an invalid Task";
+            invalid_rethrown = std::string_view(error.what()) ==
+                               "cio: awaited an invalid Task";
         }
 
-        auto completed =
-            []() -> cio::Task<int> { co_return 42; }();
+        auto completed = []() -> cio::Task<int> { co_return 42; }();
         CIO_CHECK_EQ(co_await completed, 42);
         // Resuming a coroutine already parked at final_suspend is undefined.
         // spawn() retains its historical cold wrapper for this valid but
         // already-completed Task instead of taking the direct completion path.
         auto completed_join = cio::spawn(std::move(completed));
-        co_return invalid_rethrown &&
-                  co_await completed_join == 42;
+        co_return invalid_rethrown&& co_await completed_join == 42;
     };
 
     CIO_CHECK(cio::run(body()));
@@ -487,8 +452,7 @@ struct ThrowOnSecondMove {
     ThrowOnSecondMove(const ThrowOnSecondMove&) = delete;
     ThrowOnSecondMove& operator=(const ThrowOnSecondMove&) = delete;
 
-    ThrowOnSecondMove(ThrowOnSecondMove&& other)
-        : moves(other.moves) {
+    ThrowOnSecondMove(ThrowOnSecondMove&& other) : moves(other.moves) {
         if (++*moves == 2) throw SpawnMoveFailure{};
     }
 };
@@ -496,8 +460,8 @@ struct ThrowOnSecondMove {
 void test_spawn_captures_result_move_failure() {
     auto body = []() -> cio::Task<bool> {
         int moves = 0;
-        auto joined = cio::spawn(
-            [](int* count) -> cio::Task<ThrowOnSecondMove> {
+        auto joined =
+            cio::spawn([](int* count) -> cio::Task<ThrowOnSecondMove> {
                 co_return ThrowOnSecondMove{count};
             }(&moves));
         try {
@@ -513,9 +477,7 @@ void test_spawn_captures_result_move_failure() {
 
 void test_completed_join_handle_can_be_awaited_again() {
     auto body = []() -> cio::Task<bool> {
-        auto handle = cio::spawn([]() -> cio::Task<int> {
-            co_return 42;
-        }());
+        auto handle = cio::spawn([]() -> cio::Task<int> { co_return 42; }());
 
         CIO_CHECK_EQ(co_await handle, 42);
         auto saved_awaiter = handle.operator co_await();
@@ -530,17 +492,16 @@ void test_concurrent_join_waiter_is_rejected() {
     auto body = []() -> cio::Task<bool> {
         std::atomic<bool> release{false};
         std::atomic<bool> first_entered{false};
-        auto handle = cio::spawn(
-            [](std::atomic<bool>* gate) -> cio::Task<int> {
-                while (!gate->load(std::memory_order_acquire)) {
-                    co_await cio::yield();
-                }
-                co_return 7;
-            }(&release));
+        auto handle = cio::spawn([](std::atomic<bool>* gate) -> cio::Task<int> {
+            while (!gate->load(std::memory_order_acquire)) {
+                co_await cio::yield();
+            }
+            co_return 7;
+        }(&release));
 
-        auto first = cio::spawn(
-            [](cio::JoinHandle<int>* shared,
-               std::atomic<bool>* entered) -> cio::Task<int> {
+        auto first =
+            cio::spawn([](cio::JoinHandle<int>* shared,
+                          std::atomic<bool>* entered) -> cio::Task<int> {
                 entered->store(true, std::memory_order_release);
                 co_return co_await *shared;
             }(&handle, &first_entered));
@@ -561,7 +522,7 @@ void test_concurrent_join_waiter_is_rejected() {
 
         release.store(true, std::memory_order_release);
         const int value = co_await first;
-        co_return rejected && value == 7;
+        co_return rejected&& value == 7;
     };
 
     cio::RuntimeOptions options;
@@ -572,8 +533,8 @@ void test_concurrent_join_waiter_is_rejected() {
 void test_saved_join_awaiter_survives_handle_detach() {
     auto body = []() -> cio::Task<bool> {
         std::atomic<bool> release{false};
-        auto incomplete = cio::spawn(
-            [](std::atomic<bool>* gate) -> cio::Task<int> {
+        auto incomplete =
+            cio::spawn([](std::atomic<bool>* gate) -> cio::Task<int> {
                 while (!gate->load(std::memory_order_acquire)) {
                     co_await cio::yield();
                 }
@@ -584,8 +545,7 @@ void test_saved_join_awaiter_survives_handle_detach() {
         release.store(true, std::memory_order_release);
         const int first = co_await incomplete_awaiter;
 
-        auto completed =
-            cio::spawn([]() -> cio::Task<int> { co_return 21; }());
+        auto completed = cio::spawn([]() -> cio::Task<int> { co_return 21; }());
         while (!completed.done()) co_await cio::yield();
         auto completed_awaiter = completed.operator co_await();
         completed.detach();
@@ -599,8 +559,7 @@ void test_saved_join_awaiter_survives_handle_detach() {
 
 void test_completed_void_join_snapshot_survives_detach() {
     auto body = []() -> cio::Task<bool> {
-        auto completed =
-            cio::spawn([]() -> cio::Task<> { co_return; }());
+        auto completed = cio::spawn([]() -> cio::Task<> { co_return; }());
         while (!completed.done()) co_await cio::yield();
 
         auto first = completed.operator co_await();
@@ -637,6 +596,43 @@ void test_completed_void_exception_snapshot_keeps_state() {
     CIO_CHECK(cio::run(body()));
 }
 
+void test_spawn_join_handoff_respects_local_batch() {
+    auto body = []() -> cio::Task<bool> {
+        std::vector<int> order;
+        const auto record = [](std::vector<int>* target,
+                               int value) -> cio::Task<> {
+            target->push_back(value);
+            co_return;
+        };
+
+        // The first child entered an empty local FIFO, so its completion may
+        // hand directly back to the joiner ahead of a later sibling.
+        auto lone = cio::spawn(record(&order, 1));
+        auto later = cio::spawn(record(&order, 3));
+        co_await lone;
+        order.push_back(2);
+        co_await later;
+        CIO_CHECK(order == std::vector<int>({1, 2, 3}));
+
+        order.clear();
+        // Only the first enqueue in a batch receives the direct-handoff hint.
+        // Awaiting the second must leave its continuation behind the sibling
+        // that was already queued, preserving batch completion.
+        auto first = cio::spawn(record(&order, 4));
+        auto batched = cio::spawn(record(&order, 5));
+        auto sibling = cio::spawn(record(&order, 6));
+        co_await batched;
+        order.push_back(7);
+        co_await first;
+        co_await sibling;
+        co_return order == std::vector<int>({4, 5, 6, 7});
+    };
+
+    cio::RuntimeOptions options;
+    options.worker_threads = 1;
+    CIO_CHECK(cio::run(body(), options));
+}
+
 struct RunnextFairnessState {
     std::atomic<bool> victim_enqueued{false};
     std::atomic<bool> victim_ran{false};
@@ -653,8 +649,8 @@ cio::Task<> runnext_fairness_victim(cio::Chan<> left, cio::Chan<> right,
     co_return;
 }
 
-cio::Task<> runnext_ping(cio::Chan<> left, cio::Chan<> right,
-                         cio::Chan<> done, RunnextFairnessState* state) {
+cio::Task<> runnext_ping(cio::Chan<> left, cio::Chan<> right, cio::Chan<> done,
+                         RunnextFairnessState* state) {
     bool launched_victim = false;
     while (co_await left.recv()) {
         if (!launched_victim) {
@@ -709,7 +705,7 @@ void test_runnext_handoff_does_not_starve_local_fifo() {
         (void)co_await done.recv();
         co_await pair.join();
         co_return state.victim_ran.load(std::memory_order_acquire) &&
-                  !state.watchdog_fired.load(std::memory_order_acquire);
+            !state.watchdog_fired.load(std::memory_order_acquire);
     };
 
     cio::RuntimeOptions options;
@@ -734,9 +730,9 @@ cio::Task<> remote_inbox_ping(cio::Chan<> left, cio::Chan<> right,
     }
 }
 
-cio::Task<> remote_inbox_fairness_victim(
-    cio::Chan<> left, cio::Chan<> right, cio::Chan<> done,
-    RemoteInboxFairnessState* state) {
+cio::Task<> remote_inbox_fairness_victim(cio::Chan<> left, cio::Chan<> right,
+                                         cio::Chan<> done,
+                                         RemoteInboxFairnessState* state) {
     state->remote_ran.store(true, std::memory_order_release);
     left.close();
     right.close();
@@ -772,9 +768,7 @@ void test_runnext_handoff_does_not_starve_remote_inbox() {
 
         schedule_detached_to(
             &runtime.scheduler(),
-            remote_inbox_fairness_victim(
-                left, right, done, &state),
-            0);
+            remote_inbox_fairness_victim(left, right, done, &state), 0);
         state.remote_enqueued.store(true, std::memory_order_release);
 
         const auto run_deadline = cio::Clock::now() + 250ms;
@@ -799,8 +793,8 @@ void test_runnext_handoff_does_not_starve_remote_inbox() {
         (void)co_await done.recv();
         co_await pair.join();
         co_return state.remote_enqueued.load(std::memory_order_acquire) &&
-                  state.remote_ran.load(std::memory_order_acquire) &&
-                  !state.watchdog_fired.load(std::memory_order_acquire);
+            state.remote_ran.load(std::memory_order_acquire) &&
+            !state.watchdog_fired.load(std::memory_order_acquire);
     };
 
     const bool fair = runtime.block_on(body());
@@ -821,16 +815,14 @@ void test_foreign_poller_preserves_directed_wake_for_owner() {
     CIO_CHECK(reactor.poll(0) > 0);
 }
 
-cio::Task<> suspend_io_target(
-    cio::detail::Scheduler* scheduler,
-    std::atomic<void*>* frame,
-    std::atomic<cio::detail::WorkerId>* resumed_on,
-    std::atomic<bool>* done) {
+cio::Task<> suspend_io_target(cio::detail::Scheduler* scheduler,
+                              std::atomic<void*>* frame,
+                              std::atomic<cio::detail::WorkerId>* resumed_on,
+                              std::atomic<bool>* done) {
     co_await SwitchToSchedulerWorker{scheduler, 1};
     co_await PublishSuspendedFrame{frame};
-    resumed_on->store(
-        cio::detail::current_worker_id(scheduler),
-        std::memory_order_release);
+    resumed_on->store(cio::detail::current_worker_id(scheduler),
+                      std::memory_order_release);
     done->store(true, std::memory_order_release);
 }
 
@@ -841,8 +833,7 @@ struct IoCompletionPlacement {
 };
 
 cio::Task<IoCompletionPlacement> inject_io_completion_from_worker_zero(
-    cio::detail::Scheduler* scheduler, void* frame,
-    std::atomic<bool>* done) {
+    cio::detail::Scheduler* scheduler, void* frame, std::atomic<bool>* done) {
     co_await SwitchToSchedulerWorker{scheduler, 0};
 
     IoCompletionPlacement placement;
@@ -850,8 +841,7 @@ cio::Task<IoCompletionPlacement> inject_io_completion_from_worker_zero(
     placement.route = scheduler->schedule_io_completion(
         std::coroutine_handle<>::from_address(frame), 1);
     scheduler->finish_io_batch(
-        placement.route ==
-                cio::detail::Scheduler::IoCompletionRoute::kLocalFifo
+        placement.route == cio::detail::Scheduler::IoCompletionRoute::kLocalFifo
             ? 1u
             : 0u);
 
@@ -871,8 +861,7 @@ void test_same_runtime_io_completion_follows_active_poller() {
     std::atomic<cio::detail::WorkerId> resumed_on{
         cio::detail::kInvalidWorkerId};
     std::atomic<bool> done{false};
-    runtime.go(suspend_io_target(
-        scheduler, &frame, &resumed_on, &done));
+    runtime.go(suspend_io_target(scheduler, &frame, &resumed_on, &done));
 
     const auto publish_deadline = cio::Clock::now() + 1s;
     while (frame.load(std::memory_order_acquire) == nullptr &&
@@ -884,19 +873,16 @@ void test_same_runtime_io_completion_follows_active_poller() {
     if (suspended == nullptr) return;
 
     const IoCompletionPlacement placement = runtime.block_on(
-        inject_io_completion_from_worker_zero(
-            scheduler, suspended, &done));
-    CIO_CHECK(
-        placement.route ==
-        cio::detail::Scheduler::IoCompletionRoute::kRunnext);
+        inject_io_completion_from_worker_zero(scheduler, suspended, &done));
+    CIO_CHECK(placement.route ==
+              cio::detail::Scheduler::IoCompletionRoute::kRunnext);
     CIO_CHECK_EQ(placement.poller, 0u);
-    CIO_CHECK_EQ(
-        resumed_on.load(std::memory_order_acquire), 0u);
+    CIO_CHECK_EQ(resumed_on.load(std::memory_order_acquire), 0u);
 }
 
-cio::Task<> io_completion_cpu_hog(
-    std::atomic<bool>* started, std::atomic<bool>* release,
-    std::atomic<bool>* finished) {
+cio::Task<> io_completion_cpu_hog(std::atomic<bool>* started,
+                                  std::atomic<bool>* release,
+                                  std::atomic<bool>* finished) {
     started->store(true, std::memory_order_release);
     while (!release->load(std::memory_order_acquire)) {
         std::this_thread::yield();
@@ -905,9 +891,8 @@ cio::Task<> io_completion_cpu_hog(
     co_return;
 }
 
-void schedule_detached_to(
-    cio::detail::Scheduler* scheduler, cio::Task<> task,
-    cio::detail::WorkerId worker) {
+void schedule_detached_to(cio::detail::Scheduler* scheduler, cio::Task<> task,
+                          cio::detail::WorkerId worker) {
     auto handle = task.release();
     CIO_CHECK(static_cast<bool>(handle));
     if (!handle) return;
@@ -929,22 +914,18 @@ struct SuspendWithCooperativeIoDebt {
     std::uint8_t debt = cio::detail::kCooperativeIoDebtNone;
 
     bool await_ready() const noexcept { return false; }
-    void await_suspend(
-        std::coroutine_handle<> handle) const noexcept {
+    void await_suspend(std::coroutine_handle<> handle) const noexcept {
         cio::detail::Scheduler* const selected = scheduler;
         const std::uint8_t selected_debt = debt;
-        selected->reschedule_self_for_cooperative_io(
-            handle, selected_debt);
+        selected->reschedule_self_for_cooperative_io(handle, selected_debt);
     }
     void await_resume() const noexcept {}
 };
 
-cio::Task<> record_cooperative_order(
-    std::atomic<int>* sequence,
-    std::atomic<int>* observed) {
-    observed->store(
-        sequence->fetch_add(1, std::memory_order_acq_rel) + 1,
-        std::memory_order_release);
+cio::Task<> record_cooperative_order(std::atomic<int>* sequence,
+                                     std::atomic<int>* observed) {
+    observed->store(sequence->fetch_add(1, std::memory_order_acq_rel) + 1,
+                    std::memory_order_release);
     co_return;
 }
 
@@ -952,28 +933,24 @@ cio::Task<bool> cooperative_no_demand_renews_inline(
     cio::detail::Scheduler* scheduler) {
     const cio::detail::WorkerId worker =
         cio::detail::current_worker_id(scheduler);
-    cio::detail::SchedulerTestAccess::set_tick(
-        *scheduler, worker, 7);
+    cio::detail::SchedulerTestAccess::set_tick(*scheduler, worker, 7);
 
     const std::uint32_t before =
-        cio::detail::SchedulerTestAccess::tick(
-            *scheduler, worker);
+        cio::detail::SchedulerTestAccess::tick(*scheduler, worker);
     cio::detail::t_cooperative_io_budget = 1;
     co_await cio::detail::CooperativeIoCheckpoint{};
     const bool first_inline =
-        cio::detail::SchedulerTestAccess::tick(
-            *scheduler, worker) == before &&
+        cio::detail::SchedulerTestAccess::tick(*scheduler, worker) == before &&
         cio::detail::t_cooperative_io_budget ==
             cio::detail::kCooperativeIoBudget + 1;
 
     cio::detail::t_cooperative_io_budget = 1;
     co_await cio::detail::CooperativeIoCheckpoint{};
     const bool second_inline =
-        cio::detail::SchedulerTestAccess::tick(
-            *scheduler, worker) == before &&
+        cio::detail::SchedulerTestAccess::tick(*scheduler, worker) == before &&
         cio::detail::t_cooperative_io_budget ==
             cio::detail::kCooperativeIoBudget + 1;
-    co_return first_inline && second_inline;
+    co_return first_inline&& second_inline;
 }
 
 void test_cooperative_io_no_demand_renews_inline() {
@@ -981,17 +958,14 @@ void test_cooperative_io_no_demand_renews_inline() {
     options.worker_threads = 1;
     cio::Runtime runtime(options);
     CIO_CHECK(runtime.block_on(
-        cooperative_no_demand_renews_inline(
-            &runtime.scheduler())));
+        cooperative_no_demand_renews_inline(&runtime.scheduler())));
 
     // A checkpoint is inactive on a foreign thread even though the process
     // default scheduler exists.
     cio::detail::t_cooperative_io_budget = 0;
     cio::detail::CooperativeIoCheckpoint foreign;
     CIO_CHECK(foreign.await_ready());
-    CIO_CHECK_EQ(
-        cio::detail::t_cooperative_io_budget,
-        UINT64_MAX);
+    CIO_CHECK_EQ(cio::detail::t_cooperative_io_budget, UINT64_MAX);
 }
 
 cio::Task<bool> cooperative_local_demand_grace_body(
@@ -1004,13 +978,10 @@ cio::Task<bool> cooperative_local_demand_grace_body(
 
     std::atomic<int> sequence{0};
     std::atomic<int> observer_order{0};
-    cio::go(record_cooperative_order(
-        &sequence, &observer_order));
+    cio::go(record_cooperative_order(&sequence, &observer_order));
 
-    cio::detail::SchedulerTestAccess::set_tick(
-        *scheduler, worker, 0);
-    const std::int64_t poll_before =
-        reactor.last_poll_ns();
+    cio::detail::SchedulerTestAccess::set_tick(*scheduler, worker, 0);
+    const std::int64_t poll_before = reactor.last_poll_ns();
     cio::detail::t_cooperative_io_budget = 1;
     co_await cio::detail::CooperativeIoCheckpoint{};
     const bool first_inline =
@@ -1026,10 +997,8 @@ cio::Task<bool> cooperative_local_demand_grace_body(
         sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
 
     const bool result =
-        first_inline &&
-        observer_order.load(std::memory_order_acquire) == 1 &&
-        current_order == 2 &&
-        reactor.owner_poll_request_ns() != 0 &&
+        first_inline && observer_order.load(std::memory_order_acquire) == 1 &&
+        current_order == 2 && reactor.owner_poll_request_ns() != 0 &&
         reactor.last_poll_ns() == poll_before;
     (void)reactor.take_owner_poll_request_ns();
     co_return result;
@@ -1040,42 +1009,31 @@ void test_cooperative_io_local_demand_gets_one_grace_budget() {
     options.worker_threads = 1;
     cio::Runtime runtime(options);
     CIO_CHECK(runtime.block_on(
-        cooperative_local_demand_grace_body(
-            &runtime.scheduler())));
+        cooperative_local_demand_grace_body(&runtime.scheduler())));
 }
 
-cio::Task<> hold_local_checkpoint_owner(
-    std::atomic<bool>* parent_resumed,
-    std::atomic<bool>* parent_escaped,
-    std::atomic<bool>* done) {
-    const auto deadline =
-        cio::Clock::now() + 1s;
-    while (!parent_resumed->load(
-               std::memory_order_acquire) &&
+cio::Task<> hold_local_checkpoint_owner(std::atomic<bool>* parent_resumed,
+                                        std::atomic<bool>* parent_escaped,
+                                        std::atomic<bool>* done) {
+    const auto deadline = cio::Clock::now() + 1s;
+    while (!parent_resumed->load(std::memory_order_acquire) &&
            cio::Clock::now() < deadline) {
-        std::atomic_signal_fence(
-            std::memory_order_seq_cst);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
     }
-    parent_escaped->store(
-        parent_resumed->load(
-            std::memory_order_acquire),
-        std::memory_order_release);
+    parent_escaped->store(parent_resumed->load(std::memory_order_acquire),
+                          std::memory_order_release);
     done->store(true, std::memory_order_release);
     co_return;
 }
 
-cio::Task<bool>
-cooperative_local_hog_parent_escape_body(
+cio::Task<bool> cooperative_local_hog_parent_escape_body(
     cio::detail::Scheduler* scheduler) {
-    const auto idle_deadline =
-        cio::Clock::now() + 1s;
-    while (!cio::detail::SchedulerTestAccess::
-                any_idle(*scheduler) &&
+    const auto idle_deadline = cio::Clock::now() + 1s;
+    while (!cio::detail::SchedulerTestAccess::any_idle(*scheduler) &&
            cio::Clock::now() < idle_deadline) {
         co_await cio::yield();
     }
-    if (!cio::detail::SchedulerTestAccess::
-             any_idle(*scheduler)) {
+    if (!cio::detail::SchedulerTestAccess::any_idle(*scheduler)) {
         co_return false;
     }
 
@@ -1083,17 +1041,18 @@ cooperative_local_hog_parent_escape_body(
     std::atomic<bool> parent_escaped{false};
     std::atomic<bool> hog_done{false};
     const cio::detail::WorkerId before =
-        cio::detail::current_worker_id(
-            scheduler);
+        cio::detail::current_worker_id(scheduler);
+    // Keep the next owner selection away from the periodic global-fairness
+    // checkpoint. Otherwise that checkpoint may legally select the published
+    // parent first and expose the displaced hog instead, which preserves
+    // progress but does not exercise the parent-steal path below.
+    cio::detail::SchedulerTestAccess::set_tick(*scheduler, before, 0);
 
-    void* const hog = release_detached_frame(
-        hold_local_checkpoint_owner(
-            &parent_resumed, &parent_escaped,
-            &hog_done));
+    void* const hog = release_detached_frame(hold_local_checkpoint_owner(
+        &parent_resumed, &parent_escaped, &hog_done));
     if (hog == nullptr) co_return false;
-    cio::detail::SchedulerTestAccess::
-        push_next_private(
-            *scheduler, before, hog);
+    cio::detail::SchedulerTestAccess::push_next_private(*scheduler, before,
+                                                        hog);
 
     // The first local-only boundary consumes the throughput grace. The second
     // must publish this parent because the other worker is idle.
@@ -1103,23 +1062,16 @@ cooperative_local_hog_parent_escape_body(
     co_await cio::detail::CooperativeIoCheckpoint{};
 
     const cio::detail::WorkerId after =
-        cio::detail::current_worker_id(
-            scheduler);
-    parent_resumed.store(
-        true, std::memory_order_release);
+        cio::detail::current_worker_id(scheduler);
+    parent_resumed.store(true, std::memory_order_release);
 
-    const auto done_deadline =
-        cio::Clock::now() + 1s;
-    while (!hog_done.load(
-               std::memory_order_acquire) &&
+    const auto done_deadline = cio::Clock::now() + 1s;
+    while (!hog_done.load(std::memory_order_acquire) &&
            cio::Clock::now() < done_deadline) {
         co_await cio::yield();
     }
-    co_return
-        hog_done.load(std::memory_order_acquire) &&
-        parent_escaped.load(
-            std::memory_order_acquire) &&
-        before != after;
+    co_return hog_done.load(std::memory_order_acquire) &&
+        parent_escaped.load(std::memory_order_acquire) && before != after;
 }
 
 void test_cooperative_io_local_hog_publishes_parent() {
@@ -1127,8 +1079,7 @@ void test_cooperative_io_local_hog_publishes_parent() {
     options.worker_threads = 2;
     cio::Runtime runtime(options);
     CIO_CHECK(runtime.block_on(
-        cooperative_local_hog_parent_escape_body(
-            &runtime.scheduler())));
+        cooperative_local_hog_parent_escape_body(&runtime.scheduler())));
 }
 
 cio::Task<bool> cooperative_hard_debt_order_body(
@@ -1150,36 +1101,27 @@ cio::Task<bool> cooperative_hard_debt_order_body(
         co_return false;
     }
 
-    cio::detail::SchedulerTestAccess::stage_runnext(
-        *scheduler, worker, local);
-    cio::detail::SchedulerTestAccess::stage_global(
-        *scheduler, global);
-    cio::detail::SchedulerTestAccess::stage_inbox(
-        *scheduler, worker, inbox);
-    cio::detail::SchedulerTestAccess::set_tick(
-        *scheduler, worker, 0);
+    cio::detail::SchedulerTestAccess::stage_runnext(*scheduler, worker, local);
+    cio::detail::SchedulerTestAccess::stage_global(*scheduler, global);
+    cio::detail::SchedulerTestAccess::stage_inbox(*scheduler, worker, inbox);
+    cio::detail::SchedulerTestAccess::set_tick(*scheduler, worker, 0);
 
-    const std::uint8_t expected =
-        cio::detail::kCooperativeIoDebtLocal |
-        cio::detail::kCooperativeIoDebtInbox |
-        cio::detail::kCooperativeIoDebtGlobal;
-    const std::uint8_t debt =
-        scheduler->prepare_cooperative_io_checkpoint();
+    const std::uint8_t expected = cio::detail::kCooperativeIoDebtLocal |
+                                  cio::detail::kCooperativeIoDebtInbox |
+                                  cio::detail::kCooperativeIoDebtGlobal;
+    const std::uint8_t debt = scheduler->prepare_cooperative_io_checkpoint();
     const bool exact_debt = debt == expected;
 
     // OR the expected mask for failure cleanup: every detached marker must be
     // drained before this coroutine's stack state goes out of scope.
     co_await SuspendWithCooperativeIoDebt{
-        scheduler,
-        static_cast<std::uint8_t>(debt | expected)};
+        scheduler, static_cast<std::uint8_t>(debt | expected)};
     const int current_order =
         sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
 
-    co_return exact_debt &&
-              inbox_order.load(std::memory_order_acquire) == 1 &&
-              local_order.load(std::memory_order_acquire) == 2 &&
-              global_order.load(std::memory_order_acquire) == 3 &&
-              current_order == 4;
+    co_return exact_debt&& inbox_order.load(std::memory_order_acquire) == 1 &&
+        local_order.load(std::memory_order_acquire) == 2 &&
+        global_order.load(std::memory_order_acquire) == 3 && current_order == 4;
 }
 
 void test_cooperative_io_stages_hard_debt_before_self() {
@@ -1187,14 +1129,12 @@ void test_cooperative_io_stages_hard_debt_before_self() {
     options.worker_threads = 1;
     cio::Runtime runtime(options);
     CIO_CHECK(runtime.block_on(
-        cooperative_hard_debt_order_body(
-            &runtime.scheduler())));
+        cooperative_hard_debt_order_body(&runtime.scheduler())));
 }
 
-cio::Task<> cooperative_nonlocal_hog(
-    std::atomic<bool>* started,
-    std::atomic<bool>* release,
-    std::atomic<bool>* finished) {
+cio::Task<> cooperative_nonlocal_hog(std::atomic<bool>* started,
+                                     std::atomic<bool>* release,
+                                     std::atomic<bool>* finished) {
     started->store(true, std::memory_order_release);
     while (!release->load(std::memory_order_acquire)) {
         cio::cpu_relax();
@@ -1204,37 +1144,29 @@ cio::Task<> cooperative_nonlocal_hog(
 }
 
 cio::Task<bool> cooperative_nonlocal_publication_body(
-    cio::detail::Scheduler* scheduler,
-    std::atomic<bool>* hog_started,
-    std::atomic<bool>* release_hog,
-    std::atomic<bool>* hog_finished,
+    cio::detail::Scheduler* scheduler, std::atomic<bool>* hog_started,
+    std::atomic<bool>* release_hog, std::atomic<bool>* hog_finished,
     std::atomic<bool>* continuation_resumed) {
     co_await SwitchToSchedulerWorker{scheduler, 0};
 
     void* const hog = release_detached_frame(
-        cooperative_nonlocal_hog(
-            hog_started, release_hog, hog_finished));
+        cooperative_nonlocal_hog(hog_started, release_hog, hog_finished));
     if (hog == nullptr) co_return false;
-    cio::detail::SchedulerTestAccess::stage_inbox(
-        *scheduler, 0, hog);
-    const std::uint8_t debt =
-        scheduler->prepare_cooperative_io_checkpoint();
+    cio::detail::SchedulerTestAccess::stage_inbox(*scheduler, 0, hog);
+    const std::uint8_t debt = scheduler->prepare_cooperative_io_checkpoint();
 
     co_await SuspendWithCooperativeIoDebt{
         scheduler,
-        static_cast<std::uint8_t>(
-            debt | cio::detail::kCooperativeIoDebtInbox)};
+        static_cast<std::uint8_t>(debt | cio::detail::kCooperativeIoDebtInbox)};
     const cio::detail::WorkerId resumed_on =
         cio::detail::current_worker_id(scheduler);
-    continuation_resumed->store(
-        true, std::memory_order_release);
+    continuation_resumed->store(true, std::memory_order_release);
     release_hog->store(true, std::memory_order_release);
 
     while (!hog_finished->load(std::memory_order_acquire)) {
         co_await cio::yield();
     }
-    co_return
-        (debt & cio::detail::kCooperativeIoDebtInbox) != 0 &&
+    co_return (debt & cio::detail::kCooperativeIoDebtInbox) != 0 &&
         resumed_on == 1;
 }
 
@@ -1249,31 +1181,25 @@ void test_cooperative_io_nonlocal_stage_publishes_self() {
     std::atomic<bool> continuation_resumed{false};
     std::atomic<bool> watchdog_fired{false};
     std::thread watchdog([&] {
-        const auto start_deadline =
-            cio::Clock::now() + 1s;
+        const auto start_deadline = cio::Clock::now() + 1s;
         while (!hog_started.load(std::memory_order_acquire) &&
                cio::Clock::now() < start_deadline) {
             std::this_thread::yield();
         }
-        const auto escape_deadline =
-            cio::Clock::now() + 250ms;
-        while (!continuation_resumed.load(
-                   std::memory_order_acquire) &&
+        const auto escape_deadline = cio::Clock::now() + 250ms;
+        while (!continuation_resumed.load(std::memory_order_acquire) &&
                cio::Clock::now() < escape_deadline) {
             std::this_thread::yield();
         }
-        if (!continuation_resumed.load(
-                std::memory_order_acquire)) {
-            watchdog_fired.store(
-                true, std::memory_order_release);
+        if (!continuation_resumed.load(std::memory_order_acquire)) {
+            watchdog_fired.store(true, std::memory_order_release);
             release_hog.store(true, std::memory_order_release);
         }
     });
 
-    const bool escaped = runtime.block_on(
-        cooperative_nonlocal_publication_body(
-            &runtime.scheduler(), &hog_started, &release_hog,
-            &hog_finished, &continuation_resumed));
+    const bool escaped = runtime.block_on(cooperative_nonlocal_publication_body(
+        &runtime.scheduler(), &hog_started, &release_hog, &hog_finished,
+        &continuation_resumed));
     release_hog.store(true, std::memory_order_release);
     watchdog.join();
 
@@ -1288,8 +1214,7 @@ struct CooperativeTicketResult {
 };
 
 cio::Task<> cooperative_empty_ticket_controller(
-    cio::detail::Scheduler* scheduler,
-    int fd,
+    cio::detail::Scheduler* scheduler, int fd,
     CooperativeTicketResult* result) {
     auto& reactor = scheduler->reactor_for(0);
     auto attached = reactor.attach(fd);
@@ -1300,23 +1225,18 @@ cio::Task<> cooperative_empty_ticket_controller(
 
     cio::detail::IoDesc* const desc = *attached;
     (void)reactor.take_owner_poll_request_ns();
-    const bool requested =
-        reactor.request_owner_poll_at(cio::now_ns());
+    const bool requested = reactor.request_owner_poll_at(cio::now_ns());
     const std::uint32_t tick_before =
-        cio::detail::SchedulerTestAccess::tick(
-            *scheduler, 0);
-    const std::int64_t poll_before =
-        reactor.last_poll_ns();
+        cio::detail::SchedulerTestAccess::tick(*scheduler, 0);
+    const std::int64_t poll_before = reactor.last_poll_ns();
 
     cio::detail::t_cooperative_io_budget = 1;
     co_await cio::detail::CooperativeIoCheckpoint{};
 
     const bool ok =
-        requested &&
-        reactor.owner_poll_request_ns() == 0 &&
+        requested && reactor.owner_poll_request_ns() == 0 &&
         reactor.last_poll_ns() > poll_before &&
-        cio::detail::SchedulerTestAccess::tick(
-            *scheduler, 0) == tick_before &&
+        cio::detail::SchedulerTestAccess::tick(*scheduler, 0) == tick_before &&
         cio::detail::t_cooperative_io_budget ==
             cio::detail::kCooperativeIoBudget + 1;
     reactor.detach(desc);
@@ -1326,18 +1246,15 @@ cio::Task<> cooperative_empty_ticket_controller(
 
 void test_cooperative_io_empty_ticket_poll_renews_inline() {
     int pipe_fds[2] = {-1, -1};
-    CIO_CHECK_EQ(
-        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    CIO_CHECK_EQ(::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
     if (pipe_fds[0] < 0) return;
 
     cio::detail::Scheduler scheduler(1, 1);
-    cio::detail::SchedulerTestAccess::
-        start_workers_without_monitor(scheduler);
+    cio::detail::SchedulerTestAccess::start_workers_without_monitor(scheduler);
     CooperativeTicketResult result;
     schedule_detached_to(
         &scheduler,
-        cooperative_empty_ticket_controller(
-            &scheduler, pipe_fds[0], &result),
+        cooperative_empty_ticket_controller(&scheduler, pipe_fds[0], &result),
         0);
 
     const auto deadline = cio::Clock::now() + 1s;
@@ -1352,27 +1269,23 @@ void test_cooperative_io_empty_ticket_poll_renews_inline() {
     ::close(pipe_fds[1]);
 }
 
-cio::Task<> cooperative_ticket_waiter(
-    cio::detail::IoDesc* desc,
-    std::atomic<int>* sequence,
-    std::atomic<int>* waiter_order,
-    std::atomic<bool>* done) {
+cio::Task<> cooperative_ticket_waiter(cio::detail::IoDesc* desc,
+                                      std::atomic<int>* sequence,
+                                      std::atomic<int>* waiter_order,
+                                      std::atomic<bool>* done) {
     const auto ready = co_await cio::detail::IoAwaiter{
         desc, cio::detail::Dir::kRead,
         desc->generation.load(std::memory_order_acquire)};
     if (ready) {
         waiter_order->store(
-            sequence->fetch_add(
-                1, std::memory_order_acq_rel) + 1,
+            sequence->fetch_add(1, std::memory_order_acq_rel) + 1,
             std::memory_order_release);
     }
     done->store(true, std::memory_order_release);
 }
 
 cio::Task<> cooperative_productive_ticket_controller(
-    cio::detail::Scheduler* scheduler,
-    int read_fd,
-    int write_fd,
+    cio::detail::Scheduler* scheduler, int read_fd, int write_fd,
     CooperativeTicketResult* result) {
     auto& reactor = scheduler->reactor_for(0);
     auto attached = reactor.attach(read_fd);
@@ -1388,28 +1301,23 @@ cio::Task<> cooperative_productive_ticket_controller(
     std::atomic<bool> waiter_done{false};
     schedule_detached_to(
         scheduler,
-        cooperative_ticket_waiter(
-            desc, &sequence, &waiter_order, &waiter_done),
+        cooperative_ticket_waiter(desc, &sequence, &waiter_order, &waiter_done),
         0);
     co_await cio::yield();
 
     const char byte = 'C';
-    const bool wrote =
-        ::write(write_fd, &byte, sizeof(byte)) ==
-        static_cast<ssize_t>(sizeof(byte));
-    const bool requested =
-        reactor.request_owner_poll_at(cio::now_ns());
+    const bool wrote = ::write(write_fd, &byte, sizeof(byte)) ==
+                       static_cast<ssize_t>(sizeof(byte));
+    const bool requested = reactor.request_owner_poll_at(cio::now_ns());
     cio::detail::t_cooperative_io_budget = 1;
     co_await cio::detail::CooperativeIoCheckpoint{};
     const int controller_order =
         sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
 
     const bool ok =
-        wrote && requested &&
-        waiter_done.load(std::memory_order_acquire) &&
+        wrote && requested && waiter_done.load(std::memory_order_acquire) &&
         waiter_order.load(std::memory_order_acquire) == 1 &&
-        controller_order == 2 &&
-        reactor.owner_poll_request_ns() == 0;
+        controller_order == 2 && reactor.owner_poll_request_ns() == 0;
     reactor.detach(desc);
     result->ok.store(ok, std::memory_order_release);
     result->done.store(true, std::memory_order_release);
@@ -1417,19 +1325,16 @@ cio::Task<> cooperative_productive_ticket_controller(
 
 void test_cooperative_io_productive_ticket_yields() {
     int pipe_fds[2] = {-1, -1};
-    CIO_CHECK_EQ(
-        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    CIO_CHECK_EQ(::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
     if (pipe_fds[0] < 0) return;
 
     cio::detail::Scheduler scheduler(1, 1);
-    cio::detail::SchedulerTestAccess::
-        start_workers_without_monitor(scheduler);
+    cio::detail::SchedulerTestAccess::start_workers_without_monitor(scheduler);
     CooperativeTicketResult result;
-    schedule_detached_to(
-        &scheduler,
-        cooperative_productive_ticket_controller(
-            &scheduler, pipe_fds[0], pipe_fds[1], &result),
-        0);
+    schedule_detached_to(&scheduler,
+                         cooperative_productive_ticket_controller(
+                             &scheduler, pipe_fds[0], pipe_fds[1], &result),
+                         0);
 
     const auto deadline = cio::Clock::now() + 1s;
     while (!result.done.load(std::memory_order_acquire) &&
@@ -1446,41 +1351,33 @@ void test_cooperative_io_productive_ticket_yields() {
 cio::Task<bool> cooperative_budget_reset_body() {
     cio::detail::t_cooperative_io_budget = 7;
     co_await cio::yield();
-    co_return
-        cio::detail::t_cooperative_io_budget ==
+    co_return cio::detail::t_cooperative_io_budget ==
         cio::detail::kCooperativeIoBudget + 1;
 }
 
 void test_cooperative_io_top_level_resume_resets_budget() {
     cio::RuntimeOptions options;
     options.worker_threads = 1;
-    CIO_CHECK(cio::run(
-        cooperative_budget_reset_body(), options));
+    CIO_CHECK(cio::run(cooperative_budget_reset_body(), options));
 }
 
 cio::Task<> await_driver_polled_pipe(
-    cio::detail::Scheduler* scheduler,
-    cio::detail::IoDesc* desc,
-    std::atomic<bool>* done,
-    std::atomic<bool>* result_ok,
+    cio::detail::Scheduler* scheduler, cio::detail::IoDesc* desc,
+    std::atomic<bool>* done, std::atomic<bool>* result_ok,
     std::atomic<cio::detail::WorkerId>* resumed_on) {
     co_await SwitchToSchedulerWorker{scheduler, 0};
     const auto ready = co_await cio::detail::IoAwaiter{
         desc, cio::detail::Dir::kRead,
         desc->generation.load(std::memory_order_acquire)};
-    resumed_on->store(
-        cio::detail::current_worker_id(scheduler),
-        std::memory_order_release);
-    result_ok->store(
-        ready.has_value(), std::memory_order_release);
+    resumed_on->store(cio::detail::current_worker_id(scheduler),
+                      std::memory_order_release);
+    result_ok->store(ready.has_value(), std::memory_order_release);
     done->store(true, std::memory_order_release);
 }
 
 cio::Task<> run_queued_driver_from_worker_one(
-    cio::detail::Scheduler* scheduler,
-    std::atomic<bool>* started,
-    std::atomic<bool>* run,
-    void* expected_waiter,
+    cio::detail::Scheduler* scheduler, std::atomic<bool>* started,
+    std::atomic<bool>* run, void* expected_waiter,
     std::atomic<bool>* resumed_driver,
     std::atomic<bool>* completion_was_local) {
     co_await SwitchToSchedulerWorker{scheduler, 1};
@@ -1495,10 +1392,9 @@ cio::Task<> run_queued_driver_from_worker_one(
         std::coroutine_handle<>::from_address(frame).resume();
         resumed_driver->store(true, std::memory_order_release);
         completion_was_local->store(
-            cio::detail::SchedulerTestAccess::runnext(
-                *scheduler, 1) == expected_waiter &&
-                cio::detail::SchedulerTestAccess::global_empty(
-                    *scheduler),
+            cio::detail::SchedulerTestAccess::runnext(*scheduler, 1) ==
+                    expected_waiter &&
+                cio::detail::SchedulerTestAccess::global_empty(*scheduler),
             std::memory_order_release);
     }
 }
@@ -1507,8 +1403,7 @@ void test_worker_driver_polls_and_places_completion_locally() {
     cio::detail::Scheduler scheduler(2, 1);
     auto& reactor = scheduler.reactor_for(0);
     int pipe_fds[2] = {-1, -1};
-    CIO_CHECK_EQ(
-        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    CIO_CHECK_EQ(::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
     if (pipe_fds[0] < 0) return;
 
     auto attached = reactor.attach(pipe_fds[0]);
@@ -1519,8 +1414,7 @@ void test_worker_driver_polls_and_places_completion_locally() {
         return;
     }
 
-    cio::detail::SchedulerTestAccess::
-        start_workers_without_monitor(scheduler);
+    cio::detail::SchedulerTestAccess::start_workers_without_monitor(scheduler);
 
     std::atomic<bool> waiter_done{false};
     std::atomic<bool> waiter_ok{false};
@@ -1528,33 +1422,30 @@ void test_worker_driver_polls_and_places_completion_locally() {
         cio::detail::kInvalidWorkerId};
     schedule_detached_to(
         &scheduler,
-        await_driver_polled_pipe(
-            &scheduler, *attached, &waiter_done,
-            &waiter_ok, &resumed_on),
+        await_driver_polled_pipe(&scheduler, *attached, &waiter_done,
+                                 &waiter_ok, &resumed_on),
         0);
 
     const auto setup_deadline = cio::Clock::now() + 2s;
     const auto waiter_parked = [&] {
         void* const slot =
-            (*attached)->slot[
-                static_cast<unsigned>(cio::detail::Dir::kRead)]
+            (*attached)
+                ->slot[static_cast<unsigned>(cio::detail::Dir::kRead)]
                 .load(std::memory_order_acquire);
         return slot != nullptr && slot != cio::detail::kIoReady;
     };
-    while (!waiter_parked() &&
-           cio::Clock::now() < setup_deadline) {
+    while (!waiter_parked() && cio::Clock::now() < setup_deadline) {
         std::this_thread::yield();
     }
     CIO_CHECK(waiter_parked());
     void* expected_waiter = nullptr;
     if (waiter_parked()) {
         void* const slot =
-            (*attached)->slot[
-                static_cast<unsigned>(cio::detail::Dir::kRead)]
+            (*attached)
+                ->slot[static_cast<unsigned>(cio::detail::Dir::kRead)]
                 .load(std::memory_order_acquire);
         expected_waiter =
-            static_cast<cio::detail::IoWait*>(slot)
-                ->handle.address();
+            static_cast<cio::detail::IoWait*>(slot)->handle.address();
     }
     CIO_CHECK(expected_waiter != nullptr);
 
@@ -1563,9 +1454,7 @@ void test_worker_driver_polls_and_places_completion_locally() {
     std::atomic<bool> hog_finished{false};
     schedule_detached_to(
         &scheduler,
-        io_completion_cpu_hog(
-            &hog_started, &release_hog, &hog_finished),
-        0);
+        io_completion_cpu_hog(&hog_started, &release_hog, &hog_finished), 0);
     while (!hog_started.load(std::memory_order_acquire) &&
            cio::Clock::now() < setup_deadline) {
         std::this_thread::yield();
@@ -1579,31 +1468,25 @@ void test_worker_driver_polls_and_places_completion_locally() {
     schedule_detached_to(
         &scheduler,
         run_queued_driver_from_worker_one(
-            &scheduler, &coordinator_started,
-            &run_driver, expected_waiter,
+            &scheduler, &coordinator_started, &run_driver, expected_waiter,
             &resumed_driver, &completion_was_local),
         1);
     while (!coordinator_started.load(std::memory_order_acquire) &&
            cio::Clock::now() < setup_deadline) {
         std::this_thread::yield();
     }
-    CIO_CHECK(
-        coordinator_started.load(std::memory_order_acquire));
+    CIO_CHECK(coordinator_started.load(std::memory_order_acquire));
 
     (void)reactor.take_owner_poll_request_ns();
     const std::int64_t before_poll = reactor.last_poll_ns();
     const char byte = 'd';
     CIO_CHECK_EQ(::write(pipe_fds[1], &byte, 1), 1);
-    const std::int64_t stale_now =
-        before_poll + 1'000'000;
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, stale_now);
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, stale_now + 50'000);
-    CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_phase(
-            scheduler, 0),
-        2);
+    const std::int64_t stale_now = before_poll + 1'000'000;
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler, stale_now);
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler,
+                                                   stale_now + 50'000);
+    CIO_CHECK_EQ(cio::detail::SchedulerTestAccess::driver_phase(scheduler, 0),
+                 2);
 
     run_driver.store(true, std::memory_order_release);
     const auto completion_deadline = cio::Clock::now() + 2s;
@@ -1636,29 +1519,23 @@ void test_worker_driver_polls_and_places_completion_locally() {
 
     CIO_CHECK(completed_before_backstop);
     CIO_CHECK(resumed_driver.load(std::memory_order_acquire));
-    CIO_CHECK(
-        completion_was_local.load(std::memory_order_acquire));
+    CIO_CHECK(completion_was_local.load(std::memory_order_acquire));
     CIO_CHECK(waiter_ok.load(std::memory_order_acquire));
+    CIO_CHECK_EQ(resumed_on.load(std::memory_order_acquire),
+                 cio::detail::WorkerId{1});
     CIO_CHECK_EQ(
-        resumed_on.load(std::memory_order_acquire),
-        cio::detail::WorkerId{1});
-    CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_attempted_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_attempted_epoch(scheduler, 0),
         1u);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_covered_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(scheduler, 0),
         1u);
 }
 
 cio::Task<> mark_foreign_submission_ran(
-    cio::detail::Scheduler* scheduler,
-    std::atomic<bool>* done,
+    cio::detail::Scheduler* scheduler, std::atomic<bool>* done,
     std::atomic<cio::detail::WorkerId>* resumed_on) {
-    resumed_on->store(
-        cio::detail::current_worker_id(scheduler),
-        std::memory_order_release);
+    resumed_on->store(cio::detail::current_worker_id(scheduler),
+                      std::memory_order_release);
     done->store(true, std::memory_order_release);
     co_return;
 }
@@ -1674,9 +1551,7 @@ void test_foreign_submission_escapes_arbitrary_busy_worker() {
     std::atomic<bool> hog_finished{false};
     schedule_detached_to(
         scheduler,
-        io_completion_cpu_hog(
-            &hog_started, &release_hog, &hog_finished),
-        0);
+        io_completion_cpu_hog(&hog_started, &release_hog, &hog_finished), 0);
     const auto hog_deadline = cio::Clock::now() + 1s;
     while (!hog_started.load(std::memory_order_acquire) &&
            cio::Clock::now() < hog_deadline) {
@@ -1690,8 +1565,7 @@ void test_foreign_submission_escapes_arbitrary_busy_worker() {
     // Called by this foreign test thread. It has no real affinity target and
     // must therefore remain available to worker 1 rather than being assigned
     // to worker 0's owner-only inbox.
-    runtime.go(mark_foreign_submission_ran(
-        scheduler, &done, &resumed_on));
+    runtime.go(mark_foreign_submission_ran(scheduler, &done, &resumed_on));
 
     const auto escape_deadline = cio::Clock::now() + 250ms;
     while (!done.load(std::memory_order_acquire) &&
@@ -1701,8 +1575,7 @@ void test_foreign_submission_escapes_arbitrary_busy_worker() {
     const bool escaped = done.load(std::memory_order_acquire);
     CIO_CHECK(escaped);
     if (escaped) {
-        CIO_CHECK_EQ(
-            resumed_on.load(std::memory_order_acquire), 1u);
+        CIO_CHECK_EQ(resumed_on.load(std::memory_order_acquire), 1u);
     }
     CIO_CHECK(!hog_finished.load(std::memory_order_acquire));
 
@@ -1717,8 +1590,8 @@ void test_foreign_submission_escapes_arbitrary_busy_worker() {
     CIO_CHECK(done.load(std::memory_order_acquire));
 }
 
-cio::Task<int> gated_blocking_job(
-    std::atomic<bool>* started, std::atomic<bool>* release) {
+cio::Task<int> gated_blocking_job(std::atomic<bool>* started,
+                                  std::atomic<bool>* release) {
     co_return co_await cio::blocking([started, release] {
         started->store(true, std::memory_order_release);
         const auto deadline = cio::Clock::now() + 2s;
@@ -1730,8 +1603,7 @@ cio::Task<int> gated_blocking_job(
     });
 }
 
-cio::Task<int> observable_blocking_job(
-    std::atomic<bool>* executed) {
+cio::Task<int> observable_blocking_job(std::atomic<bool>* executed) {
     co_return co_await cio::blocking([executed] {
         executed->store(true, std::memory_order_release);
         return 2;
@@ -1744,8 +1616,7 @@ cio::Task<bool> exercise_blocking_queue_limit() {
     std::atomic<bool> second_executed{false};
     std::atomic<bool> rejected_callable_executed{false};
 
-    auto first = cio::spawn(
-        gated_blocking_job(&first_started, &release_first));
+    auto first = cio::spawn(gated_blocking_job(&first_started, &release_first));
 
     const auto start_deadline = cio::Clock::now() + 1s;
     while (!first_started.load(std::memory_order_acquire) &&
@@ -1758,8 +1629,7 @@ cio::Task<bool> exercise_blocking_queue_limit() {
         co_return false;
     }
 
-    auto second = cio::spawn(
-        observable_blocking_job(&second_executed));
+    auto second = cio::spawn(observable_blocking_job(&second_executed));
 
     // yield() returns behind the newly spawned task, so its blocking job is
     // deterministically queued behind `first` before the third submission.
@@ -1768,8 +1638,7 @@ cio::Task<bool> exercise_blocking_queue_limit() {
     bool overloaded = false;
     try {
         (void)co_await cio::blocking([&] {
-            rejected_callable_executed.store(
-                true, std::memory_order_release);
+            rejected_callable_executed.store(true, std::memory_order_release);
             return 3;
         });
     } catch (const cio::SystemError& error) {
@@ -1782,9 +1651,9 @@ cio::Task<bool> exercise_blocking_queue_limit() {
     const int first_value = co_await first;
     const int second_value = co_await second;
 
-    co_return overloaded && second_was_queued &&
-              !rejected_callable_executed.load(std::memory_order_acquire) &&
-              first_value == 1 && second_value == 2;
+    co_return overloaded&& second_was_queued &&
+        !rejected_callable_executed.load(std::memory_order_acquire) &&
+        first_value == 1 && second_value == 2;
 }
 
 void test_blocking_queue_rejects_overload() {
@@ -1805,14 +1674,12 @@ void run_blocking_probe(cio::detail::BlockingJob* base) noexcept {
     probe->executed->store(true, std::memory_order_release);
 }
 
-bool reject_blocking_thread_launch(
-    cio::detail::BlockingPool*) noexcept {
+bool reject_blocking_thread_launch(cio::detail::BlockingPool*) noexcept {
     return false;
 }
 
 void test_blocking_pool_rejects_failed_first_thread_launch() {
-    cio::detail::BlockingPool pool(
-        1, 1, &reject_blocking_thread_launch);
+    cio::detail::BlockingPool pool(1, 1, &reject_blocking_thread_launch);
 
     std::atomic<bool> executed{false};
     BlockingRunProbe probe;
@@ -1820,8 +1687,7 @@ void test_blocking_pool_rejects_failed_first_thread_launch() {
     probe.executed = &executed;
 
     const auto result = pool.submit(&probe);
-    CIO_CHECK(result ==
-              cio::detail::BlockingSubmitResult::overloaded);
+    CIO_CHECK(result == cio::detail::BlockingSubmitResult::overloaded);
     CIO_CHECK_EQ(pool.thread_count(), std::size_t{0});
     CIO_CHECK(!executed.load(std::memory_order_acquire));
 }
@@ -1836,30 +1702,25 @@ void test_stopped_blocking_pool_rejects_without_running_inline() {
     probe.executed = &executed;
 
     const auto result = pool.submit(&probe);
-    CIO_CHECK(result ==
-              cio::detail::BlockingSubmitResult::shutdown);
+    CIO_CHECK(result == cio::detail::BlockingSubmitResult::shutdown);
     CIO_CHECK(!executed.load(std::memory_order_acquire));
 }
 
 cio::Task<> blocking_completion_waiter(
-    cio::detail::Scheduler* scheduler,
-    std::atomic<bool>* job_started,
-    std::atomic<bool>* release_job,
-    std::atomic<bool>* completion_done,
+    cio::detail::Scheduler* scheduler, std::atomic<bool>* job_started,
+    std::atomic<bool>* release_job, std::atomic<bool>* completion_done,
     std::atomic<cio::detail::WorkerId>* resumed_on) {
     co_await SwitchToSchedulerWorker{scheduler, 0};
-    const int value = co_await cio::blocking(
-        [job_started, release_job] {
-            job_started->store(true, std::memory_order_release);
-            while (!release_job->load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-            return 42;
-        });
+    const int value = co_await cio::blocking([job_started, release_job] {
+        job_started->store(true, std::memory_order_release);
+        while (!release_job->load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        return 42;
+    });
     CIO_CHECK_EQ(value, 42);
-    resumed_on->store(
-        cio::detail::current_worker_id(scheduler),
-        std::memory_order_release);
+    resumed_on->store(cio::detail::current_worker_id(scheduler),
+                      std::memory_order_release);
     completion_done->store(true, std::memory_order_release);
 }
 
@@ -1874,9 +1735,8 @@ void test_foreign_blocking_completion_escapes_busy_preference() {
     std::atomic<bool> completion_done{false};
     std::atomic<cio::detail::WorkerId> resumed_on{
         cio::detail::kInvalidWorkerId};
-    runtime.go(blocking_completion_waiter(
-        scheduler, &job_started, &release_job, &completion_done,
-        &resumed_on));
+    runtime.go(blocking_completion_waiter(scheduler, &job_started, &release_job,
+                                          &completion_done, &resumed_on));
 
     const auto job_deadline = cio::Clock::now() + 1s;
     while (!job_started.load(std::memory_order_acquire) &&
@@ -1890,9 +1750,7 @@ void test_foreign_blocking_completion_escapes_busy_preference() {
     std::atomic<bool> hog_finished{false};
     schedule_detached_to(
         scheduler,
-        io_completion_cpu_hog(
-            &hog_started, &release_hog, &hog_finished),
-        0);
+        io_completion_cpu_hog(&hog_started, &release_hog, &hog_finished), 0);
 
     const auto hog_deadline = cio::Clock::now() + 1s;
     while (!hog_started.load(std::memory_order_acquire) &&
@@ -1907,12 +1765,10 @@ void test_foreign_blocking_completion_escapes_busy_preference() {
            cio::Clock::now() < escape_deadline) {
         std::this_thread::yield();
     }
-    const bool escaped =
-        completion_done.load(std::memory_order_acquire);
+    const bool escaped = completion_done.load(std::memory_order_acquire);
     CIO_CHECK(escaped);
     if (escaped) {
-        CIO_CHECK_EQ(
-            resumed_on.load(std::memory_order_acquire), 1u);
+        CIO_CHECK_EQ(resumed_on.load(std::memory_order_acquire), 1u);
     }
     CIO_CHECK(!hog_finished.load(std::memory_order_acquire));
 
@@ -1927,8 +1783,7 @@ void test_foreign_blocking_completion_escapes_busy_preference() {
     CIO_CHECK(completion_done.load(std::memory_order_acquire));
 }
 
-cio::Task<int> cross_runtime_join_child(
-    std::atomic<bool>* release) {
+cio::Task<int> cross_runtime_join_child(std::atomic<bool>* release) {
     while (!release->load(std::memory_order_acquire)) {
         co_await cio::yield();
     }
@@ -1936,10 +1791,8 @@ cio::Task<int> cross_runtime_join_child(
 }
 
 cio::Task<> cross_runtime_join_waiter(
-    cio::detail::Scheduler* scheduler,
-    cio::JoinHandle<int> handle,
-    std::atomic<bool>* about_to_wait,
-    std::atomic<bool>* completion_done,
+    cio::detail::Scheduler* scheduler, cio::JoinHandle<int> handle,
+    std::atomic<bool>* about_to_wait, std::atomic<bool>* completion_done,
     std::atomic<cio::detail::WorkerId>* resumed_on) {
     co_await SwitchToSchedulerWorker{scheduler, 0};
     // The worker cannot execute the subsequently enqueued hog until this
@@ -1948,9 +1801,8 @@ cio::Task<> cross_runtime_join_waiter(
     about_to_wait->store(true, std::memory_order_release);
     const int value = co_await handle;
     CIO_CHECK_EQ(value, 42);
-    resumed_on->store(
-        cio::detail::current_worker_id(scheduler),
-        std::memory_order_release);
+    resumed_on->store(cio::detail::current_worker_id(scheduler),
+                      std::memory_order_release);
     completion_done->store(true, std::memory_order_release);
 }
 
@@ -1963,16 +1815,15 @@ void test_cross_runtime_join_completion_escapes_busy_preference() {
     cio::Runtime runtime_b(options_b);
 
     std::atomic<bool> release_child{false};
-    auto handle =
-        runtime_a.spawn(cross_runtime_join_child(&release_child));
+    auto handle = runtime_a.spawn(cross_runtime_join_child(&release_child));
 
     std::atomic<bool> about_to_wait{false};
     std::atomic<bool> completion_done{false};
     std::atomic<cio::detail::WorkerId> resumed_on{
         cio::detail::kInvalidWorkerId};
-    runtime_b.go(cross_runtime_join_waiter(
-        &runtime_b.scheduler(), std::move(handle), &about_to_wait,
-        &completion_done, &resumed_on));
+    runtime_b.go(cross_runtime_join_waiter(&runtime_b.scheduler(),
+                                           std::move(handle), &about_to_wait,
+                                           &completion_done, &resumed_on));
 
     const auto wait_deadline = cio::Clock::now() + 1s;
     while (!about_to_wait.load(std::memory_order_acquire) &&
@@ -1986,9 +1837,7 @@ void test_cross_runtime_join_completion_escapes_busy_preference() {
     std::atomic<bool> hog_finished{false};
     schedule_detached_to(
         &runtime_b.scheduler(),
-        io_completion_cpu_hog(
-            &hog_started, &release_hog, &hog_finished),
-        0);
+        io_completion_cpu_hog(&hog_started, &release_hog, &hog_finished), 0);
 
     const auto hog_deadline = cio::Clock::now() + 1s;
     while (!hog_started.load(std::memory_order_acquire) &&
@@ -2003,12 +1852,10 @@ void test_cross_runtime_join_completion_escapes_busy_preference() {
            cio::Clock::now() < escape_deadline) {
         std::this_thread::yield();
     }
-    const bool escaped =
-        completion_done.load(std::memory_order_acquire);
+    const bool escaped = completion_done.load(std::memory_order_acquire);
     CIO_CHECK(escaped);
     if (escaped) {
-        CIO_CHECK_EQ(
-            resumed_on.load(std::memory_order_acquire), 1u);
+        CIO_CHECK_EQ(resumed_on.load(std::memory_order_acquire), 1u);
     }
     CIO_CHECK(!hog_finished.load(std::memory_order_acquire));
 
@@ -2024,17 +1871,14 @@ void test_cross_runtime_join_completion_escapes_busy_preference() {
 }
 
 cio::Task<> wait_group_completion_waiter(
-    cio::detail::Scheduler* scheduler,
-    cio::WaitGroup* group,
-    std::atomic<bool>* about_to_wait,
-    std::atomic<bool>* completion_done,
+    cio::detail::Scheduler* scheduler, cio::WaitGroup* group,
+    std::atomic<bool>* about_to_wait, std::atomic<bool>* completion_done,
     std::atomic<cio::detail::WorkerId>* resumed_on) {
     co_await SwitchToSchedulerWorker{scheduler, 0};
     about_to_wait->store(true, std::memory_order_release);
     co_await group->wait();
-    resumed_on->store(
-        cio::detail::current_worker_id(scheduler),
-        std::memory_order_release);
+    resumed_on->store(cio::detail::current_worker_id(scheduler),
+                      std::memory_order_release);
     completion_done->store(true, std::memory_order_release);
 }
 
@@ -2050,9 +1894,8 @@ void test_foreign_wait_group_wake_escapes_busy_preference() {
     std::atomic<bool> completion_done{false};
     std::atomic<cio::detail::WorkerId> resumed_on{
         cio::detail::kInvalidWorkerId};
-    runtime.go(wait_group_completion_waiter(
-        scheduler, &group, &about_to_wait, &completion_done,
-        &resumed_on));
+    runtime.go(wait_group_completion_waiter(scheduler, &group, &about_to_wait,
+                                            &completion_done, &resumed_on));
 
     const auto wait_deadline = cio::Clock::now() + 1s;
     while (!about_to_wait.load(std::memory_order_acquire) &&
@@ -2066,9 +1909,7 @@ void test_foreign_wait_group_wake_escapes_busy_preference() {
     std::atomic<bool> hog_finished{false};
     schedule_detached_to(
         scheduler,
-        io_completion_cpu_hog(
-            &hog_started, &release_hog, &hog_finished),
-        0);
+        io_completion_cpu_hog(&hog_started, &release_hog, &hog_finished), 0);
     const auto hog_deadline = cio::Clock::now() + 1s;
     while (!hog_started.load(std::memory_order_acquire) &&
            cio::Clock::now() < hog_deadline) {
@@ -2082,12 +1923,10 @@ void test_foreign_wait_group_wake_escapes_busy_preference() {
            cio::Clock::now() < escape_deadline) {
         std::this_thread::yield();
     }
-    const bool escaped =
-        completion_done.load(std::memory_order_acquire);
+    const bool escaped = completion_done.load(std::memory_order_acquire);
     CIO_CHECK(escaped);
     if (escaped) {
-        CIO_CHECK_EQ(
-            resumed_on.load(std::memory_order_acquire), 1u);
+        CIO_CHECK_EQ(resumed_on.load(std::memory_order_acquire), 1u);
     }
     CIO_CHECK(!hog_finished.load(std::memory_order_acquire));
 
@@ -2103,17 +1942,14 @@ void test_foreign_wait_group_wake_escapes_busy_preference() {
 }
 
 cio::Task<> closed_channel_completion_waiter(
-    cio::detail::Scheduler* scheduler,
-    cio::Chan<> channel,
-    std::atomic<bool>* about_to_wait,
-    std::atomic<bool>* completion_done,
+    cio::detail::Scheduler* scheduler, cio::Chan<> channel,
+    std::atomic<bool>* about_to_wait, std::atomic<bool>* completion_done,
     std::atomic<cio::detail::WorkerId>* resumed_on) {
     co_await SwitchToSchedulerWorker{scheduler, 0};
     about_to_wait->store(true, std::memory_order_release);
     CIO_CHECK(!(co_await channel.recv()));
-    resumed_on->store(
-        cio::detail::current_worker_id(scheduler),
-        std::memory_order_release);
+    resumed_on->store(cio::detail::current_worker_id(scheduler),
+                      std::memory_order_release);
     completion_done->store(true, std::memory_order_release);
 }
 
@@ -2129,8 +1965,7 @@ void test_foreign_channel_close_escapes_busy_preference() {
     std::atomic<cio::detail::WorkerId> resumed_on{
         cio::detail::kInvalidWorkerId};
     runtime.go(closed_channel_completion_waiter(
-        scheduler, channel, &about_to_wait, &completion_done,
-        &resumed_on));
+        scheduler, channel, &about_to_wait, &completion_done, &resumed_on));
 
     const auto wait_deadline = cio::Clock::now() + 1s;
     while (!about_to_wait.load(std::memory_order_acquire) &&
@@ -2144,9 +1979,7 @@ void test_foreign_channel_close_escapes_busy_preference() {
     std::atomic<bool> hog_finished{false};
     schedule_detached_to(
         scheduler,
-        io_completion_cpu_hog(
-            &hog_started, &release_hog, &hog_finished),
-        0);
+        io_completion_cpu_hog(&hog_started, &release_hog, &hog_finished), 0);
     const auto hog_deadline = cio::Clock::now() + 1s;
     while (!hog_started.load(std::memory_order_acquire) &&
            cio::Clock::now() < hog_deadline) {
@@ -2160,12 +1993,10 @@ void test_foreign_channel_close_escapes_busy_preference() {
            cio::Clock::now() < escape_deadline) {
         std::this_thread::yield();
     }
-    const bool escaped =
-        completion_done.load(std::memory_order_acquire);
+    const bool escaped = completion_done.load(std::memory_order_acquire);
     CIO_CHECK(escaped);
     if (escaped) {
-        CIO_CHECK_EQ(
-            resumed_on.load(std::memory_order_acquire), 1u);
+        CIO_CHECK_EQ(resumed_on.load(std::memory_order_acquire), 1u);
     }
     CIO_CHECK(!hog_finished.load(std::memory_order_acquire));
 
@@ -2181,14 +2012,14 @@ void test_foreign_channel_close_escapes_busy_preference() {
 }
 
 cio::Task<cio::detail::Scheduler::IoCompletionRoute>
-inject_io_completion_behind_runnext_hog(
-    cio::detail::Scheduler* scheduler, void* frame,
-    std::atomic<bool>* hog_started, std::atomic<bool>* release_hog,
-    std::atomic<bool>* hog_finished) {
+inject_io_completion_behind_runnext_hog(cio::detail::Scheduler* scheduler,
+                                        void* frame,
+                                        std::atomic<bool>* hog_started,
+                                        std::atomic<bool>* release_hog,
+                                        std::atomic<bool>* hog_finished) {
     co_await SwitchToSchedulerWorker{scheduler, 0};
 
-    auto hog = io_completion_cpu_hog(
-        hog_started, release_hog, hog_finished);
+    auto hog = io_completion_cpu_hog(hog_started, release_hog, hog_finished);
     auto hog_handle = hog.release();
     hog_handle.promise().detached = true;
     scheduler->schedule_next(hog_handle);
@@ -2196,10 +2027,8 @@ inject_io_completion_behind_runnext_hog(
     const auto route = scheduler->schedule_io_completion(
         std::coroutine_handle<>::from_address(frame), 1);
     scheduler->finish_io_batch(
-        route ==
-                cio::detail::Scheduler::IoCompletionRoute::kLocalFifo
-            ? 1u
-            : 0u);
+        route == cio::detail::Scheduler::IoCompletionRoute::kLocalFifo ? 1u
+                                                                       : 0u);
     co_return route;
 }
 
@@ -2213,8 +2042,8 @@ void test_io_completion_behind_runnext_is_published() {
     std::atomic<cio::detail::WorkerId> resumed_on{
         cio::detail::kInvalidWorkerId};
     std::atomic<bool> completion_done{false};
-    runtime.go(suspend_io_target(
-        scheduler, &frame, &resumed_on, &completion_done));
+    runtime.go(
+        suspend_io_target(scheduler, &frame, &resumed_on, &completion_done));
 
     const auto publish_deadline = cio::Clock::now() + 1s;
     while (frame.load(std::memory_order_acquire) == nullptr &&
@@ -2228,21 +2057,16 @@ void test_io_completion_behind_runnext_is_published() {
     std::atomic<bool> hog_started{false};
     std::atomic<bool> release_hog{false};
     std::atomic<bool> hog_finished{false};
-    const auto route = runtime.block_on(
-        inject_io_completion_behind_runnext_hog(
-            scheduler, suspended, &hog_started, &release_hog,
-            &hog_finished));
-    CIO_CHECK(
-        route ==
-        cio::detail::Scheduler::IoCompletionRoute::kLocalFifo);
+    const auto route = runtime.block_on(inject_io_completion_behind_runnext_hog(
+        scheduler, suspended, &hog_started, &release_hog, &hog_finished));
+    CIO_CHECK(route == cio::detail::Scheduler::IoCompletionRoute::kLocalFifo);
 
     const auto escape_deadline = cio::Clock::now() + 250ms;
     while (!completion_done.load(std::memory_order_acquire) &&
            cio::Clock::now() < escape_deadline) {
         std::this_thread::yield();
     }
-    const bool escaped =
-        completion_done.load(std::memory_order_acquire);
+    const bool escaped = completion_done.load(std::memory_order_acquire);
     CIO_CHECK(hog_started.load(std::memory_order_acquire));
     CIO_CHECK(escaped);
 
@@ -2257,11 +2081,11 @@ void test_io_completion_behind_runnext_is_published() {
     CIO_CHECK(completion_done.load(std::memory_order_acquire));
 }
 
-cio::Task<> inject_singleton_batch_then_hog(
-    cio::detail::Scheduler* scheduler, void* frame,
-    std::atomic<bool>* hog_started,
-    std::atomic<bool>* release_hog,
-    std::atomic<bool>* hog_finished) {
+cio::Task<> inject_singleton_batch_then_hog(cio::detail::Scheduler* scheduler,
+                                            void* frame,
+                                            std::atomic<bool>* hog_started,
+                                            std::atomic<bool>* release_hog,
+                                            std::atomic<bool>* hog_finished) {
     co_await SwitchToSchedulerWorker{scheduler, 0};
     void* frames[1] = {frame};
     scheduler->schedule_batch(frames, 1);
@@ -2283,8 +2107,8 @@ void test_singleton_generic_batch_is_published() {
     std::atomic<cio::detail::WorkerId> resumed_on{
         cio::detail::kInvalidWorkerId};
     std::atomic<bool> completion_done{false};
-    runtime.go(suspend_io_target(
-        scheduler, &frame, &resumed_on, &completion_done));
+    runtime.go(
+        suspend_io_target(scheduler, &frame, &resumed_on, &completion_done));
 
     const auto publish_deadline = cio::Clock::now() + 1s;
     while (frame.load(std::memory_order_acquire) == nullptr &&
@@ -2299,8 +2123,7 @@ void test_singleton_generic_batch_is_published() {
     std::atomic<bool> release_hog{false};
     std::atomic<bool> hog_finished{false};
     runtime.go(inject_singleton_batch_then_hog(
-        scheduler, suspended, &hog_started, &release_hog,
-        &hog_finished));
+        scheduler, suspended, &hog_started, &release_hog, &hog_finished));
 
     const auto escape_deadline = cio::Clock::now() + 250ms;
     while ((!hog_started.load(std::memory_order_acquire) ||
@@ -2334,16 +2157,13 @@ void test_fairness_preselection_publishes_displaced_runnext() {
     cio::detail::SchedulerTestAccess::stage_fairness_preselection(
         scheduler, 0, &inbox_frame, &completion_frame);
 
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::service_fairness(
-            scheduler, 0) == &inbox_frame);
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::stealable(scheduler, 0));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::service_fairness(
+                  scheduler, 0) == &inbox_frame);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::stealable(scheduler, 0));
 
     void* stolen[1] = {nullptr};
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::steal_fifo(
-            scheduler, 0, stolen, 1),
+        cio::detail::SchedulerTestAccess::steal_fifo(scheduler, 0, stolen, 1),
         1u);
     CIO_CHECK(stolen[0] == &completion_frame);
 }
@@ -2355,16 +2175,13 @@ void test_fairness_preselection_publishes_private_fifo() {
     cio::detail::SchedulerTestAccess::stage_fairness_with_private_fifo(
         scheduler, 0, &inbox_frame, &private_frame);
 
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::service_fairness(
-            scheduler, 0) == &inbox_frame);
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::stealable(scheduler, 0));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::service_fairness(
+                  scheduler, 0) == &inbox_frame);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::stealable(scheduler, 0));
 
     void* stolen[1] = {nullptr};
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::steal_fifo(
-            scheduler, 0, stolen, 1),
+        cio::detail::SchedulerTestAccess::steal_fifo(scheduler, 0, stolen, 1),
         1u);
     CIO_CHECK(stolen[0] == &private_frame);
 }
@@ -2377,32 +2194,25 @@ void test_global_fairness_publishes_bypassed_local_work() {
     cio::detail::SchedulerTestAccess::stage_global_fairness(
         scheduler, 0, &global_frame, &runnext_frame, &fifo_frame);
 
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::service_global_fairness(
-            scheduler, 0) == &global_frame);
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::stealable(scheduler, 0));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::service_global_fairness(
+                  scheduler, 0) == &global_frame);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::stealable(scheduler, 0));
 
     void* stolen[2] = {nullptr, nullptr};
     std::uint32_t count =
-        cio::detail::SchedulerTestAccess::steal_fifo(
-            scheduler, 0, stolen, 2);
+        cio::detail::SchedulerTestAccess::steal_fifo(scheduler, 0, stolen, 2);
     count += cio::detail::SchedulerTestAccess::steal_fifo(
         scheduler, 0, stolen + count, 2 - count);
     CIO_CHECK_EQ(count, 2u);
-    CIO_CHECK(
-        (stolen[0] == &runnext_frame &&
-         stolen[1] == &fifo_frame) ||
-        (stolen[0] == &fifo_frame &&
-         stolen[1] == &runnext_frame));
+    CIO_CHECK((stolen[0] == &runnext_frame && stolen[1] == &fifo_frame) ||
+              (stolen[0] == &fifo_frame && stolen[1] == &runnext_frame));
 }
 
 void test_attach_arms_owner_poll_ticket() {
     cio::detail::Scheduler scheduler(1, 1);
     auto& reactor = scheduler.reactor_for(0);
     int pipe_fds[2] = {-1, -1};
-    CIO_CHECK_EQ(
-        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    CIO_CHECK_EQ(::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
     if (pipe_fds[0] < 0) return;
 
     CIO_CHECK_EQ(reactor.take_owner_poll_request_ns(), 0);
@@ -2421,8 +2231,7 @@ void test_owner_poll_ticket_runs_at_fairness_checkpoint() {
     cio::detail::Scheduler scheduler(1, 1);
     auto& reactor = scheduler.reactor_for(0);
     int pipe_fds[2] = {-1, -1};
-    CIO_CHECK_EQ(
-        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    CIO_CHECK_EQ(::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
     if (pipe_fds[0] < 0) return;
 
     auto attached = reactor.attach(pipe_fds[0]);
@@ -2439,13 +2248,11 @@ void test_owner_poll_ticket_runs_at_fairness_checkpoint() {
     }
 
     int runnext_frame = 1;
-    cio::detail::SchedulerTestAccess::stage_runnext(
-        scheduler, 0, &runnext_frame);
-    cio::detail::SchedulerTestAccess::set_tick(
-        scheduler, 0, 31);
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::select_round(
-            scheduler, 0) == &runnext_frame);
+    cio::detail::SchedulerTestAccess::stage_runnext(scheduler, 0,
+                                                    &runnext_frame);
+    cio::detail::SchedulerTestAccess::set_tick(scheduler, 0, 31);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::select_round(scheduler, 0) ==
+              &runnext_frame);
     CIO_CHECK(reactor.last_poll_ns() > before_poll);
     CIO_CHECK_EQ(reactor.take_owner_poll_request_ns(), 0);
 
@@ -2458,8 +2265,7 @@ void test_owner_checkpoint_polls_without_ticket() {
     cio::detail::Scheduler scheduler(1, 1);
     auto& reactor = scheduler.reactor_for(0);
     int pipe_fds[2] = {-1, -1};
-    CIO_CHECK_EQ(
-        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    CIO_CHECK_EQ(::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
     if (pipe_fds[0] < 0) return;
 
     auto attached = reactor.attach(pipe_fds[0]);
@@ -2477,13 +2283,11 @@ void test_owner_checkpoint_polls_without_ticket() {
     }
 
     int runnext_frame = 1;
-    cio::detail::SchedulerTestAccess::stage_runnext(
-        scheduler, 0, &runnext_frame);
-    cio::detail::SchedulerTestAccess::set_tick(
-        scheduler, 0, 31);
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::select_round(
-            scheduler, 0) == &runnext_frame);
+    cio::detail::SchedulerTestAccess::stage_runnext(scheduler, 0,
+                                                    &runnext_frame);
+    cio::detail::SchedulerTestAccess::set_tick(scheduler, 0, 31);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::select_round(scheduler, 0) ==
+              &runnext_frame);
     CIO_CHECK(reactor.last_poll_ns() > before_poll);
     CIO_CHECK_EQ(reactor.owner_poll_request_ns(), 0);
 
@@ -2496,8 +2300,7 @@ void test_stale_monitor_arms_owner_before_foreign_poll() {
     cio::detail::Scheduler scheduler(1, 1);
     auto& reactor = scheduler.reactor_for(0);
     int pipe_fds[2] = {-1, -1};
-    CIO_CHECK_EQ(
-        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    CIO_CHECK_EQ(::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
     if (pipe_fds[0] < 0) return;
 
     auto attached = reactor.attach(pipe_fds[0]);
@@ -2512,25 +2315,20 @@ void test_stale_monitor_arms_owner_before_foreign_poll() {
     const char byte = 'm';
     CIO_CHECK_EQ(::write(pipe_fds[1], &byte, 1), 1);
     const std::int64_t before_poll = reactor.last_poll_ns();
-    const std::int64_t stale_now =
-        before_poll + 1'000'000;
+    const std::int64_t stale_now = before_poll + 1'000'000;
 
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, stale_now);
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler, stale_now);
     CIO_CHECK(reactor.owner_poll_request_ns() != 0);
     CIO_CHECK_EQ(reactor.last_poll_ns(), before_poll);
 
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, stale_now + 100'000);
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler,
+                                                   stale_now + 100'000);
     CIO_CHECK(reactor.last_poll_ns() > before_poll);
     CIO_CHECK(reactor.owner_poll_request_ns() != 0);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_requested_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_requested_epoch(scheduler, 0),
         0u);
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::global_empty(
-            scheduler));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::global_empty(scheduler));
 
     reactor.detach(*attached);
     ::close(pipe_fds[0]);
@@ -2541,8 +2339,7 @@ void test_stale_monitor_queues_one_reusable_worker_driver() {
     cio::detail::Scheduler scheduler(2, 1);
     auto& reactor = scheduler.reactor_for(0);
     int pipe_fds[2] = {-1, -1};
-    CIO_CHECK_EQ(
-        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    CIO_CHECK_EQ(::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
     if (pipe_fds[0] < 0) return;
 
     auto attached = reactor.attach(pipe_fds[0]);
@@ -2555,47 +2352,36 @@ void test_stale_monitor_queues_one_reusable_worker_driver() {
     (void)reactor.take_owner_poll_request_ns();
 
     const std::int64_t before_poll = reactor.last_poll_ns();
-    const std::int64_t stale_now =
-        before_poll + 1'000'000;
+    const std::int64_t stale_now = before_poll + 1'000'000;
 
     // The first stale pass gives the shard owner its existing bounded ticket.
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, stale_now);
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler, stale_now);
     CIO_CHECK(reactor.owner_poll_request_ns() != 0);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_requested_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_requested_epoch(scheduler, 0),
         0u);
-    CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_phase(
-            scheduler, 0),
-        1);
-    CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::pop_global(scheduler),
-        nullptr);
+    CIO_CHECK_EQ(cio::detail::SchedulerTestAccess::driver_phase(scheduler, 0),
+                 1);
+    CIO_CHECK_EQ(cio::detail::SchedulerTestAccess::pop_global(scheduler),
+                 nullptr);
 
     // The second pass queues one stable control frame globally. Repeated
     // monitor passes before it runs coalesce onto that same generation.
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, stale_now + 50'000);
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler,
+                                                   stale_now + 50'000);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_requested_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_requested_epoch(scheduler, 0),
         1u);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_requested_at(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_requested_at(scheduler, 0),
         stale_now + 50'000);
-    CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_phase(
-            scheduler, 0),
-        2);
+    CIO_CHECK_EQ(cio::detail::SchedulerTestAccess::driver_phase(scheduler, 0),
+                 2);
 
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, stale_now + 100'000);
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler,
+                                                   stale_now + 100'000);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_requested_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_requested_epoch(scheduler, 0),
         1u);
 
     void* const first_driver =
@@ -2604,28 +2390,21 @@ void test_stale_monitor_queues_one_reusable_worker_driver() {
     if (first_driver != nullptr) {
         std::coroutine_handle<>::from_address(first_driver).resume();
     }
+    CIO_CHECK_EQ(cio::detail::SchedulerTestAccess::driver_phase(scheduler, 0),
+                 1);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_phase(
-            scheduler, 0),
-        1);
-    CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_attempted_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_attempted_epoch(scheduler, 0),
         1u);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_covered_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(scheduler, 0),
         1u);
     CIO_CHECK(reactor.last_poll_ns() > before_poll);
 
     // A later stale generation reuses the exact same suspended frame.
-    const std::int64_t later_stale =
-        reactor.last_poll_ns() + 1'000'000;
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, later_stale);
+    const std::int64_t later_stale = reactor.last_poll_ns() + 1'000'000;
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler, later_stale);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_requested_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_requested_epoch(scheduler, 0),
         2u);
     void* const second_driver =
         cio::detail::SchedulerTestAccess::pop_global(scheduler);
@@ -2634,12 +2413,10 @@ void test_stale_monitor_queues_one_reusable_worker_driver() {
         std::coroutine_handle<>::from_address(second_driver).resume();
     }
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_attempted_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_attempted_epoch(scheduler, 0),
         2u);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_covered_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(scheduler, 0),
         2u);
 
     reactor.detach(*attached);
@@ -2651,8 +2428,7 @@ void test_worker_driver_has_absolute_direct_backstop() {
     cio::detail::Scheduler scheduler(2, 1);
     auto& reactor = scheduler.reactor_for(0);
     int pipe_fds[2] = {-1, -1};
-    CIO_CHECK_EQ(
-        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    CIO_CHECK_EQ(::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
     if (pipe_fds[0] < 0) return;
 
     auto attached = reactor.attach(pipe_fds[0]);
@@ -2665,38 +2441,31 @@ void test_worker_driver_has_absolute_direct_backstop() {
     (void)reactor.take_owner_poll_request_ns();
 
     const std::int64_t before_poll = reactor.last_poll_ns();
-    const std::int64_t stale_now =
-        before_poll + 1'000'000;
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, stale_now);
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, stale_now + 50'000);
+    const std::int64_t stale_now = before_poll + 1'000'000;
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler, stale_now);
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler,
+                                                   stale_now + 50'000);
 
     const std::int64_t requested_at =
-        cio::detail::SchedulerTestAccess::driver_requested_at(
-            scheduler, 0);
+        cio::detail::SchedulerTestAccess::driver_requested_at(scheduler, 0);
     CIO_CHECK(requested_at != 0);
-    CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_phase(
-            scheduler, 0),
-        2);
+    CIO_CHECK_EQ(cio::detail::SchedulerTestAccess::driver_phase(scheduler, 0),
+                 2);
 
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, requested_at + 199'999);
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler,
+                                                   requested_at + 199'999);
     CIO_CHECK_EQ(reactor.last_poll_ns(), before_poll);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_covered_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(scheduler, 0),
         0u);
 
     // A queued control frame cannot postpone liveness indefinitely. At the
     // absolute grace deadline, the monitor competes for polling_ directly.
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, requested_at + 200'000);
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler,
+                                                   requested_at + 200'000);
     CIO_CHECK(reactor.last_poll_ns() > before_poll);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_covered_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(scheduler, 0),
         1u);
     const std::int64_t after_backstop = reactor.last_poll_ns();
 
@@ -2708,13 +2477,10 @@ void test_worker_driver_has_absolute_direct_backstop() {
     if (late_driver != nullptr) {
         std::coroutine_handle<>::from_address(late_driver).resume();
     }
+    CIO_CHECK_EQ(cio::detail::SchedulerTestAccess::driver_phase(scheduler, 0),
+                 1);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_phase(
-            scheduler, 0),
-        1);
-    CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_attempted_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_attempted_epoch(scheduler, 0),
         1u);
     CIO_CHECK_EQ(reactor.last_poll_ns(), after_backstop);
 
@@ -2727,8 +2493,7 @@ void test_late_worker_driver_adopts_newer_generation() {
     cio::detail::Scheduler scheduler(2, 1);
     auto& reactor = scheduler.reactor_for(0);
     int pipe_fds[2] = {-1, -1};
-    CIO_CHECK_EQ(
-        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    CIO_CHECK_EQ(::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
     if (pipe_fds[0] < 0) return;
 
     auto attached = reactor.attach(pipe_fds[0]);
@@ -2740,19 +2505,14 @@ void test_late_worker_driver_adopts_newer_generation() {
     }
     (void)reactor.take_owner_poll_request_ns();
 
-    const std::int64_t stale_now =
-        reactor.last_poll_ns() + 1'000'000;
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, stale_now);
-    cio::detail::SchedulerTestAccess::monitor_pass(
-        scheduler, stale_now + 50'000);
+    const std::int64_t stale_now = reactor.last_poll_ns() + 1'000'000;
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler, stale_now);
+    cio::detail::SchedulerTestAccess::monitor_pass(scheduler,
+                                                   stale_now + 50'000);
     const std::int64_t first_requested_at =
-        cio::detail::SchedulerTestAccess::driver_requested_at(
-            scheduler, 0);
-    CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_phase(
-            scheduler, 0),
-        2);
+        cio::detail::SchedulerTestAccess::driver_requested_at(scheduler, 0);
+    CIO_CHECK_EQ(cio::detail::SchedulerTestAccess::driver_phase(scheduler, 0),
+                 2);
 
     // Cover generation 1 through the hard backstop, but leave its one carrier
     // in global_. A later stale episode may advance the generation while that
@@ -2760,43 +2520,32 @@ void test_late_worker_driver_adopts_newer_generation() {
     cio::detail::SchedulerTestAccess::monitor_pass(
         scheduler, first_requested_at + 200'000);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_covered_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(scheduler, 0),
         1u);
     const bool requested_second =
         cio::detail::SchedulerTestAccess::request_driver(
             scheduler, 0, reactor.last_poll_ns() + 1);
     CIO_CHECK(requested_second);
-    CIO_CHECK(
-        !cio::detail::SchedulerTestAccess::queue_driver(
-            scheduler, 0));
+    CIO_CHECK(!cio::detail::SchedulerTestAccess::queue_driver(scheduler, 0));
 
     void* const only_driver =
         cio::detail::SchedulerTestAccess::pop_global(scheduler);
     CIO_CHECK(only_driver != nullptr);
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::global_empty(
-            scheduler));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::global_empty(scheduler));
     if (only_driver != nullptr) {
-        std::coroutine_handle<>::from_address(
-            only_driver).resume();
+        std::coroutine_handle<>::from_address(only_driver).resume();
     }
 
+    CIO_CHECK_EQ(cio::detail::SchedulerTestAccess::driver_phase(scheduler, 0),
+                 1);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_phase(
-            scheduler, 0),
-        1);
-    CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_requested_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_requested_epoch(scheduler, 0),
         2u);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_attempted_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_attempted_epoch(scheduler, 0),
         2u);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_covered_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(scheduler, 0),
         2u);
 
     reactor.detach(*attached);
@@ -2808,27 +2557,20 @@ void test_queued_worker_driver_is_owned_through_shutdown() {
     cio::detail::Scheduler scheduler(2, 1);
     auto& reactor = scheduler.reactor_for(0);
     int pipe_fds[2] = {-1, -1};
-    CIO_CHECK_EQ(
-        ::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
+    CIO_CHECK_EQ(::pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK), 0);
     if (pipe_fds[0] < 0) return;
 
     auto attached = reactor.attach(pipe_fds[0]);
     CIO_CHECK(attached.has_value());
     if (attached) {
         (void)reactor.take_owner_poll_request_ns();
-        const std::int64_t stale_now =
-            reactor.last_poll_ns() + 1'000'000;
-        cio::detail::SchedulerTestAccess::monitor_pass(
-            scheduler, stale_now);
-        cio::detail::SchedulerTestAccess::monitor_pass(
-            scheduler, stale_now + 50'000);
+        const std::int64_t stale_now = reactor.last_poll_ns() + 1'000'000;
+        cio::detail::SchedulerTestAccess::monitor_pass(scheduler, stale_now);
+        cio::detail::SchedulerTestAccess::monitor_pass(scheduler,
+                                                       stale_now + 50'000);
         CIO_CHECK_EQ(
-            cio::detail::SchedulerTestAccess::driver_phase(
-                scheduler, 0),
-            2);
-        CIO_CHECK(
-            !cio::detail::SchedulerTestAccess::global_empty(
-                scheduler));
+            cio::detail::SchedulerTestAccess::driver_phase(scheduler, 0), 2);
+        CIO_CHECK(!cio::detail::SchedulerTestAccess::global_empty(scheduler));
         // Deliberately leave the frame in global_. Reactor owns it and destroys
         // it after the raw queue has lost all consumers during teardown.
         reactor.detach(*attached);
@@ -2841,8 +2583,7 @@ void test_reusable_worker_driver_rearm_race() {
     constexpr std::uint64_t kIterations = 2'000;
 
     cio::detail::Scheduler scheduler(2, 1);
-    cio::detail::SchedulerTestAccess::
-        start_workers_without_monitor(scheduler);
+    cio::detail::SchedulerTestAccess::start_workers_without_monitor(scheduler);
     auto& reactor = scheduler.reactor_for(0);
 
     // Keep shard 0's owner out of its blocking reactor poll. Every queued
@@ -2854,9 +2595,7 @@ void test_reusable_worker_driver_rearm_race() {
     std::atomic<bool> hog_finished{false};
     schedule_detached_to(
         &scheduler,
-        io_completion_cpu_hog(
-            &hog_started, &release_hog, &hog_finished),
-        0);
+        io_completion_cpu_hog(&hog_started, &release_hog, &hog_finished), 0);
     const auto setup_deadline = cio::Clock::now() + 2s;
     while (!hog_started.load(std::memory_order_acquire) &&
            cio::Clock::now() < setup_deadline) {
@@ -2864,22 +2603,17 @@ void test_reusable_worker_driver_rearm_race() {
     }
     CIO_CHECK(hog_started.load(std::memory_order_acquire));
 
-    const std::int64_t requested_base =
-        reactor.last_poll_ns() + 60'000'000'000;
+    const std::int64_t requested_base = reactor.last_poll_ns() + 60'000'000'000;
     const auto deadline = cio::Clock::now() + 5s;
 
     std::uint64_t completed = 0;
     for (std::uint64_t i = 0; i < kIterations; ++i) {
-        const bool requested =
-            cio::detail::SchedulerTestAccess::request_driver(
-                scheduler, 0,
-                requested_base + static_cast<std::int64_t>(i));
+        const bool requested = cio::detail::SchedulerTestAccess::request_driver(
+            scheduler, 0, requested_base + static_cast<std::int64_t>(i));
         bool queued = false;
-        while (requested && !queued &&
-               cio::Clock::now() < deadline) {
+        while (requested && !queued && cio::Clock::now() < deadline) {
             queued =
-                cio::detail::SchedulerTestAccess::queue_driver(
-                    scheduler, 0);
+                cio::detail::SchedulerTestAccess::queue_driver(scheduler, 0);
             if (!queued) std::this_thread::yield();
         }
         if (!queued) break;
@@ -2889,13 +2623,13 @@ void test_reusable_worker_driver_rearm_race() {
         // DriverSuspend publishes SUSPENDED. Start the next generation as soon
         // as coverage appears so queue_driver's CAS races that final release
         // instead of serializing every reuse after suspension.
-        while (cio::detail::SchedulerTestAccess::
-                   driver_covered_epoch(scheduler, 0) < epoch &&
+        while (cio::detail::SchedulerTestAccess::driver_covered_epoch(
+                   scheduler, 0) < epoch &&
                cio::Clock::now() < deadline) {
             std::this_thread::yield();
         }
-        if (cio::detail::SchedulerTestAccess::
-                driver_covered_epoch(scheduler, 0) < epoch) {
+        if (cio::detail::SchedulerTestAccess::driver_covered_epoch(scheduler,
+                                                                   0) < epoch) {
             break;
         }
         completed = epoch;
@@ -2911,34 +2645,31 @@ void test_reusable_worker_driver_rearm_race() {
     CIO_CHECK(hog_finished.load(std::memory_order_acquire));
     CIO_CHECK_EQ(completed, kIterations);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_attempted_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_attempted_epoch(scheduler, 0),
         kIterations);
     CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::driver_covered_epoch(
-            scheduler, 0),
+        cio::detail::SchedulerTestAccess::driver_covered_epoch(scheduler, 0),
         kIterations);
 }
 
 void test_monitor_batch_only_replaces_default_policy() {
+    CIO_CHECK(cio::detail::SchedulerTestAccess::should_use_batch_monitor_policy(
+        SCHED_OTHER));
     CIO_CHECK(
-        cio::detail::SchedulerTestAccess::
-            should_use_batch_monitor_policy(SCHED_OTHER));
+        !cio::detail::SchedulerTestAccess::should_use_batch_monitor_policy(
+            SCHED_FIFO));
     CIO_CHECK(
-        !cio::detail::SchedulerTestAccess::
-            should_use_batch_monitor_policy(SCHED_FIFO));
-    CIO_CHECK(
-        !cio::detail::SchedulerTestAccess::
-            should_use_batch_monitor_policy(SCHED_RR));
+        !cio::detail::SchedulerTestAccess::should_use_batch_monitor_policy(
+            SCHED_RR));
 #if defined(SCHED_BATCH)
     CIO_CHECK(
-        !cio::detail::SchedulerTestAccess::
-            should_use_batch_monitor_policy(SCHED_BATCH));
+        !cio::detail::SchedulerTestAccess::should_use_batch_monitor_policy(
+            SCHED_BATCH));
 #endif
 #if defined(SCHED_IDLE)
     CIO_CHECK(
-        !cio::detail::SchedulerTestAccess::
-            should_use_batch_monitor_policy(SCHED_IDLE));
+        !cio::detail::SchedulerTestAccess::should_use_batch_monitor_policy(
+            SCHED_IDLE));
 #endif
 }
 
@@ -2967,14 +2698,12 @@ void test_completed_poll_refreshes_last_poll_after_wait() {
     auto& reactor = scheduler.reactor_for(0);
     std::atomic<int> poll_result{-2};
     std::thread poller([&] {
-        poll_result.store(
-            reactor.poll(cio::to_ns(1s)),
-            std::memory_order_release);
+        poll_result.store(reactor.poll(cio::to_ns(1s)),
+                          std::memory_order_release);
     });
 
     const auto polling_deadline = cio::Clock::now() + 1s;
-    while (!reactor.polling() &&
-           cio::Clock::now() < polling_deadline) {
+    while (!reactor.polling() && cio::Clock::now() < polling_deadline) {
         std::this_thread::yield();
     }
     CIO_CHECK(reactor.polling());
@@ -2983,8 +2712,7 @@ void test_completed_poll_refreshes_last_poll_after_wait() {
     reactor.wake();
     poller.join();
 
-    CIO_CHECK(
-        poll_result.load(std::memory_order_acquire) >= 0);
+    CIO_CHECK(poll_result.load(std::memory_order_acquire) >= 0);
     CIO_CHECK(reactor.last_poll_ns() >= wake_ns);
 }
 
@@ -2994,18 +2722,14 @@ void test_foreign_timer_batch_uses_shared_fallback() {
     // this already-due waiter if that worker entered a non-suspending task.
     cio::detail::Scheduler scheduler(2, 1);
     const auto waiter = std::noop_coroutine();
-    cio::detail::Timer timer{
-        cio::detail::Timer::ArmTag{}, cio::now_ns() - 1, waiter, nullptr};
+    cio::detail::Timer timer{cio::detail::Timer::ArmTag{}, cio::now_ns() - 1,
+                             waiter, nullptr};
     scheduler.timers().arm(&timer);
 
     CIO_CHECK_EQ(scheduler.timers().run_expired(0), 1u);
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::inbox_empty(
-            scheduler, 0));
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::pop_global(scheduler) ==
-        waiter.address());
-
+    CIO_CHECK(cio::detail::SchedulerTestAccess::inbox_empty(scheduler, 0));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::pop_global(scheduler) ==
+              waiter.address());
 }
 
 void test_foreign_direct_handoff_uses_shared_fallback() {
@@ -3016,27 +2740,16 @@ void test_foreign_direct_handoff_uses_shared_fallback() {
     const auto waiter = std::noop_coroutine();
     scheduler.schedule_next(waiter);
 
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::inbox_empty(
-            scheduler, 0));
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::inbox_empty(
-            scheduler, 1));
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::pop_global(scheduler) ==
-        waiter.address());
+    CIO_CHECK(cio::detail::SchedulerTestAccess::inbox_empty(scheduler, 0));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::inbox_empty(scheduler, 1));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::pop_global(scheduler) ==
+              waiter.address());
 
-    scheduler.schedule_to(
-        waiter, cio::detail::kInvalidWorkerId);
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::inbox_empty(
-            scheduler, 0));
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::inbox_empty(
-            scheduler, 1));
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::pop_global(scheduler) ==
-        waiter.address());
+    scheduler.schedule_to(waiter, cio::detail::kInvalidWorkerId);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::inbox_empty(scheduler, 0));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::inbox_empty(scheduler, 1));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::pop_global(scheduler) ==
+              waiter.address());
 }
 
 // The real test of the stealing/parking protocol: many more tasks than
@@ -3054,13 +2767,15 @@ void test_many_tasks_across_workers() {
     auto branch = [&]() -> cio::Task<> {
         std::vector<cio::JoinHandle<>> handles;
         handles.reserve(kPerFanOut);
-        for (int i = 0; i < kPerFanOut; ++i) handles.push_back(cio::spawn(leaf()));
+        for (int i = 0; i < kPerFanOut; ++i)
+            handles.push_back(cio::spawn(leaf()));
         for (auto& handle : handles) co_await handle;
     };
     auto root = [&]() -> cio::Task<> {
         std::vector<cio::JoinHandle<>> handles;
         handles.reserve(kFanOut);
-        for (int i = 0; i < kFanOut; ++i) handles.push_back(cio::spawn(branch()));
+        for (int i = 0; i < kFanOut; ++i)
+            handles.push_back(cio::spawn(branch()));
         for (auto& handle : handles) co_await handle;
     };
 
@@ -3082,8 +2797,7 @@ void test_single_item_publication_survives_clear_race() {
 
     auto root = []() -> cio::Task<bool> {
         for (int i = 0; i < kRounds; ++i) {
-            auto child =
-                cio::spawn([]() -> cio::Task<> { co_return; }());
+            auto child = cio::spawn([]() -> cio::Task<> { co_return; }());
             const auto deadline = cio::Clock::now() + 1s;
             while (!child.done() && cio::Clock::now() < deadline) {
                 std::this_thread::yield();
@@ -3111,31 +2825,23 @@ void test_publication_observes_foreign_clear_epoch() {
     int first = 1;
     int second = 2;
 
-    cio::detail::SchedulerTestAccess::publish_fifo(
-        scheduler, 0, &first);
-    CIO_CHECK(cio::detail::SchedulerTestAccess::stealable(
-        scheduler, 0));
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::pop_fifo(scheduler, 0) ==
-        &first);
+    cio::detail::SchedulerTestAccess::publish_fifo(scheduler, 0, &first);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::stealable(scheduler, 0));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::pop_fifo(scheduler, 0) ==
+              &first);
 
     const std::uint64_t before =
         cio::detail::SchedulerTestAccess::clear_epoch(scheduler, 0);
-    CIO_CHECK(!cio::detail::SchedulerTestAccess::repair_fifo_as_thief(
-        scheduler, 0));
-    CIO_CHECK(!cio::detail::SchedulerTestAccess::stealable(
-        scheduler, 0));
-    CIO_CHECK_EQ(
-        cio::detail::SchedulerTestAccess::clear_epoch(scheduler, 0),
-        before + 1);
-
-    cio::detail::SchedulerTestAccess::publish_fifo(
-        scheduler, 0, &second);
-    CIO_CHECK(cio::detail::SchedulerTestAccess::stealable(
-        scheduler, 0));
     CIO_CHECK(
-        cio::detail::SchedulerTestAccess::pop_fifo(scheduler, 0) ==
-        &second);
+        !cio::detail::SchedulerTestAccess::repair_fifo_as_thief(scheduler, 0));
+    CIO_CHECK(!cio::detail::SchedulerTestAccess::stealable(scheduler, 0));
+    CIO_CHECK_EQ(cio::detail::SchedulerTestAccess::clear_epoch(scheduler, 0),
+                 before + 1);
+
+    cio::detail::SchedulerTestAccess::publish_fifo(scheduler, 0, &second);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::stealable(scheduler, 0));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::pop_fifo(scheduler, 0) ==
+              &second);
 }
 
 // A victim-publication wake is not a generic eventfd token. If targeted inbox
@@ -3146,27 +2852,19 @@ void test_searcher_credit_precedes_intercepting_inbox() {
     int victim = 1;
     int intercept = 2;
 
-    cio::detail::SchedulerTestAccess::publish_idle(
-        scheduler, 1);
-    cio::detail::SchedulerTestAccess::publish_idle(
-        scheduler, 2);
-    cio::detail::SchedulerTestAccess::publish_fifo(
-        scheduler, 0, &victim);
+    cio::detail::SchedulerTestAccess::publish_idle(scheduler, 1);
+    cio::detail::SchedulerTestAccess::publish_idle(scheduler, 2);
+    cio::detail::SchedulerTestAccess::publish_fifo(scheduler, 0, &victim);
 
-    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(
-        scheduler, 1));
-    CIO_CHECK(!cio::detail::SchedulerTestAccess::searcher_credit(
-        scheduler, 2));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(scheduler, 1));
+    CIO_CHECK(!cio::detail::SchedulerTestAccess::searcher_credit(scheduler, 2));
 
     scheduler.schedule_to_frame(&intercept, 1);
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::consume_searcher_credit(
-            scheduler, 1) == &victim);
-    CIO_CHECK(!cio::detail::SchedulerTestAccess::searcher_credit(
-        scheduler, 1));
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::pop_inbox(scheduler, 1) ==
-        &intercept);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::consume_searcher_credit(
+                  scheduler, 1) == &victim);
+    CIO_CHECK(!cio::detail::SchedulerTestAccess::searcher_credit(scheduler, 1));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::pop_inbox(scheduler, 1) ==
+              &intercept);
 }
 
 // Stealing half of a two-item FIFO takes one item and leaves one. Because the
@@ -3178,32 +2876,21 @@ void test_singleton_steal_transfers_remaining_search() {
     int first = 1;
     int second = 2;
 
-    cio::detail::SchedulerTestAccess::publish_idle(
-        scheduler, 1);
-    cio::detail::SchedulerTestAccess::publish_idle(
-        scheduler, 2);
-    cio::detail::SchedulerTestAccess::publish_fifo(
-        scheduler, 0, &first);
-    cio::detail::SchedulerTestAccess::publish_fifo(
-        scheduler, 0, &second);
+    cio::detail::SchedulerTestAccess::publish_idle(scheduler, 1);
+    cio::detail::SchedulerTestAccess::publish_idle(scheduler, 2);
+    cio::detail::SchedulerTestAccess::publish_fifo(scheduler, 0, &first);
+    cio::detail::SchedulerTestAccess::publish_fifo(scheduler, 0, &second);
 
-    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(
-        scheduler, 1));
-    CIO_CHECK(!cio::detail::SchedulerTestAccess::searcher_credit(
-        scheduler, 2));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(scheduler, 1));
+    CIO_CHECK(!cio::detail::SchedulerTestAccess::searcher_credit(scheduler, 2));
 
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::consume_searcher_credit(
-            scheduler, 1) == &first);
-    CIO_CHECK(cio::detail::SchedulerTestAccess::stealable(
-        scheduler, 0));
-    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(
-        scheduler, 2));
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::consume_searcher_credit(
-            scheduler, 2) == &second);
-    CIO_CHECK(!cio::detail::SchedulerTestAccess::stealable(
-        scheduler, 0));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::consume_searcher_credit(
+                  scheduler, 1) == &first);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::stealable(scheduler, 0));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(scheduler, 2));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::consume_searcher_credit(
+                  scheduler, 2) == &second);
+    CIO_CHECK(!cio::detail::SchedulerTestAccess::stealable(scheduler, 0));
 }
 
 // A steal from three items creates two published sources: one retained item on
@@ -3215,47 +2902,30 @@ void test_batch_steal_accounts_for_original_victim_tail() {
     int second = 2;
     int third = 3;
 
-    cio::detail::SchedulerTestAccess::publish_idle(
-        scheduler, 1);
-    cio::detail::SchedulerTestAccess::publish_idle(
-        scheduler, 2);
-    cio::detail::SchedulerTestAccess::publish_idle(
-        scheduler, 3);
-    cio::detail::SchedulerTestAccess::publish_fifo(
-        scheduler, 0, &first);
-    cio::detail::SchedulerTestAccess::publish_fifo(
-        scheduler, 0, &second);
-    cio::detail::SchedulerTestAccess::publish_fifo(
-        scheduler, 0, &third);
+    cio::detail::SchedulerTestAccess::publish_idle(scheduler, 1);
+    cio::detail::SchedulerTestAccess::publish_idle(scheduler, 2);
+    cio::detail::SchedulerTestAccess::publish_idle(scheduler, 3);
+    cio::detail::SchedulerTestAccess::publish_fifo(scheduler, 0, &first);
+    cio::detail::SchedulerTestAccess::publish_fifo(scheduler, 0, &second);
+    cio::detail::SchedulerTestAccess::publish_fifo(scheduler, 0, &third);
 
-    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(
-        scheduler, 1));
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::consume_searcher_credit(
-            scheduler, 1) == &first);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(scheduler, 1));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::consume_searcher_credit(
+                  scheduler, 1) == &first);
 
-    CIO_CHECK(cio::detail::SchedulerTestAccess::stealable(
-        scheduler, 0));
-    CIO_CHECK(cio::detail::SchedulerTestAccess::stealable(
-        scheduler, 1));
-    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(
-        scheduler, 2));
-    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(
-        scheduler, 3));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::stealable(scheduler, 0));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::stealable(scheduler, 1));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(scheduler, 2));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(scheduler, 3));
 
     void* const next =
-        cio::detail::SchedulerTestAccess::consume_searcher_credit(
-            scheduler, 2);
+        cio::detail::SchedulerTestAccess::consume_searcher_credit(scheduler, 2);
     void* const last =
-        cio::detail::SchedulerTestAccess::consume_searcher_credit(
-            scheduler, 3);
-    CIO_CHECK(
-        (next == &second && last == &third) ||
-        (next == &third && last == &second));
-    CIO_CHECK(!cio::detail::SchedulerTestAccess::stealable(
-        scheduler, 0));
-    CIO_CHECK(!cio::detail::SchedulerTestAccess::stealable(
-        scheduler, 1));
+        cio::detail::SchedulerTestAccess::consume_searcher_credit(scheduler, 3);
+    CIO_CHECK((next == &second && last == &third) ||
+              (next == &third && last == &second));
+    CIO_CHECK(!cio::detail::SchedulerTestAccess::stealable(scheduler, 0));
+    CIO_CHECK(!cio::detail::SchedulerTestAccess::stealable(scheduler, 1));
 }
 
 void test_park_final_check_adopts_searcher_credit() {
@@ -3264,24 +2934,18 @@ void test_park_final_check_adopts_searcher_credit() {
     int intercept = 2;
 
     // Publish with no idle worker, so no producer can pre-arm a credit.
-    cio::detail::SchedulerTestAccess::publish_fifo(
-        scheduler, 0, &victim);
-    CIO_CHECK(!cio::detail::SchedulerTestAccess::searcher_credit(
-        scheduler, 1));
+    cio::detail::SchedulerTestAccess::publish_fifo(scheduler, 0, &victim);
+    CIO_CHECK(!cio::detail::SchedulerTestAccess::searcher_credit(scheduler, 1));
     scheduler.schedule_to_frame(&intercept, 1);
 
     // W1 publishes idle, sees its inbox in the final check, and leaves park.
     // Its clear-then-SC-victim check must adopt the otherwise-unclaimed search.
-    cio::detail::SchedulerTestAccess::park_once(
-        scheduler, 1);
-    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(
-        scheduler, 1));
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::consume_searcher_credit(
-            scheduler, 1) == &victim);
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::pop_inbox(
-            scheduler, 1) == &intercept);
+    cio::detail::SchedulerTestAccess::park_once(scheduler, 1);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(scheduler, 1));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::consume_searcher_credit(
+                  scheduler, 1) == &victim);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::pop_inbox(scheduler, 1) ==
+              &intercept);
 }
 
 void test_poll_return_leave_adopts_searcher_credit() {
@@ -3291,26 +2955,18 @@ void test_poll_return_leave_adopts_searcher_credit() {
 
     // Model poller_returned(): the worker's idle bit is already clear before
     // the readiness batch finishes and park executes its common leave step.
-    cio::detail::SchedulerTestAccess::publish_idle(
-        scheduler, 1);
-    cio::detail::SchedulerTestAccess::clear_idle(
-        scheduler, 1);
-    cio::detail::SchedulerTestAccess::publish_fifo(
-        scheduler, 0, &victim);
-    CIO_CHECK(!cio::detail::SchedulerTestAccess::searcher_credit(
-        scheduler, 1));
+    cio::detail::SchedulerTestAccess::publish_idle(scheduler, 1);
+    cio::detail::SchedulerTestAccess::clear_idle(scheduler, 1);
+    cio::detail::SchedulerTestAccess::publish_fifo(scheduler, 0, &victim);
+    CIO_CHECK(!cio::detail::SchedulerTestAccess::searcher_credit(scheduler, 1));
     scheduler.schedule_to_frame(&intercept, 1);
 
-    cio::detail::SchedulerTestAccess::leave_park(
-        scheduler, 1);
-    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(
-        scheduler, 1));
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::consume_searcher_credit(
-            scheduler, 1) == &victim);
-    CIO_CHECK(
-        cio::detail::SchedulerTestAccess::pop_inbox(
-            scheduler, 1) == &intercept);
+    cio::detail::SchedulerTestAccess::leave_park(scheduler, 1);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::searcher_credit(scheduler, 1));
+    CIO_CHECK(cio::detail::SchedulerTestAccess::consume_searcher_credit(
+                  scheduler, 1) == &victim);
+    CIO_CHECK(cio::detail::SchedulerTestAccess::pop_inbox(scheduler, 1) ==
+              &intercept);
 }
 
 cio::Task<> occupy_only_worker(std::atomic<bool>* started,
@@ -3365,8 +3021,8 @@ void test_foreign_mpsc_burst_overflows_without_loss() {
             for (int i = 0; i < kPerProducer; ++i) {
                 schedule_detached_to(
                     &runtime.scheduler(),
-                    mark_external_submission(
-                        &seen[base + i], &completed, &duplicates),
+                    mark_external_submission(&seen[base + i], &completed,
+                                             &duplicates),
                     0);
             }
         });
@@ -3412,7 +3068,8 @@ void test_detached_task_runs() {
         }
         // Detached tasks have no join point, so drain by polling — this is
         // exactly why TaskGroup exists.
-        while (seen.load(std::memory_order_relaxed) < 100) co_await cio::sleep(1ms);
+        while (seen.load(std::memory_order_relaxed) < 100)
+            co_await cio::sleep(1ms);
     };
 
     cio::run(body());
@@ -3421,19 +3078,18 @@ void test_detached_task_runs() {
 
 void test_join_completion_ignores_destroyed_target_runtime() {
     auto* state = new cio::detail::JoinState<int>(1);
-    cio::detail::JoinWait waiter;
+    std::unique_ptr<cio::detail::JoinWait> waiter;
 
     {
         cio::RuntimeOptions options;
         options.worker_threads = 1;
         cio::Runtime target(options);
-        const auto parked = state->try_park(
-            &waiter, std::noop_coroutine());
-        CIO_CHECK(
-            parked ==
-            cio::detail::JoinState<int>::ParkResult::kParked);
+        waiter = std::make_unique<cio::detail::JoinWait>(std::noop_coroutine(),
+                                                         &target.scheduler());
+        const auto parked = state->try_park(waiter.get());
+        CIO_CHECK(parked == cio::detail::JoinState<int>::ParkResult::kParked);
     }
-    CIO_CHECK(!waiter.sched.lock());
+    CIO_CHECK(!waiter->sched.lock());
 
     // Completion may originate on another runtime or an arbitrary thread long
     // after the awaiting runtime was torn down. It must publish the result
@@ -3458,8 +3114,7 @@ void test_completion_endpoint_identity_is_never_recycled() {
     cio::RuntimeOptions options;
     options.worker_threads = 1;
     cio::Runtime replacement(options);
-    const auto current =
-        replacement.scheduler().completion_target();
+    const auto current = replacement.scheduler().completion_target();
     CIO_CHECK(current.endpoint != stale.endpoint);
     CIO_CHECK(!stale.lock());
     CIO_CHECK(static_cast<bool>(current.lock()));
@@ -3468,10 +3123,8 @@ void test_completion_endpoint_identity_is_never_recycled() {
 void test_completion_endpoint_shutdown_waits_out_foreign_leases() {
     cio::RuntimeOptions options;
     options.worker_threads = 1;
-    auto runtime =
-        std::make_unique<cio::Runtime>(options);
-    const auto target =
-        runtime->scheduler().completion_target();
+    auto runtime = std::make_unique<cio::Runtime>(options);
+    const auto target = runtime->scheduler().completion_target();
 
     std::atomic<bool> started{false};
     std::atomic<bool> stop{false};
@@ -3489,8 +3142,7 @@ void test_completion_endpoint_shutdown_waits_out_foreign_leases() {
     while (!started.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
-    const auto acquisition_deadline =
-        cio::Clock::now() + 1s;
+    const auto acquisition_deadline = cio::Clock::now() + 1s;
     while (acquired.load(std::memory_order_acquire) == 0 &&
            cio::Clock::now() < acquisition_deadline) {
         std::this_thread::yield();
@@ -3530,7 +3182,7 @@ void test_invalid_async_handles_report_errors() {
             go_rejected = true;
         }
 
-        co_return task_rejected && join_rejected && go_rejected;
+        co_return task_rejected&& join_rejected&& go_rejected;
     };
     CIO_CHECK(cio::run(body()));
 }
@@ -3540,23 +3192,20 @@ void test_shutdown_from_own_worker_is_rejected() {
     options.worker_threads = 1;
     cio::Runtime runtime(options);
 
-    const bool rejected = runtime.block_on(
-        [&runtime]() -> cio::Task<bool> {
-            try {
-                runtime.shutdown();
-            } catch (const std::logic_error&) {
-                co_return true;
-            }
-            co_return false;
-        }());
+    const bool rejected = runtime.block_on([&runtime]() -> cio::Task<bool> {
+        try {
+            runtime.shutdown();
+        } catch (const std::logic_error&) {
+            co_return true;
+        }
+        co_return false;
+    }());
     CIO_CHECK(rejected);
 
     // The failed call must not half-close the scheduler; an external caller
     // can still use it and perform the real shutdown.
-    CIO_CHECK_EQ(
-        runtime.block_on(
-            []() -> cio::Task<int> { co_return 42; }()),
-        42);
+    CIO_CHECK_EQ(runtime.block_on([]() -> cio::Task<int> { co_return 42; }()),
+                 42);
     runtime.shutdown();
 }
 
@@ -3576,6 +3225,7 @@ int main() {
     RUN_TEST(test_saved_join_awaiter_survives_handle_detach);
     RUN_TEST(test_completed_void_join_snapshot_survives_detach);
     RUN_TEST(test_completed_void_exception_snapshot_keeps_state);
+    RUN_TEST(test_spawn_join_handoff_respects_local_batch);
     RUN_TEST(test_runnext_handoff_does_not_starve_local_fifo);
     RUN_TEST(test_runnext_handoff_does_not_starve_remote_inbox);
     RUN_TEST(test_foreign_poller_preserves_directed_wake_for_owner);

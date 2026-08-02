@@ -148,6 +148,12 @@ go test ./...
 - 普通外来提交、软亲和完成与收件箱溢出走共享回退队列。不要把偏好变成对某个
   任意繁忙 worker 的硬亲和。
 - 公开的 `cio::Chan<T>` 是互斥锁保护的 MPMC，与调度器的 MPSC 收件箱无关。
+- `Chan<T>` 的内部互斥只保护短小的等待者队列与环形缓冲区临界区，持有期间绝不
+  挂起或调度。它先有限自旋、再让出 OS 线程；跨 channel 的 `select` 仍按地址序
+  获取这些锁，唤醒仍在全部相关锁释放后发生。
+- `select` 的随机 poll permutation 只包含真正的操作 case；`default` 是全部操作
+  都阻塞后的控制流，绝不参与 ready case 的随机竞争。无 `default` 的 select 仍
+  按完整 case 集合生成均匀 permutation。
 
 ### 发布与休眠
 
@@ -169,8 +175,51 @@ go test ./...
 
 不要往 channel 唤醒路径里加等待者/帧的引用计数来绕开这条所有权规则。
 
+`ChanWaiter` 的 copy/move 只用于组装尚未发布的普通 awaiter 或 select case，目标
+是一个新的惰性空节点，不复制源节点字段。一旦节点进入 channel 等待队列就绝不能
+复制或移动；此后只允许在持锁下摘取/撤回，并按上述规则把调度作为最后动作。
+
 定时器的 disarm 是无条件的。即使节点看起来已不处于 armed 状态，`disarm()` 也必
 须等出正在触发的回调，节点才能复用。
+
+`TimeoutCase` 只在 select 的 ready 扫描全部阻塞、确定需要 park 后，才在原始存储
+中构造 `SelectTimer::Node`。已就绪 channel 或 default 获胜时不得初始化未使用的定
+时器；一旦 armed，finish 仍必须无条件 `disarm()`，等待回调停止接触节点后才能销
+毁 selector 帧。
+
+timer shard 的 `earliest` 只在堆根发生变化时 release 发布；插入非根或移除非根
+不得重复写该共享原子，但移除/触发根后必须在释放 shard 锁前发布新根或空哨兵。
+移除任意 timer 后，末节点只按它与新父节点的关系选择 sift-up 或 sift-down；两条
+路径都必须同步维护每个节点的 `heap_index`，供并发 disarm 精确定位。
+
+`WaitGroup` 的原子状态把稳定零、零转换收尾中与正计数编码为不同值；最后一次
+`done()` 只做一条 RMW，但只有摘链并释放 waiter 锁后才能发布稳定的零，避免
+`wait()` 返回后与仍在收尾的 `done()` 竞态。零计数转换若只摘到一个 waiter，
+直接经 `runnext` 交接；多个 waiter 仍走普通批量唤醒，跨运行时交接仍由
+completion endpoint 降级到共享调度。
+
+`Mutex` 的无竞争解锁只在状态精确为 locked 时原子换零。首个等待者必须在队列锁
+下先发布 contended 位再入队，使并发解锁要么先释放并由等待者接管，要么进入同一
+队列锁完成直接交接；只有 contended、尚无 locked 的状态是等待者正在接管的瞬态，
+`try_lock()` 绝不能获取它。直接交接得到的 Guard 记住队列模式，队列排空后再把状
+态发布回零。
+
+`WaitGroup`、`Mutex`、`RWMutex` 与 `TaskGroup::join()` 的 awaiter 在 ready 快路上
+只保留对齐的 `WaitNode` 原始存储，不构造等待节点。`await_ready()` 失败后、确认操
+作仍需挂起时才在持有等待者队列锁期间或取锁前原地构造节点；因此 `WaitNode` 必须
+保持可平凡析构，协程帧销毁时不需要判断节点是否已构造。节点一旦入队，仍严格遵
+守上述等待者所有权与最后动作规则。`RWMutex` 确认需要入队后，原地构造直接写入
+最终的 coroutine handle、调度目标与 worker，链指针在发布前由队列写入；不得先把
+整节点清零、再由 `arm()` 重复覆盖。`WaitGroup`、`Mutex` 与 `TaskGroup::join()`
+保留默认构造后按需 `arm()` 的队列发布形状。`Mutex` 与 `RWMutex` awaiter 的 owner
+指针低位记录是否进入了 contended/parked 慢路，解引用前必须清除此位；该编码以
+`std::mutex` 的对齐为编译期前提，不能退回每次 ready 快路都清零一个独立布尔字
+段。
+
+`RWMutex` 的写解锁只在状态精确为单独 writer 时走无锁快路。首个读或写等待者必
+须在等待者锁下把 pending 位与所有权状态原子合并，再把自身挂入队列；并发写解锁
+要么先发布零、由等待者直接获取，要么观察 pending 后进入同一把锁。写者直接交接
+必须保留仍排队的读者所需的 pending 位。
 
 ### reactor 与关停生命周期
 
@@ -189,6 +238,46 @@ go test ./...
 
 - 正常的 `spawn()` 任务从 final suspend 直接完成其 `JoinState`；不要在热路径
   上重新引入只为分配而存在的包装协程。
+- `spawn()` 把子任务发布进本地 FIFO 时，复用该次 push 已读取的 head/tail，
+  在 promise 的 detached 模式字节里记录它是否为当时唯一的本地项。只有这种
+  单子任务完成可经 `runnext` 直接交回 joiner；批量中的后续子任务仍把 joiner
+  放进普通 FIFO，外部或跨运行时完成仍走共享回退。
+- `JoinState` 的引用只能由已有的计数所有者派生并在发布前取得；因此最后所有者以
+  acquire 观察到引用数为一后可以直接销毁，非最后所有者仍必须用原子 RMW 释放。
+- `JoinHandle` awaiter 在帧中只保留未初始化的 `JoinWait` 存储；只有
+  `await_suspend()` 确实尝试发布 joiner 时才用最终的 coroutine handle 与调度目
+  标原地构造节点。已完成、无效与成功 void 快照路径不得清零一个永远不会发布的
+  等待节点；拒绝与快照状态共用一个状态字节。
+- 正常的 `TaskGroup` 子任务也从 final suspend 直接完成其紧凑的完成记录；每个
+  记录持有一份组状态所有权，子任务完成后先报告异常与计数，再释放该所有权。
+- `TaskGroup` 的最后一个子任务若只摘到一个 join waiter，直接经 `runnext` 交回
+  结构化父任务；多个 waiter 仍走普通批量唤醒，跨运行时交接仍由 completion
+  endpoint 降级到共享调度。
+- `TaskGroup` 的首个异常先在组锁下保存，再以 release 发布异常标志；成功 join
+  以 acquire 观察标志为假时不获取组锁，只有失败路径才复制并重抛异常。
+- `TaskGroup` 的取消状态内嵌在组状态中；导出的 token 以 aliasing 所有权共享组
+  的控制块，使 token、子任务与组只用一个生命周期根，同时允许 token 独立延寿。
+- `TaskGroup` 的组状态与 `shared_ptr` 控制块通过 FramePool 一次分配；最后所有者
+  可能是另一 worker 上完成的子任务，因此这份分配必须保留跨线程批量回收能力。
+- FramePool 的线程缓存命中只触碰本地 free-list 与计数；分配 miss 才进入
+  noinline 冷路径获取中央批次或向系统分配。释放端的批次 spill 保持内联，中央
+  批次数与数组仍只在中央锁下访问。
+- BufferPool 的线程缓存把下一节点写在空闲缓冲区的首个指针字中，并以本地头与
+  计数维护 intrusive free-list；中央跨线程列表仍只在中央锁下访问。线程缓存换
+  owner 或在线程退出时直接释放本地链，绝不解引用可能已析构的 owner；它的布局
+  填充保持既有 TLS footprint，避免扰动同线程的其他热缓存。缓存 miss、中央
+  refill/spill 与 re-home drain 走 noinline 慢路径，但这些函数留在普通 text
+  section，不能用全局 cold section 的布局变化去扰动无关热代码。
+- 取消的 `done` channel 在 token 首次请求时惰性创建；首次请求与 `cancel()` 由
+  hook 锁线性化。若取消先发生，之后创建的 channel 必须在返回前关闭；从未请求
+  `done()` 的普通 `TaskGroup` 不应为它分配 channel。
+- `TaskGroup` 的最后一个子任务在摘取 join waiter 前，必须把零计数换成 finishing
+  哨兵；撞上哨兵的新子任务在同一 waiter 锁下延续或新开代际。普通的 0→1 启动
+  不应重新获取 waiter 锁。
+- 每一代唯一赢得 0→1 的子任务通过 completion callback 身份携带直接收尾提示，
+  不扩大完成记录；它可尝试把 1 直接换成 finishing。若已有并发启动使该尝试失
+  败，则退回普通 fetch-sub 与零计数认领路径；其余完成者不得为这条单子任务快路
+  径额外读取共享计数。
 - 无效或已完成的任务保留冷路径包装，以维持既有语义并避免恢复一个已在 final
   suspend 的协程。
 - `go()` 与 `go_on()` 必须在 detach 前清空共享的续体/完成槽，此后分离中止完

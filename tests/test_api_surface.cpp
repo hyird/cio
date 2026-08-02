@@ -18,7 +18,7 @@ using namespace std::chrono_literals;
 
 namespace {
 
-template <typename Awaiter, typename Result>
+template<typename Awaiter, typename Result>
 concept ResumesAs = requires(Awaiter& awaiter) {
     { awaiter.await_ready() } -> std::convertible_to<bool>;
     { awaiter.await_resume() } -> std::same_as<Result>;
@@ -32,20 +32,16 @@ using IntJoinAwaiter =
     decltype(std::declval<cio::JoinHandle<int>&>().operator co_await());
 using VoidJoinAwaiter =
     decltype(std::declval<cio::JoinHandle<>&>().operator co_await());
-using IntSendAwaiter =
-    decltype(std::declval<const cio::Chan<int>&>().send(1));
-using IntRecvAwaiter =
-    decltype(std::declval<const cio::Chan<int>&>().recv());
+using IntSendAwaiter = decltype(std::declval<const cio::Chan<int>&>().send(1));
+using IntRecvAwaiter = decltype(std::declval<const cio::Chan<int>&>().recv());
 using SelectType = decltype(cio::select(
     cio::recv(std::declval<cio::Chan<int>>()), cio::otherwise()));
-using SelectAwaiter =
-    decltype(std::declval<SelectType&>().operator co_await());
-using GroupJoinAwaiter =
-    decltype(std::declval<cio::TaskGroup&>().join());
+using SelectAwaiter = decltype(std::declval<SelectType&>().operator co_await());
+using GroupJoinAwaiter = decltype(std::declval<cio::TaskGroup&>().join());
 
 // Runtime and Task.
-static_assert(std::same_as<decltype(cio::RuntimeOptions::worker_threads),
-                           std::size_t>);
+static_assert(
+    std::same_as<decltype(cio::RuntimeOptions::worker_threads), std::size_t>);
 static_assert(std::same_as<decltype(cio::RuntimeOptions::max_blocking_threads),
                            std::size_t>);
 static_assert(std::same_as<decltype(cio::RuntimeOptions::max_blocking_queue),
@@ -53,26 +49,23 @@ static_assert(std::same_as<decltype(cio::RuntimeOptions::max_blocking_queue),
 static_assert(std::is_constructible_v<cio::Runtime, cio::RuntimeOptions>);
 static_assert(!std::is_copy_constructible_v<cio::Runtime>);
 static_assert(!std::is_copy_assignable_v<cio::Runtime>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::Runtime&>().worker_count()),
-              std::size_t>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::Runtime&>().worker_count()),
+                 std::size_t>);
 static_assert(noexcept(std::declval<const cio::Runtime&>().worker_count()));
-static_assert(std::same_as<
-              decltype(std::declval<cio::Runtime&>().block_on(
-                  std::declval<cio::Task<int>>())),
-              int>);
-static_assert(std::same_as<
-              decltype(std::declval<cio::Runtime&>().spawn(
-                  std::declval<cio::Task<int>>())),
-              cio::JoinHandle<int>>);
-static_assert(std::same_as<
-              decltype(std::declval<cio::Runtime&>().go(
-                  std::declval<cio::Task<>>())),
-              void>);
-static_assert(std::same_as<
-              decltype(cio::run(std::declval<cio::Task<int>>(),
-                                std::declval<cio::RuntimeOptions>())),
-              int>);
+static_assert(std::same_as<decltype(std::declval<cio::Runtime&>().block_on(
+                               std::declval<cio::Task<int>>())),
+                           int>);
+static_assert(std::same_as<decltype(std::declval<cio::Runtime&>().spawn(
+                               std::declval<cio::Task<int>>())),
+                           cio::JoinHandle<int>>);
+static_assert(std::same_as<decltype(std::declval<cio::Runtime&>().go(
+                               std::declval<cio::Task<>>())),
+                           void>);
+static_assert(
+    std::same_as<decltype(cio::run(std::declval<cio::Task<int>>(),
+                                   std::declval<cio::RuntimeOptions>())),
+                 int>);
 
 static_assert(std::same_as<cio::Task<int>::value_type, int>);
 static_assert(std::same_as<cio::Task<>::value_type, void>);
@@ -83,8 +76,8 @@ static_assert(!std::is_copy_constructible_v<cio::Task<int>>);
 static_assert(!std::is_copy_assignable_v<cio::Task<int>>);
 static_assert(std::same_as<
               decltype(std::declval<const cio::Task<int>&>().valid()), bool>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::Task<int>&>().done()), bool>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::Task<int>&>().done()), bool>);
 static_assert(noexcept(std::declval<const cio::Task<int>&>().valid()));
 static_assert(noexcept(std::declval<const cio::Task<int>&>().done()));
 static_assert(ResumesAs<IntTaskAwaiter, int&&>);
@@ -94,12 +87,12 @@ static_assert(ResumesAs<VoidTaskAwaiter, void>);
 static_assert(std::is_nothrow_default_constructible_v<cio::JoinHandle<int>>);
 static_assert(std::is_nothrow_move_constructible_v<cio::JoinHandle<int>>);
 static_assert(!std::is_copy_constructible_v<cio::JoinHandle<int>>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::JoinHandle<int>&>().valid()),
-              bool>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::JoinHandle<int>&>().done()),
-              bool>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::JoinHandle<int>&>().valid()),
+                 bool>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::JoinHandle<int>&>().done()),
+                 bool>);
 static_assert(std::same_as<
               decltype(std::declval<cio::JoinHandle<int>&>().detach()), void>);
 static_assert(ResumesAs<IntJoinAwaiter, int>);
@@ -107,11 +100,10 @@ static_assert(ResumesAs<VoidJoinAwaiter, void>);
 static_assert(requires(const IntJoinAwaiter& awaiter) {
     { awaiter.await_ready() } -> std::convertible_to<bool>;
 });
-static_assert(std::same_as<
-              decltype(cio::spawn(std::declval<cio::Task<int>>())),
-              cio::JoinHandle<int>>);
-static_assert(std::same_as<
-              decltype(cio::go(std::declval<cio::Task<>>())), void>);
+static_assert(std::same_as<decltype(cio::spawn(std::declval<cio::Task<int>>())),
+                           cio::JoinHandle<int>>);
+static_assert(
+    std::same_as<decltype(cio::go(std::declval<cio::Task<>>())), void>);
 static_assert(noexcept(cio::yield()));
 
 // Channels and select.
@@ -120,74 +112,75 @@ static_assert(std::same_as<decltype(cio::make_chan<int>(1)), cio::Chan<int>>);
 static_assert(std::same_as<decltype(cio::make_chan()), cio::Chan<cio::Unit>>);
 static_assert(std::is_nothrow_copy_constructible_v<cio::Chan<int>>);
 static_assert(std::is_nothrow_move_constructible_v<cio::Chan<int>>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::Chan<int>&>().try_send(1)),
-              bool>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::Chan<int>&>().try_recv()),
-              std::optional<int>>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::Chan<int>&>().try_send(1)),
+                 bool>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::Chan<int>&>().try_recv()),
+                 std::optional<int>>);
 static_assert(std::same_as<
               decltype(std::declval<const cio::Chan<int>&>().close()), void>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::Chan<int>&>().is_closed()),
-              bool>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::Chan<int>&>().size()),
-              std::size_t>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::Chan<int>&>().capacity()),
-              std::size_t>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::Chan<int>&>().is_closed()),
+                 bool>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::Chan<int>&>().size()),
+                 std::size_t>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::Chan<int>&>().capacity()),
+                 std::size_t>);
 static_assert(ResumesAs<IntSendAwaiter, bool>);
 static_assert(ResumesAs<IntRecvAwaiter, std::optional<int>>);
 
-static_assert(std::same_as<
-              decltype(cio::recv(std::declval<cio::Chan<int>>())),
-              cio::RecvCase<int>>);
-static_assert(std::same_as<
-              decltype(cio::send(std::declval<cio::Chan<int>>(), 1)),
-              cio::SendCase<int>>);
+static_assert(std::same_as<decltype(cio::recv(std::declval<cio::Chan<int>>())),
+                           cio::RecvCase<int>>);
+static_assert(
+    std::same_as<decltype(cio::send(std::declval<cio::Chan<int>>(), 1)),
+                 cio::SendCase<int>>);
+static_assert(std::is_copy_constructible_v<cio::RecvCase<int>>);
+static_assert(std::is_move_constructible_v<cio::RecvCase<int>>);
+static_assert(std::is_copy_constructible_v<cio::SendCase<int>>);
+static_assert(std::is_move_constructible_v<cio::SendCase<int>>);
 static_assert(std::same_as<decltype(cio::after(1ms)), cio::TimeoutCase>);
-static_assert(std::same_as<
-              decltype(cio::after_deadline(std::declval<cio::TimePoint>())),
-              cio::TimeoutCase>);
+static_assert(
+    std::same_as<decltype(cio::after_deadline(std::declval<cio::TimePoint>())),
+                 cio::TimeoutCase>);
 static_assert(std::same_as<decltype(cio::otherwise()), cio::DefaultCase>);
-static_assert(std::same_as<
-              decltype(std::declval<const SelectType&>().index()),
-              std::size_t>);
-static_assert(std::same_as<
-              decltype(std::declval<SelectType&>().template get<0>()),
-              std::optional<int>>);
+static_assert(std::same_as<decltype(std::declval<const SelectType&>().index()),
+                           std::size_t>);
+static_assert(
+    std::same_as<decltype(std::declval<SelectType&>().template get<0>()),
+                 std::optional<int>>);
 static_assert(std::same_as<
               decltype(std::declval<SelectType&>().template get<1>()), void>);
 static_assert(ResumesAs<SelectAwaiter, std::size_t>);
 
 // Structured concurrency and cancellation.
 static_assert(!std::is_copy_constructible_v<cio::TaskGroup>);
-static_assert(std::same_as<
-              decltype(std::declval<cio::TaskGroup&>().spawn(
-                  std::declval<cio::Task<>>())),
-              void>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::TaskGroup&>().token()),
-              cio::CancelToken>);
+static_assert(std::same_as<decltype(std::declval<cio::TaskGroup&>().spawn(
+                               std::declval<cio::Task<>>())),
+                           void>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::TaskGroup&>().token()),
+                 cio::CancelToken>);
 static_assert(std::same_as<
               decltype(std::declval<const cio::TaskGroup&>().cancel()), void>);
 static_assert(ResumesAs<GroupJoinAwaiter, void>);
 using MutexTryLock = bool (cio::Mutex::*)();
 static_assert(std::same_as<decltype(&cio::Mutex::try_lock), MutexTryLock>);
 static_assert(std::is_copy_constructible_v<cio::CancelToken>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::CancelToken&>().cancelled()),
-              bool>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::CancelToken&>().done()),
-              cio::Chan<cio::Unit>>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::CancelSource&>().token()),
-              cio::CancelToken>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::CancelSource&>().cancel()),
-              void>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::CancelToken&>().cancelled()),
+                 bool>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::CancelToken&>().done()),
+                 cio::Chan<cio::Unit>>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::CancelSource&>().token()),
+                 cio::CancelToken>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::CancelSource&>().cancel()),
+                 void>);
 
 // Time.
 static_assert(std::same_as<cio::Clock, std::chrono::steady_clock>);
@@ -198,120 +191,112 @@ static_assert(std::same_as<decltype(cio::to_ns(1ms)), std::int64_t>);
 static_assert(std::same_as<
               decltype(cio::deadline_from_now(std::declval<cio::Duration>())),
               std::int64_t>);
-static_assert(std::same_as<
-              decltype(cio::sleep(std::declval<cio::Duration>())),
-              cio::SleepAwaiter>);
-static_assert(std::same_as<
-              decltype(cio::sleep_until(std::declval<cio::TimePoint>())),
-              cio::SleepAwaiter>);
+static_assert(std::same_as<decltype(cio::sleep(std::declval<cio::Duration>())),
+                           cio::SleepAwaiter>);
+static_assert(
+    std::same_as<decltype(cio::sleep_until(std::declval<cio::TimePoint>())),
+                 cio::SleepAwaiter>);
 static_assert(ResumesAs<cio::SleepAwaiter, void>);
 
 // Network surface. These assertions deliberately name only public types even
 // where the concrete awaiter returned by a readiness helper is private.
 using MutableBytes = std::span<std::byte>;
 using ConstBytes = std::span<const std::byte>;
-static_assert(std::same_as<
-              decltype(cio::net::SocketAddr::parse(
-                  std::declval<std::string_view>(), std::uint16_t{})),
-              cio::Result<cio::net::SocketAddr>>);
-static_assert(std::same_as<
-              decltype(cio::net::SocketAddr::loopback_v4(std::uint16_t{})),
-              cio::net::SocketAddr>);
-static_assert(std::same_as<
-              decltype(cio::net::resolve(std::declval<std::string>(),
-                                         std::uint16_t{})),
-              cio::Task<cio::Result<std::vector<cio::net::SocketAddr>>>>);
+static_assert(
+    std::same_as<decltype(cio::net::SocketAddr::parse(
+                     std::declval<std::string_view>(), std::uint16_t{})),
+                 cio::Result<cio::net::SocketAddr>>);
+static_assert(
+    std::same_as<decltype(cio::net::SocketAddr::loopback_v4(std::uint16_t{})),
+                 cio::net::SocketAddr>);
+static_assert(
+    std::same_as<decltype(cio::net::resolve(std::declval<std::string>(),
+                                            std::uint16_t{})),
+                 cio::Task<cio::Result<std::vector<cio::net::SocketAddr>>>>);
 // Socket is an implementation base, not public API: each concrete type
 // re-exports exactly its Go counterpart's surface. The move/copy contracts are
 // asserted on the concrete types.
 static_assert(!std::is_copy_constructible_v<cio::net::TcpConn>);
 static_assert(std::is_nothrow_move_constructible_v<cio::net::TcpConn>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::net::TcpConn&>().valid()),
-              bool>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::net::TcpConn&>().native_handle()),
-              int>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::net::TcpConn&>().valid()),
+                 bool>);
+static_assert(std::same_as<decltype(std::declval<const cio::net::TcpConn&>()
+                                        .native_handle()),
+                           int>);
 // A listener has no peer: remote_addr() must not exist on it, and addr() is
 // the listener's name for its own address, as Go's Listener.Addr is.
-template <typename T>
+template<typename T>
 concept HasRemoteAddr = requires(const T& t) { t.remote_addr(); };
 static_assert(HasRemoteAddr<cio::net::TcpConn>);
 static_assert(!HasRemoteAddr<cio::net::TcpListener>);
 static_assert(!HasRemoteAddr<cio::net::UnixListener>);
-static_assert(std::same_as<
-              decltype(cio::net::TcpConn::dial(
-                  std::declval<cio::net::SocketAddr>())),
-              cio::Task<cio::Result<cio::net::TcpConn>>>);
-static_assert(std::same_as<
-              decltype(cio::net::TcpConn::dial(
-                  std::declval<std::string>(), std::uint16_t{})),
-              cio::Task<cio::Result<cio::net::TcpConn>>>);
-static_assert(std::same_as<
-              decltype(std::declval<cio::net::TcpConn&>().read(
-                  std::declval<MutableBytes>())),
-              cio::Task<cio::Result<std::size_t>>>);
-static_assert(std::same_as<
-              decltype(std::declval<cio::net::TcpConn&>().write(
-                  std::declval<ConstBytes>())),
-              cio::Task<cio::Result<std::size_t>>>);
-static_assert(std::same_as<
-              decltype(cio::net::TcpListener::listen(
-                  std::declval<cio::net::SocketAddr>(), 16)),
-              cio::Result<cio::net::TcpListener>>);
-static_assert(std::same_as<
-              decltype(std::declval<cio::net::TcpListener&>().accept()),
-              cio::Task<cio::Result<cio::net::TcpConn>>>);
-static_assert(std::same_as<
-              decltype(cio::net::UdpConn::listen(
-                  std::declval<cio::net::SocketAddr>())),
-              cio::Result<cio::net::UdpConn>>);
-static_assert(std::same_as<
-              decltype(std::declval<cio::net::UdpConn&>().read_from(
-                  std::declval<MutableBytes>(),
-                  std::declval<cio::net::SocketAddr&>())),
-              cio::Task<cio::Result<std::size_t>>>);
-static_assert(std::same_as<
-              decltype(std::declval<cio::net::UdpConn&>().write_to(
-                  std::declval<ConstBytes>(),
-                  std::declval<const cio::net::SocketAddr&>())),
-              cio::Task<cio::Result<std::size_t>>>);
+static_assert(std::same_as<decltype(cio::net::TcpConn::dial(
+                               std::declval<cio::net::SocketAddr>())),
+                           cio::Task<cio::Result<cio::net::TcpConn>>>);
+static_assert(std::same_as<decltype(cio::net::TcpConn::dial(
+                               std::declval<std::string>(), std::uint16_t{})),
+                           cio::Task<cio::Result<cio::net::TcpConn>>>);
+static_assert(std::same_as<decltype(std::declval<cio::net::TcpConn&>().read(
+                               std::declval<MutableBytes>())),
+                           cio::Task<cio::Result<std::size_t>>>);
+static_assert(std::same_as<decltype(std::declval<cio::net::TcpConn&>().write(
+                               std::declval<ConstBytes>())),
+                           cio::Task<cio::Result<std::size_t>>>);
+static_assert(std::same_as<decltype(cio::net::TcpListener::listen(
+                               std::declval<cio::net::SocketAddr>(), 16)),
+                           cio::Result<cio::net::TcpListener>>);
+static_assert(
+    std::same_as<decltype(std::declval<cio::net::TcpListener&>().accept()),
+                 cio::Task<cio::Result<cio::net::TcpConn>>>);
+static_assert(std::same_as<decltype(cio::net::UdpConn::listen(
+                               std::declval<cio::net::SocketAddr>())),
+                           cio::Result<cio::net::UdpConn>>);
+static_assert(
+    std::same_as<decltype(std::declval<cio::net::UdpConn&>().read_from(
+                     std::declval<MutableBytes>(),
+                     std::declval<cio::net::SocketAddr&>())),
+                 cio::Task<cio::Result<std::size_t>>>);
+static_assert(std::same_as<decltype(std::declval<cio::net::UdpConn&>().write_to(
+                               std::declval<ConstBytes>(),
+                               std::declval<const cio::net::SocketAddr&>())),
+                           cio::Task<cio::Result<std::size_t>>>);
 
 // Result and errors.
 static_assert(std::same_as<cio::Result<int>::value_type, int>);
 static_assert(std::same_as<cio::Result<void>::value_type, void>);
 static_assert(std::is_convertible_v<int, cio::Result<int>>);
 static_assert(std::is_convertible_v<cio::Errc, cio::Result<int>>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::Result<int>&>().has_value()),
-              bool>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::Result<int>&>().error()),
-              cio::Error>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::Result<int>&>().has_value()),
+                 bool>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::Result<int>&>().error()),
+                 cio::Error>);
 static_assert(std::same_as<decltype(*std::declval<cio::Result<int>&>()), int&>);
-static_assert(std::same_as<
-              decltype(*std::declval<const cio::Result<int>&>()), const int&>);
-static_assert(std::same_as<
-              decltype(*std::declval<cio::Result<int>&&>()), int&&>);
-static_assert(std::same_as<
-              decltype(std::declval<cio::Result<int>&>().value()), int&>);
-static_assert(std::same_as<
-              decltype(std::declval<cio::Result<int>&&>().value()), int&&>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::Result<int>&>().value_or(0)),
-              int>);
+static_assert(std::same_as<decltype(*std::declval<const cio::Result<int>&>()),
+                           const int&>);
+static_assert(
+    std::same_as<decltype(*std::declval<cio::Result<int>&&>()), int&&>);
+static_assert(
+    std::same_as<decltype(std::declval<cio::Result<int>&>().value()), int&>);
+static_assert(
+    std::same_as<decltype(std::declval<cio::Result<int>&&>().value()), int&&>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::Result<int>&>().value_or(0)),
+                 int>);
 static_assert(std::same_as<decltype(cio::ok()), cio::Result<void>>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::Result<void>&>().value()),
-              void>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::Error&>().raw()), int>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::Error&>().message()),
-              std::string>);
-static_assert(std::same_as<
-              decltype(std::declval<const cio::SystemError&>().error()),
-              cio::Error>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::Result<void>&>().value()),
+                 void>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::Error&>().raw()), int>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::Error&>().message()),
+                 std::string>);
+static_assert(
+    std::same_as<decltype(std::declval<const cio::SystemError&>().error()),
+                 cio::Error>);
 
 cio::Task<int> lazy_value(bool* started, int value) {
     *started = true;
@@ -351,6 +336,14 @@ cio::Task<int> exercise_concurrency_surface() {
     CIO_CHECK(send.get<0>());
     CIO_CHECK_EQ(sent.try_recv().value_or(0), 11);
 
+    auto first = cio::make_chan<int>(1);
+    auto second = cio::make_chan<int>(1);
+    CIO_CHECK(first.try_send(13));
+    auto three_way =
+        cio::select(cio::recv(first), cio::recv(second), cio::otherwise());
+    CIO_CHECK_EQ(co_await three_way, std::size_t{0});
+    CIO_CHECK_EQ(three_way.get<0>().value_or(0), 13);
+
     auto joined = cio::spawn([]() -> cio::Task<int> { co_return 5; }());
     const int joined_value = co_await joined;
 
@@ -363,9 +356,29 @@ cio::Task<int> exercise_concurrency_surface() {
     group.spawn(send_value(grouped_values, 20));
     group.spawn(send_value(grouped_values, 22));
     co_await group.join();
-    const int grouped =
-        grouped_values.try_recv().value_or(0) +
-        grouped_values.try_recv().value_or(0);
+    const int grouped = grouped_values.try_recv().value_or(0) +
+                        grouped_values.try_recv().value_or(0);
+
+    cio::RWMutex rwmutex;
+    {
+        auto read_guard = co_await rwmutex.rlock();
+    }
+    {
+        auto write_guard = co_await rwmutex.lock();
+    }
+    CIO_CHECK(rwmutex.try_rlock());
+    rwmutex.runlock();
+
+    cio::Once once;
+    int once_calls = 0;
+    auto initialise_once = [&once_calls]() -> cio::Task<> {
+        ++once_calls;
+        co_return;
+    };
+    co_await once.call(initialise_once);
+    co_await once.call(initialise_once);
+    CIO_CHECK(once.done());
+    CIO_CHECK_EQ(once_calls, 1);
 
     cio::CancelSource cancellation;
     const cio::CancelToken token = cancellation.token();
@@ -391,8 +404,8 @@ cio::Task<int> exercise_concurrency_surface() {
 // without performing network I/O in the API fixture.
 [[maybe_unused]] cio::Task<void> downstream_net_usage(
     cio::net::TcpConn& stream, cio::net::TcpListener& listener,
-    cio::net::UdpConn& datagram, cio::net::SocketAddr peer,
-    MutableBytes input, ConstBytes output) {
+    cio::net::UdpConn& datagram, cio::net::SocketAddr peer, MutableBytes input,
+    ConstBytes output) {
     stream.set_read_timeout(1s);
     stream.set_write_deadline(cio::Clock::now() + 1s);
     const cio::Result<void> writable = co_await stream.writable();

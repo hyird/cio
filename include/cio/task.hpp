@@ -16,6 +16,7 @@
 
 #include <concepts>
 #include <coroutine>
+#include <cstdint>
 #include <exception>
 #include <optional>
 #include <stdexcept>
@@ -27,7 +28,7 @@
 
 namespace cio {
 
-template <typename T = void>
+template<typename T = void>
 class Task;
 
 namespace detail {
@@ -39,23 +40,29 @@ namespace detail {
 
 struct TaskPromiseBase;
 
-// Type-erased completion hook used only by spawn(). The pointer to this object
-// shares TaskPromiseBase's continuation slot: a lazy task can have an awaiting
-// continuation or be scheduler-detached with a join completion, never both.
-// Keeping the hook in JoinState avoids enlarging every coroutine frame.
+// Type-erased completion hook used by spawn() and TaskGroup. The pointer to
+// this object shares TaskPromiseBase's continuation slot: a lazy task can have
+// an awaiting continuation or be scheduler-detached with a completion, never
+// both. Keeping the hook in its owning state avoids enlarging every frame.
 struct DetachedTaskCompletion {
-    using Callback =
-        void (*)(TaskPromiseBase&, DetachedTaskCompletion&) noexcept;
+    using Callback = void (*)(TaskPromiseBase&,
+                              DetachedTaskCompletion&) noexcept;
 
     Callback callback;
 };
 
 struct TaskPromiseBase {
+    static constexpr std::uint8_t kAttached = 0;
+    static constexpr std::uint8_t kDetached = 1;
+    static constexpr std::uint8_t kDetachedDirect = 2;
+
     // Route every task frame through the per-thread pool. Only the sized delete
     // is declared: the coroutine machinery always knows the frame size, and
     // offering only this form means a compiler that wanted the unsized one
     // would fail loudly rather than silently bypassing the pool.
-    static void* operator new(std::size_t size) { return FramePool::allocate(size); }
+    static void* operator new(std::size_t size) {
+        return FramePool::allocate(size);
+    }
     static void operator delete(void* frame, std::size_t size) noexcept {
         FramePool::deallocate(frame, size);
     }
@@ -64,10 +71,9 @@ struct TaskPromiseBase {
         TaskPromiseBase* promise;
 
         bool await_ready() noexcept {
-            if (promise->detached) {
-                auto* const completion =
-                    static_cast<DetachedTaskCompletion*>(
-                        promise->continuation_or_completion);
+            if (promise->detached != kAttached) {
+                auto* const completion = static_cast<DetachedTaskCompletion*>(
+                    promise->continuation_or_completion);
                 if (completion != nullptr) {
                     // The callback may release and destroy its JoinState. Do
                     // not inspect `completion` again after this call.
@@ -81,7 +87,8 @@ struct TaskPromiseBase {
             return false;
         }
 
-        std::coroutine_handle<> await_suspend(std::coroutine_handle<>) noexcept {
+        std::coroutine_handle<> await_suspend(
+            std::coroutine_handle<>) noexcept {
             return promise->continuation_or_completion
                        ? std::coroutine_handle<>::from_address(
                              promise->continuation_or_completion)
@@ -113,24 +120,25 @@ struct TaskPromiseBase {
     // above; storing the raw address avoids an inactive-union-member read.
     void* continuation_or_completion = nullptr;
     std::exception_ptr exception{};
-    bool detached = false;
+    // spawn() upgrades this to kDetachedDirect before publishing the frame
+    // when it was the only local FIFO item. Keep the mode in the original
+    // one-byte slot so small coroutine frames do not cross a pool size class.
+    std::uint8_t detached = kAttached;
 
 private:
-    static void abort_detached(
-        TaskPromiseBase& promise,
-        DetachedTaskCompletion&) noexcept {
+    static void abort_detached(TaskPromiseBase& promise,
+                               DetachedTaskCompletion&) noexcept {
         abort_on_unhandled_exception(promise.exception);
     }
 
-    static inline DetachedTaskCompletion abort_completion{
-        &abort_detached};
+    static inline DetachedTaskCompletion abort_completion{&abort_detached};
 };
 
-template <typename T>
+template<typename T>
 struct TaskPromise final : TaskPromiseBase {
     Task<T> get_return_object() noexcept;
 
-    template <typename U = T>
+    template<typename U = T>
         requires std::convertible_to<U&&, T>
     void return_value(U&& v) {
         value.emplace(std::forward<U>(v));
@@ -144,7 +152,7 @@ struct TaskPromise final : TaskPromiseBase {
     std::optional<T> value;
 };
 
-template <>
+template<>
 struct TaskPromise<void> final : TaskPromiseBase {
     Task<void> get_return_object() noexcept;
     void return_void() noexcept {}
@@ -153,7 +161,7 @@ struct TaskPromise<void> final : TaskPromiseBase {
 
 }  // namespace detail
 
-template <typename T>
+template<typename T>
 class [[nodiscard]] Task {
 public:
     using promise_type = detail::TaskPromise<T>;
@@ -192,15 +200,16 @@ private:
 
         bool await_ready() const noexcept { return !coro || coro.done(); }
 
-        std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting) noexcept {
+        std::coroutine_handle<> await_suspend(
+            std::coroutine_handle<> awaiting) noexcept {
             coro.promise().continuation_or_completion = awaiting.address();
             return coro;  // tail-call into the child
         }
 
         decltype(auto) await_resume() {
             // await_ready() reports a null handle as "already done", so this is
-            // where a default-constructed or moved-from Task lands. Awaiting one
-            // is a programming error, and the codebase reports those as
+            // where a default-constructed or moved-from Task lands. Awaiting
+            // one is a programming error, and the codebase reports those as
             // exceptions rather than Results.
             if (!coro) throw std::logic_error("cio: awaited an invalid Task");
             return coro.promise().result();
@@ -219,29 +228,30 @@ private:
 
 namespace detail {
 
-template <typename T>
+template<typename T>
 inline Task<T> TaskPromise<T>::get_return_object() noexcept {
     return Task<T>{std::coroutine_handle<TaskPromise<T>>::from_promise(*this)};
 }
 
 inline Task<void> TaskPromise<void>::get_return_object() noexcept {
-    return Task<void>{std::coroutine_handle<TaskPromise<void>>::from_promise(*this)};
+    return Task<void>{
+        std::coroutine_handle<TaskPromise<void>>::from_promise(*this)};
 }
 
 // Holds a T, or nothing when T is void. Used wherever a result has to be moved
 // across a suspension boundary.
-template <typename T>
+template<typename T>
 struct ValueSlot {
     std::optional<T> value;
 
-    template <typename U>
+    template<typename U>
     void set(U&& v) {
         value.emplace(std::forward<U>(v));
     }
     T take() { return std::move(*value); }
 };
 
-template <>
+template<>
 struct ValueSlot<void> {
     void set() noexcept {}
     void take() const noexcept {}

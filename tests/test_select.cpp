@@ -81,6 +81,30 @@ void test_default_makes_it_non_blocking() {
     CIO_CHECK_EQ(cio::run(body()), std::size_t{1});
 }
 
+void test_default_does_not_compete_with_ready_cases() {
+    auto body = []() -> cio::Task<std::array<int, 3>> {
+        auto a = cio::make_chan<int>();
+        auto b = cio::make_chan<int>();
+        a.close();
+        b.close();
+
+        std::array<int, 3> picked{};
+        for (int i = 0; i < 6000; ++i) {
+            auto sel =
+                cio::select(cio::recv(a), cio::otherwise(), cio::recv(b));
+            ++picked[co_await sel];
+        }
+        co_return picked;
+    };
+
+    const auto picked = cio::run(body());
+    CIO_CHECK_EQ(picked[1], 0);
+    CIO_CHECK(picked[0] > 2500);
+    CIO_CHECK(picked[0] < 3500);
+    CIO_CHECK(picked[2] > 2500);
+    CIO_CHECK(picked[2] < 3500);
+}
+
 void test_send_case() {
     auto body = []() -> cio::Task<bool> {
         auto ch = cio::make_chan<int>(1);
@@ -89,6 +113,40 @@ void test_send_case() {
         CIO_CHECK_EQ(which, std::size_t{0});
         CIO_CHECK(sel.get<0>());
         CIO_CHECK_EQ(*co_await ch.recv(), 5);
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+void test_copied_and_moved_cases_park_safely() {
+    auto body = []() -> cio::Task<bool> {
+        auto a = cio::make_chan<int>();
+        auto b = cio::make_chan<int>();
+        auto first = cio::recv(a);
+        auto second = cio::recv(b);
+        auto copied = first;
+
+        auto sender = cio::spawn([](cio::Chan<int> target) -> cio::Task<> {
+            co_await cio::sleep(20ms);
+            CIO_CHECK(co_await target.send(42));
+        }(b));
+
+        auto recv_select = cio::select(std::move(copied), std::move(second));
+        CIO_CHECK_EQ(co_await recv_select, std::size_t{1});
+        CIO_CHECK_EQ(*recv_select.get<1>(), 42);
+        co_await sender;
+
+        auto output = cio::make_chan<int>();
+        auto send_case = cio::send(output, 9);
+        auto receiver = cio::spawn([](cio::Chan<int> source) -> cio::Task<int> {
+            co_await cio::sleep(20ms);
+            co_return *co_await source.recv();
+        }(output));
+
+        auto send_select = cio::select(std::move(send_case), cio::after(1s));
+        CIO_CHECK_EQ(co_await send_select, std::size_t{0});
+        CIO_CHECK(send_select.get<0>());
+        CIO_CHECK_EQ(co_await receiver, 9);
         co_return true;
     };
     CIO_CHECK(cio::run(body()));
@@ -216,8 +274,9 @@ void test_ready_cases_are_uniform_with_a_disabled_case() {
 
         std::array<int, 3> picked{};
         for (int i = 0; i < 6000; ++i) {
-            auto sel = cio::select(cio::recv(channels[0]), cio::recv(channels[1]),
-                                   cio::recv(channels[2]));
+            auto sel =
+                cio::select(cio::recv(channels[0]), cio::recv(channels[1]),
+                            cio::recv(channels[2]));
             const std::size_t which = co_await sel;
             CIO_CHECK(which < picked.size());
             if (which < picked.size()) ++picked[which];
@@ -235,8 +294,8 @@ void test_ready_cases_are_uniform_with_a_disabled_case() {
             CIO_CHECK(picked[i] < 3500);
         }
         if (picked[disabled] != 0) {
-            std::fprintf(stderr, "  (disabled %zu was selected %d times)\n", disabled,
-                         picked[disabled]);
+            std::fprintf(stderr, "  (disabled %zu was selected %d times)\n",
+                         disabled, picked[disabled]);
         }
     }
 }
@@ -267,8 +326,8 @@ void test_three_ready_cases_are_uniform() {
     }
     if (picked[0] <= 2500 || picked[0] >= 3500 || picked[1] <= 2500 ||
         picked[1] >= 3500 || picked[2] <= 2500 || picked[2] >= 3500) {
-        std::fprintf(stderr, "  (split was %d / %d / %d)\n", picked[0], picked[1],
-                     picked[2]);
+        std::fprintf(stderr, "  (split was %d / %d / %d)\n", picked[0],
+                     picked[1], picked[2]);
     }
 }
 
@@ -308,14 +367,16 @@ void test_two_ready_cases_are_uniform() {
 // once the specialised ones exist to be preferred.
 void test_four_ready_cases_are_uniform() {
     auto body = []() -> cio::Task<std::array<int, 4>> {
-        std::array<cio::Chan<int>, 4> channels{cio::make_chan<int>(), cio::make_chan<int>(),
-                                               cio::make_chan<int>(), cio::make_chan<int>()};
+        std::array<cio::Chan<int>, 4> channels{
+            cio::make_chan<int>(), cio::make_chan<int>(), cio::make_chan<int>(),
+            cio::make_chan<int>()};
         for (auto& channel : channels) channel.close();
 
         std::array<int, 4> picked{};
         for (int i = 0; i < 8000; ++i) {
-            auto sel = cio::select(cio::recv(channels[0]), cio::recv(channels[1]),
-                                   cio::recv(channels[2]), cio::recv(channels[3]));
+            auto sel =
+                cio::select(cio::recv(channels[0]), cio::recv(channels[1]),
+                            cio::recv(channels[2]), cio::recv(channels[3]));
             const std::size_t which = co_await sel;
             CIO_CHECK(which < 4);
             if (which < 4) ++picked[which];
@@ -329,8 +390,8 @@ void test_four_ready_cases_are_uniform() {
         CIO_CHECK(count < 2500);
     }
     if (picked[0] <= 1500 || picked[0] >= 2500) {
-        std::fprintf(stderr, "  (split was %d / %d / %d / %d)\n", picked[0], picked[1],
-                     picked[2], picked[3]);
+        std::fprintf(stderr, "  (split was %d / %d / %d / %d)\n", picked[0],
+                     picked[1], picked[2], picked[3]);
     }
 }
 
@@ -342,7 +403,9 @@ int main() {
     RUN_TEST(test_timeout_case_fires);
     RUN_TEST(test_timeout_loses_to_a_ready_channel);
     RUN_TEST(test_default_makes_it_non_blocking);
+    RUN_TEST(test_default_does_not_compete_with_ready_cases);
     RUN_TEST(test_send_case);
+    RUN_TEST(test_copied_and_moved_cases_park_safely);
     RUN_TEST(test_nil_channel_case_is_never_ready);
     RUN_TEST(test_ready_cases_are_chosen_randomly);
     RUN_TEST(test_cancellation_through_select);

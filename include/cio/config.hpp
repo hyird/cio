@@ -14,22 +14,25 @@
 // (src/reactor_common.cpp) so a kqueue or IOCP backend has a clean place to go,
 // but no such backend is claimed here.
 #if defined(__linux__)
-#  define CIO_LINUX 1
-#  define CIO_REACTOR_EPOLL 1
+#define CIO_LINUX 1
+#define CIO_REACTOR_EPOLL 1
 #else
-#  error "cio requires Linux (epoll). See src/reactor_common.cpp for the backend seam."
+#error \
+    "cio requires Linux (epoll). See src/reactor_common.cpp for the backend seam."
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
-#  define CIO_LIKELY(x)   __builtin_expect(!!(x), 1)
-#  define CIO_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#  define CIO_ALWAYS_INLINE inline __attribute__((always_inline))
-#  define CIO_NOINLINE __attribute__((noinline))
+#define CIO_LIKELY(x) __builtin_expect(!!(x), 1)
+#define CIO_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define CIO_ALWAYS_INLINE inline __attribute__((always_inline))
+#define CIO_NOINLINE __attribute__((noinline))
+#define CIO_COLD __attribute__((cold))
 #else
-#  define CIO_LIKELY(x)   (x)
-#  define CIO_UNLIKELY(x) (x)
-#  define CIO_ALWAYS_INLINE inline
-#  define CIO_NOINLINE
+#define CIO_LIKELY(x) (x)
+#define CIO_UNLIKELY(x) (x)
+#define CIO_ALWAYS_INLINE inline
+#define CIO_NOINLINE
+#define CIO_COLD
 #endif
 
 namespace cio {

@@ -48,19 +48,16 @@ struct SchedulerTestAccess;
 // there is real work to let through. A worker installs budget + 1, so 128
 // completions pass before the following one enters the cold checkpoint.
 inline constexpr std::uint32_t kCooperativeIoBudget = 128;
-extern thread_local constinit std::uint64_t
-    t_cooperative_io_budget;
+extern thread_local constinit std::uint64_t t_cooperative_io_budget;
 
 // The default-visible detail symbol lets shared-library consumers use their
 // normal TLS model. Library translation units use a hidden alias of that exact
 // storage; with GCC, a statically linked PIE can relax the TCP-completion hot
 // path to a direct segment-relative access. The alias is defined beside the
 // storage in scheduler.cpp.
-#if (defined(__GNUC__) || defined(__clang__)) && \
-    defined(CIO_BUILDING_LIBRARY)
-extern thread_local constinit
-    __attribute__((visibility("hidden")))
-    std::uint64_t t_cooperative_io_budget_local;
+#if (defined(__GNUC__) || defined(__clang__)) && defined(CIO_BUILDING_LIBRARY)
+extern thread_local constinit __attribute__((
+    visibility("hidden"))) std::uint64_t t_cooperative_io_budget_local;
 #endif
 
 enum CooperativeIoDebt : std::uint8_t {
@@ -80,6 +77,7 @@ private:
     friend class Scheduler;
     friend struct SchedulerTarget;
     friend struct SchedulerTestAccess;
+    friend void reschedule_current(std::coroutine_handle<> handle) noexcept;
 
     void run();
 
@@ -96,7 +94,8 @@ private:
     void stage_fairness_item(void* item) noexcept;
     void repair_stealable() noexcept;
 
-    bool push(void* item, bool publish = true) noexcept;
+    bool push(void* item, bool publish = true,
+              std::uint8_t* spawn_mode = nullptr) noexcept;
     CIO_NOINLINE void push_overflow(void* item) noexcept;
     void push_next(void* item) noexcept;
     std::uint32_t rand_up_to(std::uint32_t n) noexcept;
@@ -131,8 +130,7 @@ private:
         std::atomic<std::uint64_t> clear_epoch{0};
         std::uint64_t next_publish_epoch = 0;
         std::uint64_t seen_clear_epoch = 0;
-        char padding[kCacheLine -
-                     2 * sizeof(std::atomic<std::uint64_t>) -
+        char padding[kCacheLine - 2 * sizeof(std::atomic<std::uint64_t>) -
                      2 * sizeof(std::uint64_t)]{};
     };
     static_assert(sizeof(StealablePublication) == kCacheLine);
@@ -153,8 +151,7 @@ private:
 
 class Scheduler : public std::enable_shared_from_this<Scheduler> {
 public:
-    using IoCompletionRoute =
-        ::cio::detail::IoCompletionRoute;
+    using IoCompletionRoute = ::cio::detail::IoCompletionRoute;
 
     Scheduler(std::size_t worker_count, std::size_t max_blocking_threads,
               std::size_t max_blocking_queue = 1024);
@@ -167,7 +164,9 @@ public:
     void start();
     // Requests stop, wakes everything parked, joins all threads. Idempotent.
     void shutdown();
-    bool stopping() const noexcept { return stop_.load(std::memory_order_acquire); }
+    bool stopping() const noexcept {
+        return stop_.load(std::memory_order_acquire);
+    }
     std::shared_ptr<Scheduler> shared_handle() noexcept {
         return weak_from_this().lock();
     }
@@ -177,8 +176,14 @@ public:
 
     // Makes a suspended task runnable. Safe from any thread, including threads
     // the runtime does not own.
-    void schedule(std::coroutine_handle<> h) noexcept { schedule_frame(h.address()); }
+    void schedule(std::coroutine_handle<> h) noexcept {
+        schedule_frame(h.address());
+    }
     void schedule_frame(void* frame) noexcept;
+    void schedule_spawn(std::coroutine_handle<> h,
+                        std::uint8_t* spawn_mode) noexcept {
+        schedule_spawn_frame(h.address(), spawn_mode);
+    }
 
     // Directed internal scheduling prefers a valid target's inbox; overflow
     // may degrade to shared execution, and invalid targets schedule normally.
@@ -192,18 +197,15 @@ public:
     // Runnext is private by construction; shared/overflow paths publish
     // themselves immediately.
     IoCompletionRoute schedule_io_completion(
-        std::coroutine_handle<> h,
-        WorkerId preferred_worker) noexcept;
+        std::coroutine_handle<> h, WorkerId preferred_worker) noexcept;
     // Soft-affinity completion wakeups (I/O deadline/close, blocking-pool and
     // cross-runtime join). A local preferred worker may retain the
     // continuation; a monitor, foreign runtime/thread or different worker
     // publishes it globally so an idle worker can make progress even when the
     // preferred worker is executing a CPU-bound task.
-    void schedule_completion_wake(
-        std::coroutine_handle<> h,
-        WorkerId preferred_worker) noexcept;
-    void finish_io_batch(
-        std::uint32_t unpublished_local_fifo) noexcept;
+    void schedule_completion_wake(std::coroutine_handle<> h,
+                                  WorkerId preferred_worker) noexcept;
+    void finish_io_batch(std::uint32_t unpublished_local_fifo) noexcept;
 
     // Re-queues a task that is voluntarily giving up the worker. Skips the
     // wake path: the worker doing this is about to loop straight back into its
@@ -222,7 +224,9 @@ public:
 
     // Hand-off: run this task next on the current worker. Use when the caller
     // just produced the exact data the target is waiting for.
-    void schedule_next(std::coroutine_handle<> h) noexcept { schedule_next_frame(h.address()); }
+    void schedule_next(std::coroutine_handle<> h) noexcept {
+        schedule_next_frame(h.address());
+    }
     void schedule_next_frame(void* frame) noexcept;
 
     void schedule_batch(void* const* frames, std::uint32_t n) noexcept;
@@ -275,15 +279,16 @@ private:
     void enqueue_remote(WorkerId target, void* frame, bool wake) noexcept;
     CIO_NOINLINE void schedule_completion_fallback(
         void* frame, WorkerId preferred_worker) noexcept;
+    void schedule_spawn_frame(void* frame, std::uint8_t* spawn_mode) noexcept;
     void wake_worker(WorkerId worker) noexcept;
     bool wake_one_idle(WorkerId start = 0) noexcept;
     bool wake_one_searcher(WorkerId start = 0) noexcept;
-    void publish_stealable(Worker& worker, std::uint32_t wake_count = 1) noexcept;
+    void publish_stealable(Worker& worker,
+                           std::uint32_t wake_count = 1) noexcept;
     bool repair_stealable(Worker& worker) noexcept;
     void poller_returned(WorkerId shard) noexcept;
     void monitor_pass(std::int64_t now) noexcept;
-    static bool should_use_batch_monitor_policy(
-        int inherited_policy) noexcept;
+    static bool should_use_batch_monitor_policy(int inherited_policy) noexcept;
     void monitor_main();
 
     std::vector<std::unique_ptr<Worker>> workers_;
@@ -308,11 +313,22 @@ Worker* current_worker() noexcept;
 WorkerId current_worker_id(const Scheduler* sched = nullptr) noexcept;
 Scheduler* current_scheduler() noexcept;
 
+inline void reschedule_current(std::coroutine_handle<> handle) noexcept {
+    Worker* const worker = current_worker();
+    if (CIO_LIKELY(worker != nullptr)) {
+        worker->push(handle.address(), false);
+        return;
+    }
+    // Preserve yield()'s established runtime-context precondition. Outside a
+    // worker, the process default is the same fallback current_scheduler()
+    // previously selected before Scheduler::reschedule_self().
+    current_scheduler()->schedule_frame(handle.address());
+}
+
 // Invoked only when the inline I/O-completion counter reaches its boundary.
 // Keeping scheduler lookup, demand inspection and quota renewal out of line
 // avoids duplicating that cold half in every network coroutine actor.
-CIO_NOINLINE std::uint8_t
-cooperative_io_return_debt_slow() noexcept;
+CIO_NOINLINE std::uint8_t cooperative_io_return_debt_slow() noexcept;
 
 // Common completion fast path used by the explicit successful-operation
 // checkpoint and the internal TCP terminal-completion policy.
@@ -322,13 +338,10 @@ inline std::uint8_t cooperative_io_return_debt() noexcept {
     // comparison; a worker always installs a real budget before resuming a
     // task. In the frozen GCC x86-64 build this contracts to one TLS decrement
     // and one not-taken branch.
-#if (defined(__GNUC__) || defined(__clang__)) && \
-    defined(CIO_BUILDING_LIBRARY)
-    std::uint64_t& budget =
-        t_cooperative_io_budget_local;
+#if (defined(__GNUC__) || defined(__clang__)) && defined(CIO_BUILDING_LIBRARY)
+    std::uint64_t& budget = t_cooperative_io_budget_local;
 #else
-    std::uint64_t& budget =
-        t_cooperative_io_budget;
+    std::uint64_t& budget = t_cooperative_io_budget;
 #endif
     const std::uint64_t remaining = budget - 1;
     budget = remaining;
@@ -339,8 +352,7 @@ inline std::uint8_t cooperative_io_return_debt() noexcept {
 }
 
 std::coroutine_handle<> defer_cooperative_io_continuation(
-    std::coroutine_handle<> continuation,
-    std::uint8_t debt) noexcept;
+    std::coroutine_handle<> continuation, std::uint8_t debt) noexcept;
 
 // Used by successful accept and UDP paths after releasing their descriptor
 // lease. TCP counts both success and error terminal results from its private
@@ -349,27 +361,23 @@ std::coroutine_handle<> defer_cooperative_io_continuation(
 class CooperativeIoCheckpoint {
 public:
     bool await_ready() noexcept {
-        const std::uint8_t debt =
-            cooperative_io_checkpoint_debt();
+        const std::uint8_t debt = cooperative_io_checkpoint_debt();
         if (debt == kCooperativeIoDebtNone) return true;
         debt_ = debt;
         return false;
     }
 
-    void await_suspend(
-        std::coroutine_handle<> handle) noexcept {
+    void await_suspend(std::coroutine_handle<> handle) noexcept {
         // Copy before publication: the final scheduler call may make this
         // frame runnable on another worker immediately.
         Scheduler* const scheduler = current_scheduler();
-        scheduler->reschedule_self_for_cooperative_io(
-            handle, debt_);
+        scheduler->reschedule_self_for_cooperative_io(handle, debt_);
     }
 
     void await_resume() const noexcept {}
 
 private:
-    static std::uint8_t
-    cooperative_io_checkpoint_debt() noexcept {
+    static std::uint8_t cooperative_io_checkpoint_debt() noexcept {
         return cooperative_io_return_debt();
     }
 

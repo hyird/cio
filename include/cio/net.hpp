@@ -1,6 +1,7 @@
 // Async TCP/UDP.
 //
-//     auto listener = cio::net::TcpListener::listen(cio::net::SocketAddr::any_v4(8080)).value();
+//     auto listener =
+//     cio::net::TcpListener::listen(cio::net::SocketAddr::any_v4(8080)).value();
 //     for (;;) {
 //         auto conn = co_await listener.accept();
 //         if (!conn) break;
@@ -18,9 +19,9 @@
 // — but destroying the object out from under a parked task is not.
 #pragma once
 
+#include <concepts>
 #include <cstdint>
 #include <memory>
-#include <concepts>
 #include <span>
 #include <string>
 #include <string_view>
@@ -119,7 +120,8 @@ struct Resolver {
 };
 
 // Delegates to a default-constructed Resolver.
-Task<Result<std::vector<SocketAddr>>> resolve(std::string host, std::uint16_t port);
+Task<Result<std::vector<SocketAddr>>> resolve(std::string host,
+                                              std::uint16_t port);
 
 // Implementation base for the socket types: owns the fd and its reactor
 // registration.
@@ -144,8 +146,7 @@ protected:
             close();
             fd_ = std::exchange(other.fd_, -1);
             desc_ = std::exchange(other.desc_, nullptr);
-            scheduler_lifetime_ =
-                std::move(other.scheduler_lifetime_);
+            scheduler_lifetime_ = std::move(other.scheduler_lifetime_);
             cancel_binding_ = std::move(other.cancel_binding_);
             cancel_token_ = std::move(other.cancel_token_);
         }
@@ -211,14 +212,14 @@ public:
     TcpConn() = default;
 
     // Go's TCPConn surface, re-exported piece by piece from the protected base.
-    using Socket::valid;
-    using Socket::native_handle;
+    using Socket::clear_cancel;
     using Socket::close;
+    using Socket::deadline;
     using Socket::local_addr;
+    using Socket::native_handle;
     using Socket::remote_addr;
     using Socket::set_cancel;
-    using Socket::clear_cancel;
-    using Socket::deadline;
+    using Socket::valid;
 
     // Already-resolved connect. With a cancel token, a cancellation resumes the
     // caller with Errc::cancelled; the abandoned socket is closed once its
@@ -228,7 +229,7 @@ public:
     // Convenience: resolves through a default Dialer.
     static Task<Result<TcpConn>> dial(std::string host, std::uint16_t port);
     static Task<Result<TcpConn>> dial(std::string host, std::uint16_t port,
-                                           CancelToken cancel);
+                                      CancelToken cancel);
 
     // Reads whatever is available. 0 means the peer closed cleanly (EOF).
     Task<Result<std::size_t>> read(std::span<std::byte> buffer);
@@ -291,16 +292,16 @@ public:
     // Go's TCPListener surface: accept, addr, close, a deadline. Deliberately
     // no local_addr()/remote_addr() — addr() is the listener's name for its
     // address, and a listener has no peer.
-    using Socket::valid;
-    using Socket::native_handle;
-    using Socket::close;
-    using Socket::set_cancel;
     using Socket::clear_cancel;
+    using Socket::close;
     using Socket::deadline;
+    using Socket::native_handle;
+    using Socket::set_cancel;
+    using Socket::valid;
 
     static Result<TcpListener> listen(SocketAddr addr, int backlog = 1024);
     static Result<TcpListener> listen(std::string_view host, std::uint16_t port,
-                                    int backlog = 1024);
+                                      int backlog = 1024);
 
     Task<Result<TcpConn>> accept();
 
@@ -316,9 +317,9 @@ public:
 //
 // Go models this as UnixAddr with a Name and a Net; here the path is the whole
 // address and the socket type is the class that owns it. An abstract address —
-// Linux's leading NUL, which lives in a namespace rather than the filesystem and
-// disappears with the last reference — is written with a leading '@', matching
-// the convention every Linux tool uses.
+// Linux's leading NUL, which lives in a namespace rather than the filesystem
+// and disappears with the last reference — is written with a leading '@',
+// matching the convention every Linux tool uses.
 class UnixAddr {
 public:
     UnixAddr() = default;
@@ -337,21 +338,22 @@ private:
 
 // Go's UnixConn: a stream socket over a Unix domain address.
 //
-// The same Conn surface as TcpConn, so a generic helper works over either. There
-// is no address to report for an unnamed peer, so remote_addr() on an accepted
-// connection is usually empty — that is the kernel's behaviour, not an omission.
+// The same Conn surface as TcpConn, so a generic helper works over either.
+// There is no address to report for an unnamed peer, so remote_addr() on an
+// accepted connection is usually empty — that is the kernel's behaviour, not an
+// omission.
 class UnixConn : public Socket {
 public:
     UnixConn() = default;
 
-    using Socket::valid;
-    using Socket::native_handle;
+    using Socket::clear_cancel;
     using Socket::close;
+    using Socket::deadline;
     using Socket::local_addr;
+    using Socket::native_handle;
     using Socket::remote_addr;
     using Socket::set_cancel;
-    using Socket::clear_cancel;
-    using Socket::deadline;
+    using Socket::valid;
 
     static Task<Result<UnixConn>> dial(UnixAddr addr);
     static Task<Result<UnixConn>> dial(UnixAddr addr, CancelToken cancel);
@@ -393,11 +395,11 @@ class UnixListener : public Socket {
 public:
     UnixListener() = default;
 
-    using Socket::valid;
-    using Socket::native_handle;
-    using Socket::set_cancel;
     using Socket::clear_cancel;
     using Socket::deadline;
+    using Socket::native_handle;
+    using Socket::set_cancel;
+    using Socket::valid;
 
     // Socket::close() is deliberately non-virtual — a vtable on a socket is not
     // worth one cold path — so destruction alone would never remove the bound
@@ -405,8 +407,8 @@ public:
     // listener does, however it is destroyed.
     ~UnixListener() { unlink(); }
 
-    // The moved-from listener must stop owning the path, or its destructor would
-    // unlink a socket the new owner is still serving.
+    // The moved-from listener must stop owning the path, or its destructor
+    // would unlink a socket the new owner is still serving.
     UnixListener(UnixListener&& other) noexcept
         : Socket(std::move(other)),
           bound_(std::move(other.bound_)),
@@ -436,8 +438,8 @@ public:
     void set_deadline(TimePoint deadline);
     void clear_deadline();
 
-    // Removes the filesystem path this listener bound, if any. Called by close()
-    // when the listener created the path.
+    // Removes the filesystem path this listener bound, if any. Called by
+    // close() when the listener created the path.
     void unlink();
 
     void close();
@@ -452,8 +454,7 @@ private:
 // Addresses are tried with the families interleaved (v6, v4, v6, ...) rather
 // than exhausting one family before starting the other, so a host whose IPv6
 // route is a blackhole does not have to fail every v6 address first. Attempts
-// run one at a time, each bounded by fallback_delay; cio does not yet race
-// attempts concurrently the way RFC 8305 does.
+// are raced: a new address starts after each fallback_delay until one connects.
 struct Dialer {
     // Covers resolution and every connection attempt. Zero means no overall
     // timeout. Go's Dialer.Timeout.
@@ -468,31 +469,32 @@ struct Dialer {
     bool prefer_builtin_resolver = true;
 
     Task<Result<TcpConn>> dial_tcp(std::string host, std::uint16_t port,
-                                     CancelToken cancel = {}) const;
+                                   CancelToken cancel = {}) const;
 };
 
 // Delegates to a default-constructed Dialer.
 Task<Result<TcpConn>> dial_tcp(std::string host, std::uint16_t port,
-                                 CancelToken cancel = {});
+                               CancelToken cancel = {});
 
 class UdpConn : public Socket {
 public:
     UdpConn() = default;
 
-    using Socket::valid;
-    using Socket::native_handle;
+    using Socket::clear_cancel;
     using Socket::close;
+    using Socket::deadline;
     using Socket::local_addr;
+    using Socket::native_handle;
     using Socket::remote_addr;
     using Socket::set_cancel;
-    using Socket::clear_cancel;
-    using Socket::deadline;
+    using Socket::valid;
 
     static Result<UdpConn> listen(SocketAddr addr);
 
-    Task<Result<std::size_t>> read_from(std::span<std::byte> buffer, SocketAddr& from);
+    Task<Result<std::size_t>> read_from(std::span<std::byte> buffer,
+                                        SocketAddr& from);
     Task<Result<std::size_t>> write_to(std::span<const std::byte> buffer,
-                                      const SocketAddr& to);
+                                       const SocketAddr& to);
 
     // Same deadline rules as TcpConn.
     void set_deadline(TimePoint deadline);
@@ -516,7 +518,7 @@ public:
 // net.Conn, so a generic helper works over plaintext and TLS unchanged.
 
 // net.Conn
-template <typename T>
+template<typename T>
 concept Conn = requires(T& c, std::span<std::byte> in,
                         std::span<const std::byte> out, TimePoint t) {
     { c.read(in) } -> std::same_as<Task<Result<std::size_t>>>;
@@ -530,21 +532,21 @@ concept Conn = requires(T& c, std::span<std::byte> in,
 };
 
 // net.PacketConn
-template <typename T>
-concept PacketConn = requires(T& c, std::span<std::byte> in,
-                              std::span<const std::byte> out, SocketAddr& from,
-                              const SocketAddr& to, TimePoint t) {
-    { c.read_from(in, from) } -> std::same_as<Task<Result<std::size_t>>>;
-    { c.write_to(out, to) } -> std::same_as<Task<Result<std::size_t>>>;
-    c.close();
-    { c.local_addr() } -> std::same_as<Result<SocketAddr>>;
-    c.set_deadline(t);
-    c.set_read_deadline(t);
-    c.set_write_deadline(t);
-};
+template<typename T>
+concept PacketConn =
+    requires(T& c, std::span<std::byte> in, std::span<const std::byte> out,
+             SocketAddr& from, const SocketAddr& to, TimePoint t) {
+        { c.read_from(in, from) } -> std::same_as<Task<Result<std::size_t>>>;
+        { c.write_to(out, to) } -> std::same_as<Task<Result<std::size_t>>>;
+        c.close();
+        { c.local_addr() } -> std::same_as<Result<SocketAddr>>;
+        c.set_deadline(t);
+        c.set_read_deadline(t);
+        c.set_write_deadline(t);
+    };
 
 // net.Listener
-template <typename T>
+template<typename T>
 concept Listener = requires(T& l, TimePoint t) {
     l.accept();
     l.close();

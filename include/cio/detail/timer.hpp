@@ -10,8 +10,8 @@
 #pragma once
 
 #include <atomic>
-#include <cstdint>
 #include <coroutine>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -28,11 +28,11 @@ class Scheduler;
 // frame, so arming a timer never allocates.
 struct Timer {
     enum State : std::uint32_t {
-        kIdle = 0,       // not in any heap
-        kArmed = 1,      // in a heap, waiting for its deadline
-        kFiring = 2,     // on_fire is running and still touching this node
-        kFired = 3,      // done; nobody will touch this node again
-        kCancelled = 4   // removed before firing
+        kIdle = 0,      // not in any heap
+        kArmed = 1,     // in a heap, waiting for its deadline
+        kFiring = 2,    // on_fire is running and still touching this node
+        kFired = 3,     // done; nobody will touch this node again
+        kCancelled = 4  // removed before firing
     };
 
     // Invoked when the deadline is reached, instead of simply scheduling
@@ -73,7 +73,8 @@ struct Timer {
     // Filled in by TimerService::arm().
     std::uint32_t shard = 0;
     WorkerId preferred_worker = kInvalidWorkerId;
-    std::uint32_t heap_index = ~0u;  // position in the shard heap, for O(log n) removal
+    std::uint32_t heap_index =
+        ~0u;  // position in the shard heap, for O(log n) removal
 };
 
 class TimerService {
@@ -130,6 +131,7 @@ private:
 
     static void sift_up(std::vector<Timer*>& heap, std::size_t i) noexcept;
     static void sift_down(std::vector<Timer*>& heap, std::size_t i) noexcept;
+    static void heap_pop_root(std::vector<Timer*>& heap) noexcept;
     static void heap_remove(std::vector<Timer*>& heap, std::size_t i) noexcept;
     void republish(Shard& s) noexcept;
     std::size_t run_expired_shard(Shard& s, std::int64_t now);

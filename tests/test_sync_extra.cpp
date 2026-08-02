@@ -74,11 +74,11 @@ void test_writer_is_not_starved() {
         // Hold a read lock so the writer has to queue.
         auto first = co_await lock.rlock();
 
-        auto writer = cio::spawn([](cio::RWMutex& m,
-                                    std::atomic<bool>& ran) -> cio::Task<> {
-            auto guard = co_await m.lock();
-            ran.store(true);
-        }(lock, writer_ran));
+        auto writer = cio::spawn(
+            [](cio::RWMutex& m, std::atomic<bool>& ran) -> cio::Task<> {
+                auto guard = co_await m.lock();
+                ran.store(true);
+            }(lock, writer_ran));
 
         co_await cio::sleep(10ms);
         // With a writer queued, a fresh reader must not be admitted.
@@ -97,6 +97,158 @@ void test_writer_is_not_starved() {
         CIO_CHECK(writer_ran.load());
         co_await latecomers.join();
         (void)stop;
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// The writer publishes its pending bit while the final reader is leaving.
+// Missing either side of that handshake parks the writer forever: the reader
+// observes no writer to wake, while later readers observe the pending bit and
+// cannot make progress either.
+void test_last_reader_hands_off_to_queued_writer() {
+    auto body = []() -> cio::Task<bool> {
+        for (int round = 0; round < 2'000; ++round) {
+            cio::RWMutex lock;
+            auto reader = co_await lock.rlock();
+            std::atomic<bool> writer_started{false};
+            bool writer_ran = false;
+            auto writer =
+                cio::spawn([](cio::RWMutex& mutex, std::atomic<bool>& started,
+                              bool& ran) -> cio::Task<> {
+                    started.store(true, std::memory_order_release);
+                    auto guard = co_await mutex.lock();
+                    ran = true;
+                }(lock, writer_started, writer_ran));
+
+            while (!writer_started.load(std::memory_order_acquire)) {
+                co_await cio::yield();
+            }
+
+            bool queued = false;
+            const auto queue_deadline = cio::Clock::now() + 1s;
+            while (cio::Clock::now() < queue_deadline) {
+                if (!lock.try_rlock()) {
+                    queued = true;
+                    break;
+                }
+                lock.runlock();
+                co_await cio::yield();
+            }
+            // A yield count is not a scheduling deadline: another worker may
+            // be descheduled after publishing writer_started but before it
+            // reaches lock(). Bound the actual publication check by wall time.
+            CIO_CHECK(queued);
+
+            reader = cio::RWMutex::ReadGuard{};
+            co_await writer;
+            CIO_CHECK(writer_ran);
+        }
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+// The uncontended writer fast path is valid only while no waiter is being
+// published. Releasing immediately after the reader announces its attempt
+// repeatedly hits both sides of that boundary: unlock either wins first and
+// the reader acquires zero, or the reader publishes pending and unlock joins
+// the queue protocol. Neither outcome may lose the reader or overlap owners.
+void test_rwmutex_unlock_races_first_reader_publication() {
+    auto body = []() -> cio::Task<bool> {
+        for (int round = 0; round < 20'000; ++round) {
+            cio::RWMutex lock;
+            auto writer = co_await lock.lock();
+            auto ready = cio::make_chan(1);
+            std::atomic<int> inside{1};
+            std::atomic<bool> overlap{false};
+            std::atomic<bool> reader_acquired{false};
+
+            auto reader = cio::spawn(
+                [](cio::RWMutex& mutex, cio::Chan<cio::Unit> started,
+                   std::atomic<int>& active, std::atomic<bool>& raced,
+                   std::atomic<bool>& acquired) -> cio::Task<bool> {
+                    co_await started.send(cio::Unit{});
+                    auto guard = co_await mutex.rlock();
+                    acquired.store(true, std::memory_order_relaxed);
+                    if (active.fetch_add(1, std::memory_order_relaxed) != 0) {
+                        raced.store(true, std::memory_order_relaxed);
+                    }
+                    co_await cio::yield();
+                    active.fetch_sub(1, std::memory_order_relaxed);
+                    co_return true;
+                }(lock, ready, inside, overlap, reader_acquired));
+
+            (void)co_await ready.recv();
+            if ((round & 15) == 0) {
+                // Periodically give the waiter enough time to publish while
+                // the writer remains held, also checking basic exclusion.
+                co_await cio::yield();
+                CIO_CHECK(!reader_acquired.load(std::memory_order_relaxed));
+            }
+
+            inside.fetch_sub(1, std::memory_order_relaxed);
+            writer = cio::RWMutex::WriteGuard{};
+
+            // A fresh writer may legitimately win before the reader publishes,
+            // but once either side owns the lock they must remain exclusive.
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                if (lock.try_lock()) {
+                    if (inside.fetch_add(1, std::memory_order_relaxed) != 0) {
+                        overlap.store(true, std::memory_order_relaxed);
+                    }
+                    co_await cio::yield();
+                    inside.fetch_sub(1, std::memory_order_relaxed);
+                    lock.unlock();
+                }
+                co_await cio::yield();
+            }
+
+            CIO_CHECK(co_await reader);
+            CIO_CHECK(reader_acquired.load(std::memory_order_relaxed));
+            CIO_CHECK(!overlap.load(std::memory_order_relaxed));
+            CIO_CHECK(lock.try_lock());
+            lock.unlock();
+        }
+        co_return true;
+    };
+
+    cio::RuntimeOptions options;
+    options.worker_threads = 8;
+    CIO_CHECK(cio::run(body(), options));
+}
+
+// Regression for the zero-to-pending race: one writer repeatedly queues while
+// readers leave in parallel. The broken two-step "retry, then set pending"
+// protocol strands every task in this exact shape with all workers parked.
+void test_rwmutex_parallel_handoff_makes_progress() {
+    auto body = []() -> cio::Task<bool> {
+        cio::RWMutex lock;
+        cio::TaskGroup tasks;
+        std::atomic<int> completed{0};
+
+        tasks.spawn(
+            [](cio::RWMutex& mutex, std::atomic<int>& done) -> cio::Task<> {
+                for (int i = 0; i < 5'000; ++i) {
+                    auto guard = co_await mutex.lock();
+                    co_await cio::yield();
+                }
+                done.fetch_add(1, std::memory_order_relaxed);
+            }(lock, completed));
+
+        for (int reader = 0; reader < 7; ++reader) {
+            tasks.spawn(
+                [](cio::RWMutex& mutex, std::atomic<int>& done) -> cio::Task<> {
+                    for (int i = 0; i < 5'000; ++i) {
+                        auto guard = co_await mutex.rlock();
+                        co_await cio::yield();
+                    }
+                    done.fetch_add(1, std::memory_order_relaxed);
+                }(lock, completed));
+        }
+
+        co_await tasks.join();
+        CIO_CHECK_EQ(completed.load(std::memory_order_relaxed), 8);
         co_return true;
     };
     CIO_CHECK(cio::run(body()));
@@ -261,7 +413,6 @@ void test_cond_notify_one() {
     CIO_CHECK(cio::run(body()));
 }
 
-
 // ------------------------------------------------- cancellation scopes ---
 
 // Cancelling a parent must reach every descendant, which is the whole point of
@@ -301,8 +452,8 @@ void test_cancel_does_not_propagate_up() {
     CIO_CHECK(cio::run(body()));
 }
 
-// Attaching to an already-cancelled parent must fire immediately: no callback is
-// coming, so waiting for one would hang.
+// Attaching to an already-cancelled parent must fire immediately: no callback
+// is coming, so waiting for one would hang.
 void test_child_of_cancelled_parent_starts_cancelled() {
     auto body = []() -> cio::Task<bool> {
         cio::CancelSource root;
@@ -369,8 +520,8 @@ void test_explicit_cancel_beats_the_deadline() {
     CIO_CHECK(cio::run(body()));
 }
 
-// A scope must integrate with the operations that take a token, which is what it
-// exists for.
+// A scope must integrate with the operations that take a token, which is what
+// it exists for.
 void test_scope_cancels_a_socket_operation() {
     auto body = []() -> cio::Task<bool> {
         auto listener =
@@ -378,11 +529,11 @@ void test_scope_cancels_a_socket_operation() {
         CIO_CHECK(listener.has_value());
         const auto addr = listener->addr().value();
 
-        auto accepted = cio::spawn([](cio::net::TcpListener l)
-                                       -> cio::Task<cio::net::TcpConn> {
-            auto conn = co_await l.accept();
-            co_return conn ? std::move(*conn) : cio::net::TcpConn{};
-        }(std::move(*listener)));
+        auto accepted = cio::spawn(
+            [](cio::net::TcpListener l) -> cio::Task<cio::net::TcpConn> {
+                auto conn = co_await l.accept();
+                co_return conn ? std::move(*conn) : cio::net::TcpConn{};
+            }(std::move(*listener)));
 
         auto client = co_await cio::net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
@@ -433,6 +584,9 @@ int main() {
     RUN_TEST(test_finished_children_deregister);
     RUN_TEST(test_readers_share_writers_exclude);
     RUN_TEST(test_writer_is_not_starved);
+    RUN_TEST(test_last_reader_hands_off_to_queued_writer);
+    RUN_TEST(test_rwmutex_unlock_races_first_reader_publication);
+    RUN_TEST(test_rwmutex_parallel_handoff_makes_progress);
     RUN_TEST(test_try_lock_variants);
     RUN_TEST(test_once_runs_exactly_once);
     RUN_TEST(test_once_waiters_see_the_result);

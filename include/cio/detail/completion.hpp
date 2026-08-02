@@ -33,14 +33,11 @@ public:
 
     Scheduler* get() const noexcept { return scheduler_; }
     Scheduler* operator->() const noexcept { return scheduler_; }
-    explicit operator bool() const noexcept {
-        return scheduler_ != nullptr;
-    }
+    explicit operator bool() const noexcept { return scheduler_ != nullptr; }
 
 private:
     friend struct SchedulerTarget;
-    SchedulerLease(Scheduler* scheduler,
-                   CompletionEndpoint* endpoint) noexcept
+    SchedulerLease(Scheduler* scheduler, CompletionEndpoint* endpoint) noexcept
         : scheduler_(scheduler), endpoint_(endpoint) {}
     void reset() noexcept;
 
@@ -58,31 +55,26 @@ private:
 struct SchedulerTarget {
     SchedulerLease lock() const noexcept;
     // Join completion stays local when it originates on the awaiting
-    // Scheduler; a foreign completion uses the captured worker only as a soft
-    // affinity hint.
-    static void dispatch(
-        SchedulerTarget target,
-        std::coroutine_handle<> handle,
-        WorkerId preferred_worker) noexcept;
+    // Scheduler; a foreign completion uses any valid worker id only as a soft
+    // affinity hint and otherwise publishes shared work.
+    static void dispatch(SchedulerTarget target, std::coroutine_handle<> handle,
+                         WorkerId preferred_worker) noexcept;
     // Direct hand-off for channel/synchronisation rendezvous.
-    static void dispatch_next(
-        SchedulerTarget target,
-        std::coroutine_handle<> handle) noexcept;
+    static void dispatch_next(SchedulerTarget target,
+                              std::coroutine_handle<> handle) noexcept;
     // Wakeups which may originate on a pool thread, monitor, or another
     // runtime. A same-runtime preferred worker may retain the continuation;
     // every other path publishes it where an idle worker can take it.
-    static void dispatch_completion(
-        SchedulerTarget target,
-        std::coroutine_handle<> handle,
-        WorkerId preferred_worker) noexcept;
+    static void dispatch_completion(SchedulerTarget target,
+                                    std::coroutine_handle<> handle,
+                                    WorkerId preferred_worker) noexcept;
     // Reactor batches need to distinguish unpublished local FIFO placement
     // from runnext/shared placement. Returns false when the target has already
     // closed and no scheduling occurred.
-    static bool dispatch_io(
-        SchedulerTarget target,
-        std::coroutine_handle<> handle,
-        WorkerId preferred_worker,
-        IoCompletionRoute& route) noexcept;
+    static bool dispatch_io(SchedulerTarget target,
+                            std::coroutine_handle<> handle,
+                            WorkerId preferred_worker,
+                            IoCompletionRoute& route) noexcept;
     bool operator==(const SchedulerTarget&) const noexcept = default;
 
     CompletionEndpoint* endpoint = nullptr;

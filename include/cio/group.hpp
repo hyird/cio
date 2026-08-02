@@ -20,11 +20,12 @@
 #include <atomic>
 #include <cstddef>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <vector>
 #include <utility>
+#include <vector>
 
 #include "cio/chan.hpp"
 #include "cio/clock.hpp"
@@ -37,6 +38,33 @@ namespace cio {
 namespace detail {
 
 struct CancelAccess;
+
+template<typename T>
+class GroupAllocator {
+public:
+    using value_type = T;
+
+    GroupAllocator() noexcept = default;
+    template<typename U>
+    GroupAllocator(const GroupAllocator<U>&) noexcept {}
+
+    T* allocate(std::size_t count) {
+        static_assert(alignof(T) <= alignof(std::max_align_t));
+        if (count > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+            throw std::bad_array_new_length{};
+        }
+        return static_cast<T*>(FramePool::allocate(count * sizeof(T)));
+    }
+
+    void deallocate(T* block, std::size_t count) noexcept {
+        FramePool::deallocate(block, count * sizeof(T));
+    }
+
+    template<typename U>
+    friend bool operator==(GroupAllocator, GroupAllocator<U>) noexcept {
+        return true;
+    }
+};
 
 // Something to run when cancellation fires, for waiters that cannot select on
 // a channel. A parked socket read is the motivating case: the flag alone gates
@@ -52,19 +80,38 @@ struct CancelHook {
 
 struct CancelState {
     std::atomic<bool> cancelled{false};
-    Chan<Unit> done = make_chan<Unit>(0);
+    Chan<Unit> done;
+    std::atomic<bool> done_ready{false};
 
     // When this state was given a deadline, the instant it fires. Zero means
     // none. Stored here so a token can report it without a second handle.
     std::atomic<std::int64_t> deadline_ns{0};
-    // Type-erased slot for whatever a derived construction needs to keep alive —
-    // a timer, a link to a parent. Held here rather than in the source so a
+    // Type-erased slot for whatever a derived construction needs to keep alive
+    // — a timer, a link to a parent. Held here rather than in the source so a
     // moved or copied token cannot outlive it.
     std::shared_ptr<void> keepalive;
 
     std::mutex hooks_mutex;
     std::vector<std::shared_ptr<CancelHook>> hooks;
     bool fired = false;
+
+    Chan<Unit> done_channel() {
+        if (done_ready.load(std::memory_order_acquire)) return done;
+
+        Chan<Unit> result;
+        {
+            std::lock_guard<std::mutex> lock(hooks_mutex);
+            if (!done_ready.load(std::memory_order_relaxed)) {
+                done = make_chan<Unit>(0);
+                // If cancellation already completed, establish the channel's
+                // final state before publishing it to lock-free readers.
+                if (fired) done.close();
+                done_ready.store(true, std::memory_order_release);
+            }
+            result = done;
+        }
+        return result;
+    }
 
     // False when cancellation already fired; the caller must act immediately
     // instead of waiting for a callback that will never come.
@@ -91,15 +138,17 @@ struct CancelState {
         // Detach the list before running anything: a hook may re-enter this
         // state, and none of them may run under the lock.
         std::vector<std::shared_ptr<CancelHook>> to_fire;
+        Chan<Unit> done_to_close;
         {
             std::lock_guard<std::mutex> lock(hooks_mutex);
             fired = true;
             to_fire.swap(hooks);
+            done_to_close = done;
         }
         for (const auto& hook : to_fire) hook->on_cancel();
 
         // Closing wakes every parked receiver, including select cases.
-        done.close();
+        done_to_close.close();
     }
 };
 
@@ -114,13 +163,14 @@ public:
         : state_(std::move(state)) {}
 
     bool cancelled() const noexcept {
-        return state_ != nullptr && state_->cancelled.load(std::memory_order_acquire);
+        return state_ != nullptr &&
+               state_->cancelled.load(std::memory_order_acquire);
     }
 
     // A channel that is closed when cancellation is requested. Put it in a
     // select to make any blocking operation cancellable. Go's ctx.Done().
     Chan<Unit> done() const {
-        return state_ != nullptr ? state_->done : Chan<Unit>{};
+        return state_ != nullptr ? state_->done_channel() : Chan<Unit>{};
     }
 
     // Why the token fired, or a success Error while it has not. Go's ctx.Err().
@@ -196,38 +246,115 @@ namespace detail {
 // simply finish into a state that no longer has a listener.
 struct GroupState {
     std::mutex mutex;
-    std::size_t outstanding = 0;
+    std::atomic<std::size_t> outstanding{0};
     WaitNode* waiters = nullptr;
     std::exception_ptr first_exception;
-    CancelSource cancel;
+    std::atomic<bool> has_exception{false};
+    CancelState cancel;
 
     void child_started() {
-        std::lock_guard<std::mutex> lock(mutex);
-        ++outstanding;
+        // The finishing sentinel closes the only dangerous zero-transition
+        // window: a last child that has decided to detach joiners but has not
+        // acquired their lock yet. Every ordinary start, including 0 -> 1,
+        // therefore needs only this CAS.
+        std::size_t observed = outstanding.load(std::memory_order_relaxed);
+        for (;;) {
+            if (observed == kFinishing) {
+                std::lock_guard<std::mutex> lock(mutex);
+                observed = outstanding.load(std::memory_order_acquire);
+                if (observed == kFinishing) {
+                    // We reached the lock before the finishing child. Keep the
+                    // existing generation alive and let it observe our start.
+                    outstanding.store(1, std::memory_order_release);
+                    return;
+                }
+                outstanding.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (outstanding.compare_exchange_weak(observed, observed + 1,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) {
+                return;
+            }
+        }
     }
 
     void child_failed(std::exception_ptr e) {
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (first_exception) return;  // keep the first failure, like Go's errgroup
+            if (first_exception)
+                return;  // keep the first failure, like Go's errgroup
             first_exception = std::move(e);
+            has_exception.store(true, std::memory_order_release);
         }
         // One child failing makes the rest pointless; tell them to stop.
         cancel.cancel();
     }
 
     void child_finished() {
+        const std::size_t previous =
+            outstanding.fetch_sub(1, std::memory_order_acq_rel);
+        if (previous > 1) return;
+
+        std::size_t expected = 0;
+        if (!outstanding.compare_exchange_strong(expected, kFinishing,
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_relaxed)) {
+            return;
+        }
         WaitNode* to_wake = nullptr;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (--outstanding > 0) return;
+            // A child that reached this lock first replaced the sentinel with
+            // one, cancelling this completion boundary.
+            if (outstanding.load(std::memory_order_acquire) != kFinishing)
+                return;
             to_wake = std::exchange(waiters, nullptr);
+            outstanding.store(0, std::memory_order_release);
         }
-        wake_list(to_wake);
+        if (to_wake != nullptr && to_wake->next == nullptr) {
+            // A TaskGroup join is released only by the final child. With one
+            // joiner there is no child batch left to drain, so hand the worker
+            // directly back to the structured parent.
+            to_wake->wake_handoff();
+        } else {
+            wake_list(to_wake);
+        }
     }
+
+    static constexpr std::size_t kFinishing = ~std::size_t{0};
 };
 
-template <typename T>
+// The ordinary TaskGroup path does not need a wrapper coroutine: the child's
+// final suspend can report failure and completion straight into the group.
+// Each record owns one state reference so destroying the TaskGroup before its
+// children finish remains safe.
+struct GroupCompletion final : DetachedTaskCompletion {
+    explicit GroupCompletion(std::shared_ptr<GroupState> group_state) noexcept
+        : DetachedTaskCompletion{&complete_task},
+          owner(std::move(group_state)) {}
+
+    static void* operator new(std::size_t size) {
+        return FramePool::allocate(size);
+    }
+    static void operator delete(void* completion, std::size_t size) noexcept {
+        FramePool::deallocate(completion, size);
+    }
+
+    static void complete_task(TaskPromiseBase& promise,
+                              DetachedTaskCompletion& completion) noexcept {
+        auto& self = static_cast<GroupCompletion&>(completion);
+        std::shared_ptr<GroupState> state = std::move(self.owner);
+        delete &self;
+
+        if (promise.exception) state->child_failed(promise.exception);
+        state->child_finished();
+    }
+
+    std::shared_ptr<GroupState> owner;
+};
+
+template<typename T>
 Task<void> group_child(Task<T> task, std::shared_ptr<GroupState> state) {
     try {
         co_await std::move(task);
@@ -237,11 +364,31 @@ Task<void> group_child(Task<T> task, std::shared_ptr<GroupState> state) {
     state->child_finished();
 }
 
+template<typename T>
+void start_group_child(Task<T> task, std::shared_ptr<GroupState> state) {
+    Scheduler& scheduler = require_scheduler();
+
+    // Preserve Task's established invalid/completed semantics without ever
+    // resuming a coroutine that is already at final suspend.
+    if (!task.valid() || task.done()) {
+        go_on(scheduler, group_child<T>(std::move(task), std::move(state)));
+        return;
+    }
+
+    auto completion = std::make_unique<GroupCompletion>(std::move(state));
+    auto child = task.release();
+    child.promise().continuation_or_completion = completion.release();
+    child.promise().detached = true;
+    scheduler.schedule(child);
+}
+
 }  // namespace detail
 
 class TaskGroup {
 public:
-    TaskGroup() : state_(std::make_shared<detail::GroupState>()) {}
+    TaskGroup()
+        : state_(std::allocate_shared<detail::GroupState>(
+              detail::GroupAllocator<detail::GroupState>{})) {}
 
     TaskGroup(const TaskGroup&) = delete;
     TaskGroup& operator=(const TaskGroup&) = delete;
@@ -252,14 +399,19 @@ public:
         if (!joined_) state_->cancel.cancel();
     }
 
-    template <typename T>
+    template<typename T>
     void spawn(Task<T> task) {
         state_->child_started();
-        go(detail::group_child<T>(std::move(task), state_));
+        detail::start_group_child<T>(std::move(task), state_);
     }
 
     // Pass this into children so they can observe cancellation.
-    CancelToken token() const noexcept { return state_->cancel.token(); }
+    CancelToken token() const noexcept {
+        // The token aliases the group's control block, so cancellation state
+        // stays alive independently without a second allocation or refcount.
+        return CancelToken{
+            std::shared_ptr<detail::CancelState>{state_, &state_->cancel}};
+    }
 
     // Ask every child to stop. Cooperative: children must actually check.
     void cancel() const { state_->cancel.cancel(); }
@@ -268,23 +420,33 @@ public:
     // all of them have finished — never leaves a child running past the scope.
     [[nodiscard]] auto join() noexcept {
         struct Awaiter {
+            explicit Awaiter(TaskGroup* owner) noexcept : group(owner) {}
+
             TaskGroup* group;
-            detail::WaitNode node{};
+            detail::WaitNodeStorage node_storage;
 
             bool await_ready() const noexcept {
-                std::lock_guard<std::mutex> lock(group->state_->mutex);
-                return group->state_->outstanding == 0;
+                return group->state_->outstanding.load(
+                           std::memory_order_acquire) == 0;
             }
             bool await_suspend(std::coroutine_handle<> h) {
                 std::lock_guard<std::mutex> lock(group->state_->mutex);
-                if (group->state_->outstanding == 0) return false;
-                node.arm(h);
-                node.next = group->state_->waiters;
-                group->state_->waiters = &node;
+                if (group->state_->outstanding.load(
+                        std::memory_order_acquire) == 0) {
+                    return false;
+                }
+                detail::WaitNode* const node = node_storage.construct();
+                node->arm(h);
+                node->next = group->state_->waiters;
+                group->state_->waiters = node;
                 return true;
             }
             void await_resume() const {
                 group->joined_ = true;
+                if (!group->state_->has_exception.load(
+                        std::memory_order_acquire)) {
+                    return;
+                }
                 std::exception_ptr failure;
                 {
                     std::lock_guard<std::mutex> lock(group->state_->mutex);
@@ -293,7 +455,7 @@ public:
                 if (failure) std::rethrow_exception(failure);
             }
         };
-        return Awaiter{this, {}};
+        return Awaiter{this};
     }
 
 private:

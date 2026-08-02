@@ -31,6 +31,7 @@
 #include <new>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -80,6 +81,17 @@ struct ChanWaiter {
     // operation has actually found that it must block.
     explicit ChanWaiter(UninitializedWaiterTag) noexcept {}
 
+    // Channel/select awaiters are copied or moved only while their operation
+    // is being assembled, before this intrusive node can be published. None
+    // of the scalar fields is live at that point, so copying or moving the
+    // surrounding case should construct a fresh lazy node rather than copy a
+    // cache line of zeros. Copy remains available for the public case
+    // aggregates.
+    ChanWaiter(ChanWaiter&&) noexcept : ChanWaiter(kUninitializedWaiter) {}
+    ChanWaiter(const ChanWaiter&) noexcept : ChanWaiter(kUninitializedWaiter) {}
+    ChanWaiter& operator=(ChanWaiter&&) noexcept { return *this; }
+    ChanWaiter& operator=(const ChanWaiter&) noexcept { return *this; }
+
     ChanWaiter* next;
     ChanWaiter* prev;
     std::coroutine_handle<> handle;
@@ -103,23 +115,22 @@ struct ChanWaiter {
     bool try_acquire() noexcept {
         if (select_winner == nullptr) return true;
         std::uint32_t expected = kNoWinner;
-        return select_winner->compare_exchange_strong(expected, case_index,
-                                                      std::memory_order_acq_rel,
-                                                      std::memory_order_relaxed);
+        return select_winner->compare_exchange_strong(
+            expected, case_index, std::memory_order_acq_rel,
+            std::memory_order_relaxed);
     }
 
     // Returns false if resumption is not ours to perform (a select that has not
     // finished publishing itself yet).
     bool take_resume_ownership() noexcept {
         if (select_phase == nullptr) return true;
-        return select_phase->exchange(kSelectResumed, std::memory_order_acq_rel) ==
-               kSelectParked;
+        return select_phase->exchange(
+                   kSelectResumed, std::memory_order_acq_rel) == kSelectParked;
     }
 
     void wake() noexcept {
         if (!take_resume_ownership()) return;
-        SchedulerTarget::dispatch_completion(
-            sched, handle, kInvalidWorkerId);
+        SchedulerTarget::dispatch_completion(sched, handle, kInvalidWorkerId);
     }
 
     // Used for a direct hand-off, where the waker has just produced exactly the
@@ -184,11 +195,45 @@ private:
 
 enum class OpStatus { kDone, kClosed, kBlocked };
 
+// Channel critical sections only manipulate a short intrusive queue or ring
+// index and never suspend. Avoid entering pthread's mutex machinery on every
+// buffered operation, but yield periodically so an owner descheduled by the OS
+// is not denied its CPU indefinitely under heavy MPMC contention.
+class ChannelMutex {
+public:
+    ChannelMutex() = default;
+    ChannelMutex(const ChannelMutex&) = delete;
+    ChannelMutex& operator=(const ChannelMutex&) = delete;
+
+    bool try_lock() noexcept {
+        return !locked_.test_and_set(std::memory_order_acquire);
+    }
+
+    void lock() noexcept {
+        if (try_lock()) return;
+        unsigned spins = 0;
+        for (;;) {
+            while (locked_.test(std::memory_order_relaxed)) {
+                if (++spins == 64) {
+                    spins = 0;
+                    std::this_thread::yield();
+                }
+            }
+            if (try_lock()) return;
+        }
+    }
+
+    void unlock() noexcept { locked_.clear(std::memory_order_release); }
+
+private:
+    std::atomic_flag locked_ = ATOMIC_FLAG_INIT;
+};
+
 // Type-erased part of a channel. select needs to lock a heterogeneous set of
 // channels in address order, which it can only do through a common base.
 class ChannelBase {
 public:
-    std::mutex mutex;
+    ChannelMutex mutex;
     WaiterList senders;
     WaiterList receivers;
     std::size_t capacity = 0;
@@ -199,7 +244,7 @@ public:
     std::atomic<std::uint32_t> refs{1};
 };
 
-template <typename T>
+template<typename T>
 class Channel final : public ChannelBase {
 public:
     static Channel* create(std::size_t capacity) {
@@ -211,11 +256,12 @@ public:
             // capacity * sizeof(T) wrapping would allocate a ring far smaller
             // than the capacity recorded above, and every buffered send after
             // that writes out of bounds.
-            if (capacity > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+            if (capacity >
+                std::numeric_limits<std::size_t>::max() / sizeof(T)) {
                 throw std::bad_array_new_length{};
             }
-            channel->buffer_ = static_cast<T*>(
-                ::operator new(capacity * sizeof(T), std::align_val_t{alignof(T)}));
+            channel->buffer_ = static_cast<T*>(::operator new(
+                capacity * sizeof(T), std::align_val_t{alignof(T)}));
         }
         return channel.release();
     }
@@ -240,14 +286,16 @@ public:
         // ring buffer, even on a buffered channel.
         while (ChanWaiter* receiver = receivers.pop_front()) {
             if (!receiver->try_acquire()) continue;  // lost a select race
-            static_cast<std::optional<T>*>(receiver->slot)->emplace(std::move(*value));
+            static_cast<std::optional<T>*>(receiver->slot)
+                ->emplace(std::move(*value));
             receiver->success = true;
             to_wake = receiver;
             return OpStatus::kDone;
         }
 
         if (count < capacity) {
-            ::new (static_cast<void*>(buffer_ + send_index)) T(std::move(*value));
+            ::new (static_cast<void*>(buffer_ + send_index))
+                T(std::move(*value));
             send_index = next_index(send_index);
             ++count;
             return OpStatus::kDone;
@@ -302,7 +350,7 @@ public:
         // and no channel lock should be held across that.
         ChanWaiter* wake_list = nullptr;
         {
-            std::lock_guard<std::mutex> lock(mutex);
+            std::lock_guard<ChannelMutex> lock(mutex);
             if (closed) return;
             closed = true;
 
@@ -347,7 +395,7 @@ private:
     T* buffer_ = nullptr;
 };
 
-template <typename T>
+template<typename T>
 class [[nodiscard]] SendAwaiter {
 public:
     SendAwaiter(Channel<T>* channel, T value)
@@ -361,15 +409,14 @@ public:
     bool await_suspend(std::coroutine_handle<> h) {
         ChanWaiter* to_wake = nullptr;
         {
-            std::unique_lock<std::mutex> lock(channel_->mutex);
+            std::unique_lock<ChannelMutex> lock(channel_->mutex);
             const OpStatus status = channel_->try_send_locked(&value_, to_wake);
             if (status == OpStatus::kBlocked) {
                 waiter_.handle = h;
                 Scheduler* const scheduler = current_scheduler();
-                waiter_.sched =
-                    scheduler == nullptr
-                        ? SchedulerTarget{}
-                        : scheduler->completion_target();
+                waiter_.sched = scheduler == nullptr
+                                    ? SchedulerTarget{}
+                                    : scheduler->completion_target();
                 waiter_.slot = &value_;
                 waiter_.success = false;
                 waiter_.select_winner = nullptr;
@@ -394,7 +441,7 @@ private:
     ChanWaiter waiter_{kUninitializedWaiter};
 };
 
-template <typename T>
+template<typename T>
 class [[nodiscard]] RecvAwaiter {
 public:
     explicit RecvAwaiter(Channel<T>* channel) : channel_(channel) {}
@@ -407,15 +454,14 @@ public:
     bool await_suspend(std::coroutine_handle<> h) {
         ChanWaiter* to_wake = nullptr;
         {
-            std::unique_lock<std::mutex> lock(channel_->mutex);
+            std::unique_lock<ChannelMutex> lock(channel_->mutex);
             const OpStatus status = channel_->try_recv_locked(&value_, to_wake);
             if (status == OpStatus::kBlocked) {
                 waiter_.handle = h;
                 Scheduler* const scheduler = current_scheduler();
-                waiter_.sched =
-                    scheduler == nullptr
-                        ? SchedulerTarget{}
-                        : scheduler->completion_target();
+                waiter_.sched = scheduler == nullptr
+                                    ? SchedulerTarget{}
+                                    : scheduler->completion_target();
                 waiter_.slot = &value_;
                 waiter_.success = false;
                 waiter_.select_winner = nullptr;
@@ -438,7 +484,7 @@ private:
 
 }  // namespace detail
 
-template <typename T = Unit>
+template<typename T = Unit>
 class Chan {
 public:
     using value_type = T;
@@ -479,7 +525,7 @@ public:
         detail::ChanWaiter* to_wake = nullptr;
         detail::OpStatus status;
         {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
+            std::lock_guard<detail::ChannelMutex> lock(impl_->mutex);
             status = impl_->try_send_locked(&value, to_wake);
         }
         if (to_wake != nullptr) to_wake->wake();
@@ -491,7 +537,7 @@ public:
         std::optional<T> out;
         detail::ChanWaiter* to_wake = nullptr;
         {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
+            std::lock_guard<detail::ChannelMutex> lock(impl_->mutex);
             impl_->try_recv_locked(&out, to_wake);
         }
         if (to_wake != nullptr) to_wake->wake();
@@ -505,13 +551,13 @@ public:
 
     bool is_closed() const {
         if (impl_ == nullptr) return false;
-        std::lock_guard<std::mutex> lock(impl_->mutex);
+        std::lock_guard<detail::ChannelMutex> lock(impl_->mutex);
         return impl_->closed;
     }
 
     std::size_t size() const {
         if (impl_ == nullptr) return 0;
-        std::lock_guard<std::mutex> lock(impl_->mutex);
+        std::lock_guard<detail::ChannelMutex> lock(impl_->mutex);
         return impl_->count;
     }
 
@@ -522,7 +568,7 @@ public:
     detail::Channel<T>* native() const noexcept { return impl_; }
 
 private:
-    template <typename U>
+    template<typename U>
     friend Chan<U> make_chan(std::size_t);
 
     explicit Chan(detail::Channel<T>* impl) noexcept : impl_(impl) {}
@@ -539,7 +585,7 @@ private:
 };
 
 // capacity 0 gives an unbuffered channel: send and recv rendezvous.
-template <typename T = Unit>
+template<typename T = Unit>
 Chan<T> make_chan(std::size_t capacity = 0) {
     return Chan<T>{detail::Channel<T>::create(capacity)};
 }

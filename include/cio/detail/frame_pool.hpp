@@ -42,7 +42,7 @@ public:
     static constexpr std::size_t kClasses = kMaxSize / kGranularity;
 
     // Blocks moved between a thread cache and the central list in one lock.
-    static constexpr std::size_t kBatch = 16;
+    static constexpr std::size_t kBatch = 32;
     // High-water mark for a thread cache; must exceed kBatch so that a thread
     // alternating between allocate and free does not spill on every operation.
     static constexpr std::size_t kCachePerClass = 64;
@@ -59,14 +59,7 @@ public:
             --cache.count[index];
             return block;
         }
-        if (void* chain = take_batch(index)) {
-            cache.free_list[index] = next_of(chain);
-            cache.count[index] = kBatch - 1;
-            return chain;
-        }
-        // Allocate the whole class, not the request, so any frame in this class
-        // can reuse the block.
-        return ::operator new((index + 1) * kGranularity);
+        return allocate_slow(cache, index);
     }
 
     static void deallocate(void* block, std::size_t size) noexcept {
@@ -81,61 +74,7 @@ public:
         next_of(block) = cache.free_list[index];
         cache.free_list[index] = block;
         if (++cache.count[index] < kCachePerClass) return;
-        spill_batch(cache, index);
-    }
 
-private:
-    static std::size_t size_class(std::size_t size) noexcept {
-        return (size - 1) / kGranularity;
-    }
-
-    // The free-list link lives in the first word of the free block itself.
-    static void*& next_of(void* block) noexcept { return *static_cast<void**>(block); }
-
-    static void release_chain(void* block) noexcept {
-        while (block != nullptr) {
-            void* next = next_of(block);
-            ::operator delete(block);
-            block = next;
-        }
-    }
-
-    struct Cache {
-        void* free_list[kClasses]{};
-        std::size_t count[kClasses]{};
-
-        // Returns this thread's cached blocks to the process at thread exit,
-        // so a short-lived thread does not strand memory.
-        ~Cache() {
-            for (std::size_t i = 0; i < kClasses; ++i) release_chain(free_list[i]);
-        }
-    };
-
-    struct Central {
-        std::mutex mutex;
-        void* batches[kCentralBatches]{};
-        std::size_t count = 0;
-    };
-
-    static Cache& thread_cache() noexcept {
-        static thread_local Cache cache;
-        return cache;
-    }
-
-    static Central& central(std::size_t index) noexcept {
-        // Trivially destructible, so never torn down — see the header comment.
-        static Central lists[kClasses];
-        return lists[index];
-    }
-
-    static void* take_batch(std::size_t index) noexcept {
-        Central& list = central(index);
-        std::lock_guard<std::mutex> lock(list.mutex);
-        if (list.count == 0) return nullptr;
-        return list.batches[--list.count];
-    }
-
-    static void spill_batch(Cache& cache, std::size_t index) noexcept {
         // Detach the first kBatch blocks. Walking them is cheap: they were just
         // written by this thread and are still in L1.
         void* head = cache.free_list[index];
@@ -156,6 +95,71 @@ private:
         }
         // Central list is full: genuinely give the memory back.
         release_chain(head);
+    }
+
+private:
+    static std::size_t size_class(std::size_t size) noexcept {
+        return (size - 1) / kGranularity;
+    }
+
+    // The free-list link lives in the first word of the free block itself.
+    static void*& next_of(void* block) noexcept {
+        return *static_cast<void**>(block);
+    }
+
+    static void release_chain(void* block) noexcept {
+        while (block != nullptr) {
+            void* next = next_of(block);
+            ::operator delete(block);
+            block = next;
+        }
+    }
+
+    struct Cache {
+        void* free_list[kClasses]{};
+        std::size_t count[kClasses]{};
+
+        // Returns this thread's cached blocks to the process at thread exit,
+        // so a short-lived thread does not strand memory.
+        ~Cache() {
+            for (std::size_t i = 0; i < kClasses; ++i)
+                release_chain(free_list[i]);
+        }
+    };
+
+    struct Central {
+        std::mutex mutex;
+        std::size_t count = 0;
+        void* batches[kCentralBatches]{};
+    };
+
+    static Cache& thread_cache() noexcept {
+        static thread_local Cache cache;
+        return cache;
+    }
+
+    static Central& central(std::size_t index) noexcept {
+        // Trivially destructible, so never torn down — see the header comment.
+        static Central lists[kClasses];
+        return lists[index];
+    }
+
+    static CIO_NOINLINE CIO_COLD void* allocate_slow(Cache& cache,
+                                                     std::size_t index) {
+        Central& list = central(index);
+        void* chain = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(list.mutex);
+            if (list.count != 0) chain = list.batches[--list.count];
+        }
+        if (chain != nullptr) {
+            cache.free_list[index] = next_of(chain);
+            cache.count[index] = kBatch - 1;
+            return chain;
+        }
+        // Allocate the whole class, not the request, so any frame in this class
+        // can reuse the block.
+        return ::operator new((index + 1) * kGranularity);
     }
 };
 

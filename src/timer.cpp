@@ -13,14 +13,19 @@ namespace {
 // sift path) by half while the extra comparisons stay in registers.
 constexpr std::size_t kFanOut = 4;
 
-inline std::size_t parent_of(std::size_t i) noexcept { return (i - 1) / kFanOut; }
-inline std::size_t first_child_of(std::size_t i) noexcept { return i * kFanOut + 1; }
+inline std::size_t parent_of(std::size_t i) noexcept {
+    return (i - 1) / kFanOut;
+}
+inline std::size_t first_child_of(std::size_t i) noexcept {
+    return i * kFanOut + 1;
+}
 
 constexpr std::uint32_t kNotInHeap = ~0u;
 
 }  // namespace
 
-TimerService::TimerService(Scheduler& sched, std::size_t shard_count) : sched_(sched) {
+TimerService::TimerService(Scheduler& sched, std::size_t shard_count)
+    : sched_(sched) {
     if (shard_count == 0) shard_count = 1;
     shards_.reserve(shard_count);
     for (std::size_t i = 0; i < shard_count; ++i) {
@@ -43,7 +48,8 @@ void TimerService::sift_up(std::vector<Timer*>& heap, std::size_t i) noexcept {
     node->heap_index = static_cast<std::uint32_t>(i);
 }
 
-void TimerService::sift_down(std::vector<Timer*>& heap, std::size_t i) noexcept {
+void TimerService::sift_down(std::vector<Timer*>& heap,
+                             std::size_t i) noexcept {
     const std::size_t n = heap.size();
     Timer* node = heap[i];
     for (;;) {
@@ -65,23 +71,44 @@ void TimerService::sift_down(std::vector<Timer*>& heap, std::size_t i) noexcept 
     node->heap_index = static_cast<std::uint32_t>(i);
 }
 
-void TimerService::heap_remove(std::vector<Timer*>& heap, std::size_t i) noexcept {
+void TimerService::heap_pop_root(std::vector<Timer*>& heap) noexcept {
+    const std::size_t last = heap.size() - 1;
+    if (last == 0) {
+        heap.pop_back();
+        return;
+    }
+    heap[0] = heap[last];
+    heap[0]->heap_index = 0;
+    heap.pop_back();
+    // A replacement at the root can only violate the invariant downward.
+    sift_down(heap, 0);
+}
+
+void TimerService::heap_remove(std::vector<Timer*>& heap,
+                               std::size_t i) noexcept {
     const std::size_t last = heap.size() - 1;
     if (i == last) {
         heap.pop_back();
         return;
     }
-    heap[i] = heap[last];
-    heap[i]->heap_index = static_cast<std::uint32_t>(i);
+    Timer* const replacement = heap[last];
+    heap[i] = replacement;
+    replacement->heap_index = static_cast<std::uint32_t>(i);
     heap.pop_back();
-    // The replacement can violate the invariant in either direction.
-    sift_down(heap, i);
-    sift_up(heap, heap[i]->heap_index);
+    // Only one direction can be invalid. Choosing it up front avoids walking
+    // children before discovering that this replacement belongs above its
+    // parent — the common shape when cancelling arbitrary deadline timers.
+    if (i > 0 && replacement->deadline_ns < heap[parent_of(i)]->deadline_ns) {
+        sift_up(heap, i);
+    } else {
+        sift_down(heap, i);
+    }
 }
 
 void TimerService::republish(Shard& shard) noexcept {
-    shard.earliest.store(shard.heap.empty() ? INT64_MAX : shard.heap[0]->deadline_ns,
-                         std::memory_order_release);
+    shard.earliest.store(
+        shard.heap.empty() ? INT64_MAX : shard.heap[0]->deadline_ns,
+        std::memory_order_release);
 }
 
 void TimerService::arm(Timer* timer) {
@@ -92,14 +119,16 @@ void TimerService::arm(Timer* timer) {
     // manipulated from a different runtime, so retain shard zero as the safe
     // foreign-thread fallback.
     const std::uint32_t shard_index =
-        worker != nullptr && &worker->scheduler() == &sched_ ? worker->index() : 0u;
+        worker != nullptr && &worker->scheduler() == &sched_ ? worker->index()
+                                                             : 0u;
     Shard& shard = *shards_[shard_index];
     timer->preferred_worker = shard_index;
 
     // Arming a node that is already linked into a heap corrupts it: heap_index
     // gets overwritten and the old slot keeps pointing here. Callers must
     // disarm() first, unconditionally.
-    assert(timer->heap_index == kNotInHeap && "cio: timer armed while already in a heap");
+    assert(timer->heap_index == kNotInHeap &&
+           "cio: timer armed while already in a heap");
 
     timer->shard = shard_index;
     timer->state.store(Timer::kArmed, std::memory_order_relaxed);
@@ -124,7 +153,9 @@ void TimerService::arm(Timer* timer) {
         timer->heap_index = static_cast<std::uint32_t>(shard.heap.size() - 1);
         sift_up(shard.heap, timer->heap_index);
         now_earliest = shard.heap[0] == timer;
-        republish(shard);
+        if (now_earliest) {
+            shard.earliest.store(deadline_ns, std::memory_order_release);
+        }
     }
 
     // Only disturb the parked poller if this timer would fire before it plans
@@ -143,7 +174,8 @@ bool TimerService::disarm(Timer* timer) {
     // reality — which ends with the same Timer linked into a heap twice and
     // heap_index pointing at the wrong slot.
     for (;;) {
-        const std::uint32_t state = timer->state.load(std::memory_order_acquire);
+        const std::uint32_t state =
+            timer->state.load(std::memory_order_acquire);
 
         if (state == Timer::kIdle || state == Timer::kCancelled ||
             state == Timer::kFired) {
@@ -174,10 +206,11 @@ bool TimerService::disarm(Timer* timer) {
                                                  std::memory_order_acq_rel,
                                                  std::memory_order_relaxed)) {
             if (timer->heap_index != kNotInHeap) {
+                const bool removed_earliest = timer->heap_index == 0;
                 heap_remove(shard.heap, timer->heap_index);
                 timer->heap_index = kNotInHeap;
+                if (removed_earliest) republish(shard);
             }
-            republish(shard);
             return true;
         }
         // Lost the race; re-examine (it is now kFiring or kFired).
@@ -212,7 +245,9 @@ std::int64_t TimerService::next_timeout_ns(WorkerId worker) const noexcept {
     return delta > 0 ? delta : 0;
 }
 
-bool TimerService::empty() const noexcept { return next_deadline_ns() == INT64_MAX; }
+bool TimerService::empty() const noexcept {
+    return next_deadline_ns() == INT64_MAX;
+}
 
 std::size_t TimerService::run_expired_shard(Shard& shard, std::int64_t now) {
     constexpr std::size_t kBatch = 64;
@@ -234,17 +269,19 @@ std::size_t TimerService::run_expired_shard(Shard& shard, std::int64_t now) {
         std::size_t n = 0;
         {
             std::lock_guard<std::mutex> lock(shard.mutex);
-            while (n < kBatch && !shard.heap.empty() && shard.heap[0]->deadline_ns <= now) {
+            while (n < kBatch && !shard.heap.empty() &&
+                   shard.heap[0]->deadline_ns <= now) {
                 Timer* timer = shard.heap[0];
-                heap_remove(shard.heap, 0);
+                heap_pop_root(shard.heap);
                 timer->heap_index = kNotInHeap;
 
                 const Timer::FireFn on_fire = timer->on_fire;
+                const std::uint32_t next =
+                    on_fire != nullptr ? Timer::kFiring : Timer::kFired;
                 std::uint32_t expected = Timer::kArmed;
-                const std::uint32_t next = on_fire != nullptr ? Timer::kFiring : Timer::kFired;
-                if (timer->state.compare_exchange_strong(expected, next,
-                                                         std::memory_order_acq_rel,
-                                                         std::memory_order_relaxed)) {
+                if (timer->state.compare_exchange_strong(
+                        expected, next, std::memory_order_acq_rel,
+                        std::memory_order_relaxed)) {
                     ready[n++] = Fired{timer, timer->waiter, on_fire,
                                        timer->preferred_worker};
                 }
@@ -268,7 +305,8 @@ std::size_t TimerService::run_expired_shard(Shard& shard, std::int64_t now) {
                 resume = fired.on_fire(fired.timer);
                 // Publish "nobody is touching this node any more" before the
                 // task can possibly resume and destroy the frame holding it.
-                fired.timer->state.store(Timer::kFired, std::memory_order_release);
+                fired.timer->state.store(Timer::kFired,
+                                         std::memory_order_release);
             }
             if (resume) {
                 resumable[resumable_count++] = resume.address();

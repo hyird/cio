@@ -19,6 +19,7 @@
 // workers must not leave the taking worker's cache permanently empty.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +28,8 @@
 #include <span>
 #include <utility>
 #include <vector>
+
+#include "cio/config.hpp"
 
 namespace cio {
 
@@ -62,7 +65,6 @@ private:
     friend class BufferPool;
     PooledBuffer(BufferPool* pool, std::byte* data, std::size_t size) noexcept
         : pool_(pool), data_(data), size_(size) {}
-
     void release() noexcept;
 
     BufferPool* pool_ = nullptr;
@@ -74,8 +76,8 @@ private:
 //
 // Requests are rounded up to a power of two, so a pool serves a range of sizes
 // without fragmenting into a class per exact request. Buffers above the largest
-// class are allocated and freed directly rather than retained, because keeping a
-// multi-megabyte buffer alive to save one allocation is the wrong trade.
+// class are allocated and freed directly rather than retained, because keeping
+// a multi-megabyte buffer alive to save one allocation is the wrong trade.
 class BufferPool {
 public:
     static constexpr std::size_t kMinBufferBytes = 512;
@@ -108,14 +110,33 @@ private:
     void put(std::byte* data, std::size_t size) noexcept;
 
     struct ThreadCache {
-        std::vector<std::byte*> free_list[kClassCount];
+        std::byte* free_list[kClassCount]{};
+        std::size_t count[kClassCount]{};
+        // Keep this TLS object's footprint and the following TLS offsets
+        // stable after replacing each three-pointer vector with two scalar
+        // words. Other runtime thread caches are hot enough that moving them
+        // changes their cache-set placement measurably.
+        static_assert(sizeof(std::vector<std::byte*>) >= 2 * sizeof(void*));
+        [[no_unique_address]]
+        std::array<std::byte, kClassCount * (sizeof(std::vector<std::byte*>) -
+                                             2 * sizeof(void*))>
+            layout_padding{};
         // Identity only, for detecting a re-home. Never dereferenced: a cache
         // can outlive the pool it names.
         const BufferPool* owner = nullptr;
         ~ThreadCache();
     };
+    static_assert(sizeof(ThreadCache) ==
+                  kClassCount * sizeof(std::vector<std::byte*>) +
+                      sizeof(const BufferPool*));
+    static std::byte*& next_of(std::byte* block) noexcept {
+        return *reinterpret_cast<std::byte**>(block);
+    }
     ThreadCache& cache();
-    static void drain_cache(ThreadCache& local) noexcept;
+    CIO_NOINLINE PooledBuffer get_slow(ThreadCache& local, unsigned index,
+                                       std::size_t size);
+    CIO_NOINLINE void put_slow(std::byte* data, unsigned index) noexcept;
+    static CIO_NOINLINE void drain_cache(ThreadCache& local) noexcept;
 
     mutable std::mutex mutex_;
     std::vector<std::byte*> central_[kClassCount];
@@ -131,7 +152,7 @@ BufferPool& buffer_pool();
 // back and hands it out again, and the caller is responsible for resetting an
 // object's state before reuse. A pooled object with stale state is the classic
 // sync.Pool bug, so `take()` does not pretend to have cleaned it.
-template <typename T>
+template<typename T>
 class Pool {
 public:
     class [[nodiscard]] Handle {

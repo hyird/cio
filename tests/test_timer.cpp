@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cio/cio.hpp"
@@ -165,8 +166,8 @@ void test_ticker_does_not_drift() {
         ticker.stop();
 
         // Drifting by the handler cost would take 5*(20+12) = 160ms. Advancing
-        // from the previous deadline keeps five ticks near 100ms; allow slack for
-        // the final handler and scheduling.
+        // from the previous deadline keeps five ticks near 100ms; allow slack
+        // for the final handler and scheduling.
         CIO_CHECK(elapsed >= 100ms);
         CIO_CHECK(elapsed < 150ms);
         co_return true;
@@ -201,18 +202,16 @@ void test_ticker_reset_and_invalid_period() {
 void test_after_func_runs_and_can_be_stopped() {
     auto body = []() -> cio::Task<bool> {
         std::atomic<int> ran{0};
-        auto timer = cio::after_func(15ms, [&ran] {
-            ran.fetch_add(1, std::memory_order_relaxed);
-        });
+        auto timer = cio::after_func(
+            15ms, [&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
         co_await cio::sleep(60ms);
         CIO_CHECK_EQ(ran.load(), 1);
         // It already ran, so stop() reports it did not win.
         CIO_CHECK(!timer.stop());
 
         std::atomic<int> never{0};
-        auto cancelled = cio::after_func(10s, [&never] {
-            never.fetch_add(1, std::memory_order_relaxed);
-        });
+        auto cancelled = cio::after_func(
+            10s, [&never] { never.fetch_add(1, std::memory_order_relaxed); });
         CIO_CHECK(cancelled.stop());
         co_await cio::sleep(30ms);
         CIO_CHECK_EQ(never.load(), 0);
@@ -225,6 +224,23 @@ void test_after_func_runs_and_can_be_stopped() {
 
 void test_buffer_pool_reuses_storage() {
     cio::BufferPool pool;
+
+    // Every exact power-of-two boundary stays in its class; crossing it by one
+    // byte advances exactly one class. This also covers the minimum and maximum
+    // pooled sizes used by the bit-width classifier.
+    for (std::size_t class_size = cio::BufferPool::kMinBufferBytes;
+         class_size <= cio::BufferPool::kMaxPooledBytes; class_size <<= 1) {
+        auto exact = pool.get(class_size);
+        CIO_CHECK_EQ(exact.size(), class_size);
+        if (class_size > cio::BufferPool::kMinBufferBytes) {
+            auto below = pool.get(class_size - 1);
+            CIO_CHECK_EQ(below.size(), class_size);
+        }
+        if (class_size < cio::BufferPool::kMaxPooledBytes) {
+            auto above = pool.get(class_size + 1);
+            CIO_CHECK_EQ(above.size(), class_size << 1);
+        }
+    }
 
     std::byte* first = nullptr;
     {
@@ -279,6 +295,30 @@ void test_buffer_pool_move_semantics() {
     second = std::move(moved);
     CIO_CHECK_EQ(second.bytes().data(), data);
     CIO_CHECK(!moved.valid());
+}
+
+void test_buffer_pool_cross_thread_batch_lifetime() {
+    cio::BufferPool pool;
+    constexpr std::size_t kBuffers = 2 * cio::BufferPool::kThreadCacheDepth;
+
+    std::vector<cio::PooledBuffer> held;
+    held.reserve(kBuffers);
+    for (std::size_t i = 0; i < kBuffers; ++i) held.push_back(pool.get(4096));
+
+    // The foreign thread keeps one local batch and spills the rest centrally.
+    // Its thread-cache destructor must free the local intrusive chain without
+    // touching `pool`, which may eventually outlive or predecease that cache.
+    std::thread releaser(
+        [buffers = std::move(held)]() mutable { buffers.clear(); });
+    releaser.join();
+    CIO_CHECK_EQ(pool.retained(), cio::BufferPool::kThreadCacheDepth);
+
+    std::vector<cio::PooledBuffer> reused;
+    reused.reserve(cio::BufferPool::kThreadCacheDepth);
+    for (std::size_t i = 0; i < cio::BufferPool::kThreadCacheDepth; ++i) {
+        reused.push_back(pool.get(4096));
+    }
+    CIO_CHECK_EQ(pool.retained(), std::size_t{0});
 }
 
 struct Poolable {
@@ -359,6 +399,7 @@ int main() {
     RUN_TEST(test_after_func_runs_and_can_be_stopped);
     RUN_TEST(test_buffer_pool_reuses_storage);
     RUN_TEST(test_buffer_pool_move_semantics);
+    RUN_TEST(test_buffer_pool_cross_thread_batch_lifetime);
     RUN_TEST(test_object_pool_reuses_objects);
     RUN_TEST(test_copy_uses_the_pool);
     return cio_test::summary();

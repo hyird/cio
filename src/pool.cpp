@@ -1,6 +1,5 @@
 #include "cio/pool.hpp"
 
-#include <bit>
 #include <new>
 
 namespace cio {
@@ -35,19 +34,23 @@ std::size_t BufferPool::class_bytes(unsigned index) noexcept {
 // Frees a cache's blocks outright.
 //
 // Deliberately not "give them back to the owning pool". A thread cache can
-// outlive the pool it borrowed from — a pool with automatic storage is destroyed
-// while this thread's cache still names it — and it can also be destroyed at
-// thread exit, after the pool. Dereferencing `owner` on either path is a
-// use-after-free, which is exactly what ASan caught here. Releasing the memory
-// directly is always safe, and both paths are cold: a re-homed cache and a
-// dying thread are not events worth retaining a few buffers for.
+// outlive the pool it borrowed from — a pool with automatic storage is
+// destroyed while this thread's cache still names it — and it can also be
+// destroyed at thread exit, after the pool. Dereferencing `owner` on either
+// path is a use-after-free, which is exactly what ASan caught here. Releasing
+// the memory directly is always safe, and both paths are cold: a re-homed cache
+// and a dying thread are not events worth retaining a few buffers for.
 void BufferPool::drain_cache(ThreadCache& local) noexcept {
     for (unsigned i = 0; i < kClassCount; ++i) {
-        for (std::byte* block : local.free_list[i]) {
+        std::byte* block = local.free_list[i];
+        while (block != nullptr) {
+            std::byte* const next = next_of(block);
             ::operator delete(block,
                               std::align_val_t{alignof(std::max_align_t)});
+            block = next;
         }
-        local.free_list[i].clear();
+        local.free_list[i] = nullptr;
+        local.count[i] = 0;
     }
 }
 
@@ -66,13 +69,7 @@ BufferPool::ThreadCache& BufferPool::cache() {
 BufferPool::ThreadCache::~ThreadCache() {
     // Runs at thread exit, possibly after the pool. Free directly; never touch
     // `owner`.
-    for (unsigned i = 0; i < kClassCount; ++i) {
-        for (std::byte* block : free_list[i]) {
-            ::operator delete(block,
-                              std::align_val_t{alignof(std::max_align_t)});
-        }
-        free_list[i].clear();
-    }
+    BufferPool::drain_cache(*this);
     owner = nullptr;
 }
 
@@ -83,8 +80,8 @@ PooledBuffer BufferPool::get(std::size_t bytes) {
         // Above the pooled range: allocate directly and let the handle free it.
         // Retaining a multi-megabyte buffer to save one allocation is the wrong
         // trade, so this deliberately does not pool.
-        void* raw = ::operator new(bytes,
-                                   std::align_val_t{alignof(std::max_align_t)});
+        void* raw =
+            ::operator new(bytes, std::align_val_t{alignof(std::max_align_t)});
         return PooledBuffer{nullptr, static_cast<std::byte*>(raw), bytes};
     }
 
@@ -92,34 +89,41 @@ PooledBuffer BufferPool::get(std::size_t bytes) {
     const std::size_t size = class_bytes(index);
 
     ThreadCache& local = cache();
-    if (!local.free_list[index].empty()) {
-        std::byte* block = local.free_list[index].back();
-        local.free_list[index].pop_back();
+    if (std::byte* block = local.free_list[index]) {
+        local.free_list[index] = next_of(block);
+        --local.count[index];
         return PooledBuffer{this, block, size};
     }
 
+    return get_slow(local, index, size);
+}
+
+PooledBuffer BufferPool::get_slow(ThreadCache& local, unsigned index,
+                                  std::size_t size) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto& shared = central_[index];
         if (!shared.empty()) {
             // Refill a batch, so a thread that only frees does not force a lock
             // acquisition per take.
-            const std::size_t move =
-                std::min(shared.size(), kThreadCacheDepth);
+            const std::size_t move = std::min(shared.size(), kThreadCacheDepth);
             for (std::size_t i = 0; i < move; ++i) {
-                local.free_list[index].push_back(shared.back());
+                std::byte* const block = shared.back();
                 shared.pop_back();
+                next_of(block) = local.free_list[index];
+                local.free_list[index] = block;
+                ++local.count[index];
             }
         }
     }
-    if (!local.free_list[index].empty()) {
-        std::byte* block = local.free_list[index].back();
-        local.free_list[index].pop_back();
+    if (std::byte* block = local.free_list[index]) {
+        local.free_list[index] = next_of(block);
+        --local.count[index];
         return PooledBuffer{this, block, size};
     }
 
-    void* raw = ::operator new(size,
-                               std::align_val_t{alignof(std::max_align_t)});
+    void* raw =
+        ::operator new(size, std::align_val_t{alignof(std::max_align_t)});
     return PooledBuffer{this, static_cast<std::byte*>(raw), size};
 }
 
@@ -132,11 +136,17 @@ void BufferPool::put(std::byte* data, std::size_t size) noexcept {
 
     const unsigned index = class_of(size);
     ThreadCache& local = cache();
-    if (local.free_list[index].size() < kThreadCacheDepth) {
-        local.free_list[index].push_back(data);
+    if (local.count[index] < kThreadCacheDepth) {
+        next_of(data) = local.free_list[index];
+        local.free_list[index] = data;
+        ++local.count[index];
         return;
     }
 
+    put_slow(data, index);
+}
+
+void BufferPool::put_slow(std::byte* data, unsigned index) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     central_[index].push_back(data);
 }
@@ -160,8 +170,9 @@ BufferPool::~BufferPool() {
 }
 
 BufferPool& buffer_pool() {
-    // Process-lifetime, like the frame pool: a thread cache must not outlive the
-    // pool it spills into, and static destruction order cannot guarantee that.
+    // Process-lifetime, like the frame pool: a thread cache must not outlive
+    // the pool it spills into, and static destruction order cannot guarantee
+    // that.
     static BufferPool* pool = new BufferPool();
     return *pool;
 }

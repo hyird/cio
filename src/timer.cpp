@@ -140,7 +140,7 @@ void TimerService::arm(Timer* timer) {
 
     bool now_earliest = false;
     {
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        std::lock_guard<TimerService::ShardMutex> lock(shard.mutex);
         try {
             shard.heap.push_back(timer);
         } catch (...) {
@@ -163,8 +163,10 @@ void TimerService::arm(Timer* timer) {
     if (now_earliest) sched_.nudge_poller(shard_index, deadline_ns);
 }
 
-bool TimerService::disarm(Timer* timer) {
-    // Safe to call in any state, and callers must call it unconditionally.
+bool TimerService::disarm_slow(Timer* timer, std::uint32_t state) {
+    // The inline entry handled terminal states, so this starts in kArmed or
+    // kFiring. The public operation is still safe in every state, and callers
+    // must invoke it unconditionally.
     //
     // Testing `state == kArmed` at the call site and skipping this is a trap:
     // it silently skips the kFiring wait below, so the caller can go on to
@@ -174,15 +176,6 @@ bool TimerService::disarm(Timer* timer) {
     // reality — which ends with the same Timer linked into a heap twice and
     // heap_index pointing at the wrong slot.
     for (;;) {
-        const std::uint32_t state =
-            timer->state.load(std::memory_order_acquire);
-
-        if (state == Timer::kIdle || state == Timer::kCancelled ||
-            state == Timer::kFired) {
-            // Not in any heap, and nobody is touching it.
-            return false;
-        }
-
         if (state == Timer::kFiring) {
             // The callback is still reading this node and our caller is about
             // to destroy or re-arm it. Wait for it to publish kFired. Bounded
@@ -192,6 +185,11 @@ bool TimerService::disarm(Timer* timer) {
 #elif defined(__aarch64__)
             __asm__ __volatile__("yield");
 #endif
+            state = timer->state.load(std::memory_order_acquire);
+            if (state == Timer::kIdle || state == Timer::kCancelled ||
+                state == Timer::kFired) {
+                return false;
+            }
             continue;
         }
 
@@ -199,21 +197,32 @@ bool TimerService::disarm(Timer* timer) {
         // it moves the timer out of kArmed while holding the lock, so exactly
         // one of disarm and fire can win.
         Shard& shard = *shards_[timer->shard];
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        std::lock_guard<TimerService::ShardMutex> lock(shard.mutex);
 
-        std::uint32_t expected = Timer::kArmed;
-        if (timer->state.compare_exchange_strong(expected, Timer::kCancelled,
-                                                 std::memory_order_acq_rel,
-                                                 std::memory_order_relaxed)) {
-            if (timer->heap_index != kNotInHeap) {
-                const bool removed_earliest = timer->heap_index == 0;
+        // Every transition that unlinks this node holds the shard lock and
+        // publishes kNotInHeap before dropping it. The index therefore is the
+        // ownership claim here; a second atomic RMW on state would arbitrate
+        // the same transition twice. Publish kCancelled only after the final
+        // node access, so a concurrent loser cannot return and recycle the
+        // node while this winner is still removing it.
+        if (timer->heap_index != kNotInHeap) {
+            if (timer->heap_index == 0) {
+                heap_remove(shard.heap, 0);
+                timer->heap_index = kNotInHeap;
+                republish(shard);
+            } else {
                 heap_remove(shard.heap, timer->heap_index);
                 timer->heap_index = kNotInHeap;
-                if (removed_earliest) republish(shard);
             }
+            timer->state.store(Timer::kCancelled, std::memory_order_release);
             return true;
         }
         // Lost the race; re-examine (it is now kFiring or kFired).
+        state = timer->state.load(std::memory_order_acquire);
+        if (state == Timer::kIdle || state == Timer::kCancelled ||
+            state == Timer::kFired) {
+            return false;
+        }
     }
 }
 
@@ -268,7 +277,7 @@ std::size_t TimerService::run_expired_shard(Shard& shard, std::int64_t now) {
     for (;;) {
         std::size_t n = 0;
         {
-            std::lock_guard<std::mutex> lock(shard.mutex);
+            std::lock_guard<TimerService::ShardMutex> lock(shard.mutex);
             while (n < kBatch && !shard.heap.empty() &&
                    shard.heap[0]->deadline_ns <= now) {
                 Timer* timer = shard.heap[0];
@@ -278,15 +287,17 @@ std::size_t TimerService::run_expired_shard(Shard& shard, std::int64_t now) {
                 const Timer::FireFn on_fire = timer->on_fire;
                 const std::uint32_t next =
                     on_fire != nullptr ? Timer::kFiring : Timer::kFired;
-                std::uint32_t expected = Timer::kArmed;
-                if (timer->state.compare_exchange_strong(
-                        expected, next, std::memory_order_acq_rel,
-                        std::memory_order_relaxed)) {
-                    ready[n++] = Fired{timer, timer->waiter, on_fire,
-                                       timer->preferred_worker};
-                }
-                // Otherwise it was disarmed concurrently and its owner has
-                // already taken responsibility for the waiter.
+                // A node still linked under this shard lock cannot have been
+                // disarmed: cancellation removes it while holding the same
+                // lock. Copy every field first, then publish the terminal
+                // state. In particular, kFired means no later code touches a
+                // plain timer node, so a losing disarm may safely return and
+                // let its owner recycle the frame immediately.
+                assert(timer->state.load(std::memory_order_relaxed) ==
+                       Timer::kArmed);
+                ready[n++] = Fired{timer, timer->waiter, on_fire,
+                                   timer->preferred_worker};
+                timer->state.store(next, std::memory_order_release);
             }
             republish(shard);
         }
@@ -335,8 +346,11 @@ std::size_t TimerService::run_expired() {
 }
 
 std::size_t TimerService::run_expired(WorkerId worker) {
+    return run_expired(worker, now_ns());
+}
+
+std::size_t TimerService::run_expired(WorkerId worker, std::int64_t now) {
     if (worker >= shards_.size()) return 0;
-    const std::int64_t now = now_ns();
     Shard& shard = *shards_[worker];
     if (shard.earliest.load(std::memory_order_acquire) > now) return 0;
     return run_expired_shard(shard, now);
@@ -346,7 +360,7 @@ void TimerService::drain_all() {
     // Shutdown path. Like Go, we do not unwind tasks that are parked when the
     // runtime stops; we just make sure nothing is left pointing into the heaps.
     for (auto& shard : shards_) {
-        std::lock_guard<std::mutex> lock(shard->mutex);
+        std::lock_guard<TimerService::ShardMutex> lock(shard->mutex);
         for (Timer* timer : shard->heap) {
             timer->state.store(Timer::kCancelled, std::memory_order_release);
             timer->heap_index = kNotInHeap;

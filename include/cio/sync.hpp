@@ -32,11 +32,9 @@ struct WaitNode {
 
     WaitNode() noexcept = default;
 
-    WaitNode(ArmTag, std::coroutine_handle<> h, Scheduler* scheduler) noexcept
-        : handle(h),
-          sched(scheduler == nullptr ? SchedulerTarget{}
-                                     : scheduler->completion_target()),
-          preferred_worker(current_worker_id(scheduler)) {}
+    WaitNode(ArmTag, std::coroutine_handle<> h) noexcept : handle(h) {
+        capture_current_scheduler(sched, preferred_worker);
+    }
 
     WaitNode* next = nullptr;
     std::coroutine_handle<> handle{};
@@ -45,10 +43,7 @@ struct WaitNode {
 
     void arm(std::coroutine_handle<> h) noexcept {
         handle = h;
-        Scheduler* const scheduler = current_scheduler();
-        sched = scheduler == nullptr ? SchedulerTarget{}
-                                     : scheduler->completion_target();
-        preferred_worker = current_worker_id(scheduler);
+        capture_current_scheduler(sched, preferred_worker);
     }
     void wake() noexcept {
         SchedulerTarget::dispatch_completion(sched, handle, preferred_worker);
@@ -81,7 +76,7 @@ public:
 
     WaitNode* construct(std::coroutine_handle<> h) noexcept {
         return ::new (static_cast<void*>(storage_))
-            WaitNode(WaitNode::ArmTag{}, h, current_scheduler());
+            WaitNode(WaitNode::ArmTag{}, h);
     }
     WaitNode* construct() noexcept {
         return ::new (static_cast<void*>(storage_)) WaitNode;
@@ -90,6 +85,17 @@ public:
 private:
     alignas(WaitNode) std::byte storage_[sizeof(WaitNode)];
 };
+
+// These primitives protect only short intrusive waiter lists and ownership
+// hand-offs. Keep their public objects' established layouts while avoiding
+// pthread mutex machinery on each queue transition.
+class alignas(std::mutex) WaiterQueueMutex : public ChannelMutex {
+private:
+    [[maybe_unused]] std::byte
+        layout_padding_[sizeof(std::mutex) - sizeof(ChannelMutex)]{};
+};
+static_assert(sizeof(WaiterQueueMutex) == sizeof(std::mutex));
+static_assert(alignof(WaiterQueueMutex) == alignof(std::mutex));
 
 // Wakes an intrusive list, reading each `next` before the wake that may free
 // it.
@@ -139,7 +145,7 @@ public:
 
         detail::WaitNode* to_wake = nullptr;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<detail::ChannelMutex> lock(mutex_);
             if (waiters_ != &drained_marker_) to_wake = waiters_;
             waiters_ = &drained_marker_;
         }
@@ -168,39 +174,7 @@ public:
                 return group->state_.load(std::memory_order_acquire) == 0;
             }
             bool await_suspend(std::coroutine_handle<> h) {
-                detail::WaitNode* const node = node_storage.construct();
-                std::unique_lock<std::mutex> lock(group->mutex_);
-                const State state =
-                    group->state_.load(std::memory_order_acquire);
-                if (state <= kFinishing) {
-                    if (state == 0) return false;
-                    if (group->waiters_ != &drained_marker_) {
-                        // done() published its finishing state but has not yet
-                        // acquired mutex_. Join the batch it is about to
-                        // extract instead of spinning until completion.
-                        node->arm(h);
-                        node->next = group->waiters_;
-                        group->waiters_ = node;
-                        return true;
-                    }
-
-                    // The last done() has claimed the waiter list but has not
-                    // yet published stable zero. It cannot finish while we
-                    // hold mutex_. Release it before waiting for that very
-                    // short transition.
-                    lock.unlock();
-                    while (group->state_.load(std::memory_order_acquire) ==
-                           kFinishing) {
-                        cpu_relax();
-                    }
-                    return false;
-                }
-                if (group->waiters_ == &drained_marker_)
-                    group->waiters_ = nullptr;
-                node->arm(h);
-                node->next = group->waiters_;
-                group->waiters_ = node;
-                return true;
+                return group->park_wait(node_storage, h);
             }
             void await_resume() const noexcept {}
         };
@@ -217,6 +191,39 @@ private:
     static constexpr State kFinishing = 1;
     static constexpr State kMaxCount =
         static_cast<State>(std::numeric_limits<std::ptrdiff_t>::max());
+
+    CIO_NOINLINE bool park_wait(detail::WaitNodeStorage& storage,
+                                std::coroutine_handle<> h) {
+        detail::WaitNode* const node = storage.construct();
+        std::unique_lock<detail::ChannelMutex> lock(mutex_);
+        const State state = state_.load(std::memory_order_acquire);
+        if (state <= kFinishing) {
+            if (state == 0) return false;
+            if (waiters_ != &drained_marker_) {
+                // done() published its finishing state but has not yet
+                // acquired mutex_. Join the batch it is about to extract
+                // instead of spinning until completion.
+                node->arm(h);
+                node->next = waiters_;
+                waiters_ = node;
+                return true;
+            }
+
+            // The last done() has claimed the waiter list but has not yet
+            // published stable zero. It cannot finish while we hold mutex_.
+            // Release it before waiting for that very short transition.
+            lock.unlock();
+            while (state_.load(std::memory_order_acquire) == kFinishing) {
+                cpu_relax();
+            }
+            return false;
+        }
+        if (waiters_ == &drained_marker_) waiters_ = nullptr;
+        node->arm(h);
+        node->next = waiters_;
+        waiters_ = node;
+        return true;
+    }
 
     void add_positive(State amount) {
         State state = state_.load(std::memory_order_acquire);
@@ -242,7 +249,7 @@ private:
     // encode count+1. This keeps done() to one RMW while preventing wait() from
     // observing zero until the last done() has stopped touching the group.
     std::atomic<State> state_{0};
-    std::mutex mutex_;
+    detail::WaiterQueueMutex mutex_;
     detail::WaitNode* waiters_ = nullptr;
     inline static detail::WaitNode drained_marker_{};
 };
@@ -321,7 +328,7 @@ public:
             bool await_suspend(std::coroutine_handle<> h) {
                 detail::WaitNode* const node = node_storage.construct();
                 Mutex* const mutex = owner();
-                std::lock_guard<std::mutex> lock(mutex->mutex_);
+                std::lock_guard<detail::ChannelMutex> lock(mutex->mutex_);
                 // Publish waiter intent before enqueueing. unlock() can take
                 // its lock-free path only while the state is exactly locked;
                 // once this bit is visible it must enter the same queue lock,
@@ -382,7 +389,7 @@ private:
     void unlock_contended() {
         detail::WaitNode* next = nullptr;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<detail::ChannelMutex> lock(mutex_);
             next = head_;
             if (next != nullptr) {
                 head_ = next->next;
@@ -413,7 +420,7 @@ private:
                                               std::memory_order_relaxed);
     }
 
-    std::mutex mutex_;
+    detail::WaiterQueueMutex mutex_;
     std::atomic<std::uint8_t> state_{0};
     detail::WaitNode* head_ = nullptr;
     detail::WaitNode* tail_ = nullptr;
@@ -498,7 +505,7 @@ public:
             }
             bool await_suspend(std::coroutine_handle<> h) {
                 RWMutex* const mutex = self();
-                std::lock_guard<std::mutex> lock(mutex->mutex_);
+                std::lock_guard<detail::ChannelMutex> lock(mutex->mutex_);
                 // Retrying under the queue lock closes the gap between the
                 // lock-free attempt and publishing this waiter. Publishing
                 // queue intent in the same atomic state also forces a racing
@@ -540,7 +547,7 @@ public:
             }
             bool await_suspend(std::coroutine_handle<> h) {
                 RWMutex* const mutex = self();
-                std::lock_guard<std::mutex> lock(mutex->mutex_);
+                std::lock_guard<detail::ChannelMutex> lock(mutex->mutex_);
                 // Either take a lock that became idle since await_ready(), or
                 // atomically block the last active reader from leaving before
                 // it observes that a writer needs the hand-off.
@@ -585,7 +592,7 @@ public:
 
         detail::WaitNode* to_wake;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<detail::ChannelMutex> lock(mutex_);
             to_wake = take_next_writer_locked();
             if (to_wake == nullptr) {
                 // A pending bit without its waiter would otherwise strand
@@ -609,7 +616,7 @@ public:
 
         detail::WaitNode* to_wake = nullptr;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<detail::ChannelMutex> lock(mutex_);
             if ((state_.load(std::memory_order_relaxed) & kWriter) == 0) {
                 return;
             }
@@ -718,7 +725,7 @@ private:
         return next;
     }
 
-    std::mutex mutex_;
+    detail::WaiterQueueMutex mutex_;
     std::atomic<std::size_t> state_{0};
     std::size_t waiting_writers_ = 0;
     // Kept to preserve this public type's established size and member offsets.
@@ -742,24 +749,43 @@ public:
 
     template<typename F>
     Task<void> call(F fn) {
+        // Keep this entry point a non-coroutine dispatcher. Otherwise every
+        // completed call reserves the mutex and gate state in its frame even
+        // though the permanent done bit makes that state unreachable.
         // Completion is permanent. Keep the common repeated-call path off the
         // queue mutex; the acquire pairs with the initialiser's release store
         // so callers also observe everything it published.
-        if (done_.load(std::memory_order_acquire)) co_return;
+        if (done_.load(std::memory_order_acquire)) {
+            return completed_call(std::move(fn));
+        }
+        return call_slow(std::move(fn));
+    }
+
+private:
+    template<typename F>
+    static Task<void> completed_call(F fn) {
+        (void)fn;
+        co_return;
+    }
+
+    template<typename F>
+    Task<void> call_slow(F fn) {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             if (done_.load(std::memory_order_relaxed)) co_return;
             if (running_) {
                 // Someone else is initialising. Wait for them rather than
-                // running it a second time.
+                // running it a second time. The first uncontended call does
+                // not need a gate at all; construct it only when a waiter
+                // actually appears. Both publication and the initialiser's
+                // completion copy happen under this lock, so no wake can be
+                // missed.
+                if (!static_cast<bool>(gate_)) gate_ = make_chan<Unit>(0);
                 auto gate = gate_;
                 lock.unlock();
                 (void)co_await gate.recv();
                 co_return;
             }
-            // The gate must exist before running_ is published, or a second
-            // caller could observe running_ and find nothing to wait on.
-            if (!static_cast<bool>(gate_)) gate_ = make_chan<Unit>(0);
             running_ = true;
         }
 
@@ -779,7 +805,6 @@ public:
         co_return;
     }
 
-private:
     std::mutex mutex_;
     std::atomic<bool> done_{false};
     bool running_ = false;

@@ -31,9 +31,10 @@ public:
     LazyTimerStorage(const LazyTimerStorage&) = delete;
     LazyTimerStorage& operator=(const LazyTimerStorage&) = delete;
 
-    Timer& construct(std::int64_t deadline, std::coroutine_handle<> waiter) noexcept {
-        return *std::construct_at(std::addressof(storage_.timer), Timer::ArmTag{},
-                                  deadline, waiter, nullptr);
+    Timer& construct(std::int64_t deadline,
+                     std::coroutine_handle<> waiter) noexcept {
+        return *std::construct_at(std::addressof(storage_.timer),
+                                  Timer::ArmTag{}, deadline, waiter, nullptr);
     }
 
 private:
@@ -51,7 +52,8 @@ private:
 
 class [[nodiscard]] SleepAwaiter {
 public:
-    explicit SleepAwaiter(std::int64_t deadline_ns) noexcept : deadline_ns_(deadline_ns) {}
+    explicit SleepAwaiter(std::int64_t deadline_ns) noexcept
+        : deadline_ns_(deadline_ns) {}
 
     SleepAwaiter(const SleepAwaiter&) = delete;
     SleepAwaiter& operator=(const SleepAwaiter&) = delete;
@@ -80,14 +82,15 @@ inline SleepAwaiter sleep(Duration duration) noexcept {
     // instead of taking two clock readings so this common polling fast path
     // stays both deterministic and cheap even when the awaiter uses lazy
     // storage that inhibits the compiler's previous constant folding.
-    return SleepAwaiter{
-        duration <= Duration::zero() ? std::numeric_limits<std::int64_t>::min()
-                                     : deadline_from_now(duration)};
+    return SleepAwaiter{duration <= Duration::zero()
+                            ? std::numeric_limits<std::int64_t>::min()
+                            : deadline_from_now(duration)};
 }
 
 inline SleepAwaiter sleep_until(TimePoint deadline) noexcept {
-    return SleepAwaiter{
-        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch()).count()};
+    return SleepAwaiter{std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            deadline.time_since_epoch())
+                            .count()};
 }
 
 }  // namespace cio

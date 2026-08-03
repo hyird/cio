@@ -312,6 +312,13 @@ template<typename Case>
 inline constexpr bool is_default_case =
     std::is_same_v<std::remove_cvref_t<Case>, DefaultCase>;
 
+template<typename Case>
+inline constexpr bool is_channel_case = false;
+template<typename T>
+inline constexpr bool is_channel_case<RecvCase<T>> = true;
+template<typename T>
+inline constexpr bool is_channel_case<SendCase<T>> = true;
+
 }  // namespace detail
 
 template<typename... Cases>
@@ -354,7 +361,9 @@ private:
         (std::size_t{0} + ... +
          static_cast<std::size_t>(detail::is_default_case<Cases>));
     static constexpr bool kHasDefault = kDefaultCount != 0;
-    static constexpr std::size_t kPollCount = kCount - kDefaultCount;
+    static constexpr std::size_t kChannelCount =
+        (std::size_t{0} + ... +
+         static_cast<std::size_t>(detail::is_channel_case<Cases>));
 
     // Returns true if the task parked.
     bool setup(std::coroutine_handle<> h) {
@@ -389,17 +398,13 @@ private:
         lock_count = unique_count;
 
         std::uint8_t poll_order[kCount];
-        if constexpr (kHasDefault) {
-            // A default case is selected only after every operation blocks; it
-            // never participates in the random choice among ready operations.
-            fill_non_default_poll_order(poll_order);
-        } else if constexpr (kCount != 2) {
-            // Larger permutations are independent of channel state. Pick them
-            // before entering the multi-channel critical section so contending
-            // senders and receivers do not wait behind the shuffle. The
-            // two-case path is one cheap bit and stays adjacent to its scan,
-            // which also keeps that common specialization compact.
-            fill_poll_order(poll_order);
+        if constexpr (kChannelCount == kCount) {
+            if constexpr (kChannelCount != 2) fill_poll_order(poll_order);
+        } else {
+            // The permutation is independent of channel state. Pick it before
+            // entering the multi-channel critical section so contending
+            // senders and receivers do not wait behind the shuffle.
+            fill_channel_poll_order(poll_order);
         }
 
         for (std::size_t i = 0; i < lock_count; ++i) locked[i]->mutex.lock();
@@ -411,12 +416,12 @@ private:
 
         // Phase 1: is anything ready right now?
         detail::ChanWaiter* to_wake = nullptr;
-        if constexpr (!kHasDefault && kCount == 2) fill_poll_order(poll_order);
+        if constexpr (kChannelCount == kCount && kChannelCount == 2)
+            fill_poll_order(poll_order);
 
         std::size_t ready = kCount;
-        if constexpr (kHasDefault) {
-            for (std::size_t position = 0; position < kPollCount; ++position) {
-                const std::size_t i = poll_order[position];
+        if constexpr (kChannelCount == kCount) {
+            for (const std::size_t i : poll_order) {
                 visit_case(i, [&](auto& target) {
                     detail::ChanWaiter* woken = nullptr;
                     if (detail::case_try(target, woken) !=
@@ -428,7 +433,9 @@ private:
                 if (ready != kCount) break;
             }
         } else {
-            for (const std::size_t i : poll_order) {
+            for (std::size_t position = 0; position < kChannelCount;
+                 ++position) {
+                const std::size_t i = poll_order[position];
                 visit_case(i, [&](auto& target) {
                     detail::ChanWaiter* woken = nullptr;
                     if (detail::case_try(target, woken) !=
@@ -514,27 +521,13 @@ private:
         }(std::make_index_sequence<kCount>{});
     }
 
-    // A uniform random permutation of [0, kCount), written into `out`.
-    //
-    // It has to be a full permutation, not a random rotation. A rotation only
-    // randomises where the scan starts, so a case that is never ready still
-    // hands its rotations to whichever case follows it: with [ready, ready,
-    // nil] the first case wins two rotations out of three, a 2:1 bias against
-    // the uniform choice this is documented to make. Go's selectgo shuffles
-    // pollorder for the same reason.
-    //
-    // Fisher-Yates is the general answer, but it is not free and kCount is a
-    // compile-time constant that is almost always 2 or 3. A permutation of n
-    // items is just a number in [0, n!), so at those sizes one draw picks the
-    // whole permutation and the loop, the swaps and the n-1 bounded draws all
-    // disappear. Each branch below produces exactly the same distribution as
-    // the shuffle it replaces.
+    // A uniform random permutation of [0, kCount), written into `out`. This
+    // direct form keeps the all-channel specialization compact.
     static void fill_poll_order(std::uint8_t (&out)[kCount]) noexcept {
         static_assert(kCount <= 255, "poll order indices are uint8_t");
         if constexpr (kCount == 1) {
             out[0] = 0;
         } else if constexpr (kCount == 2) {
-            // Both permutations of two items are rotations, so one bit decides.
             const auto first =
                 static_cast<std::uint8_t>(detail::select_rand(2));
             out[0] = first;
@@ -559,25 +552,38 @@ private:
         }
     }
 
-    // Builds and randomises only the operation cases. Default is control flow,
-    // not a ready operation, and including it merely adds a failed dispatch to
-    // every non-blocking select.
-    static void fill_non_default_poll_order(
-        std::uint8_t (&out)[kCount]) noexcept {
+    // Builds a uniform random permutation of the channel-case tuple indices.
+    // Timeout and default cases are control flow during the ready scan: their
+    // case_try overloads can only report blocked, so dispatching them cannot
+    // select a winner.
+    //
+    // It has to be a full permutation, not a random rotation. A rotation only
+    // randomises where the scan starts, so a case that is never ready still
+    // hands its rotations to whichever case follows it: with [ready, ready,
+    // nil] the first case wins two rotations out of three, a 2:1 bias against
+    // the uniform choice this is documented to make. Go's selectgo shuffles
+    // pollorder for the same reason.
+    //
+    // Fisher-Yates is the general answer, but it is not free and the channel
+    // count is almost always 2 or 3. A permutation of n items is just a number
+    // in [0, n!), so at those sizes one draw picks the whole permutation and
+    // the loop, swaps and n-1 bounded draws disappear.
+    static void fill_channel_poll_order(std::uint8_t (&out)[kCount]) noexcept {
+        static_assert(kCount <= 255, "poll order indices are uint8_t");
         std::size_t position = 0;
         [&]<std::size_t... I>(std::index_sequence<I...>) {
             (
                 [&] {
                     using Case = std::tuple_element_t<I, std::tuple<Cases...>>;
-                    if constexpr (!detail::is_default_case<Case>)
+                    if constexpr (detail::is_channel_case<Case>)
                         out[position++] = static_cast<std::uint8_t>(I);
                 }(),
                 ...);
         }(std::make_index_sequence<kCount>{});
 
-        if constexpr (kPollCount == 2) {
+        if constexpr (kChannelCount == 2) {
             if (detail::select_rand(2) != 0) std::swap(out[0], out[1]);
-        } else if constexpr (kPollCount == 3) {
+        } else if constexpr (kChannelCount == 3) {
             static constexpr std::uint8_t kOrders[6][3] = {
                 {0, 1, 2}, {0, 2, 1}, {1, 0, 2},
                 {1, 2, 0}, {2, 0, 1}, {2, 1, 0},
@@ -587,8 +593,8 @@ private:
             out[0] = cases[picked[0]];
             out[1] = cases[picked[1]];
             out[2] = cases[picked[2]];
-        } else if constexpr (kPollCount > 3) {
-            for (std::size_t i = kPollCount; i > 1; --i) {
+        } else if constexpr (kChannelCount > 3) {
+            for (std::size_t i = kChannelCount; i > 1; --i) {
                 const std::size_t j =
                     detail::select_rand(static_cast<std::uint32_t>(i));
                 std::swap(out[i - 1], out[j]);

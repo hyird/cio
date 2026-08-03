@@ -48,6 +48,29 @@ void test_buffered_capacity() {
     CIO_CHECK(cio::run(body()));
 }
 
+void test_try_recv_refills_from_blocked_sender() {
+    auto body = []() -> cio::Task<bool> {
+        auto ch = cio::make_chan<int>(1);
+        CIO_CHECK(ch.try_send(1));
+
+        auto sender = cio::spawn([](cio::Chan<int> out) -> cio::Task<> {
+            CIO_CHECK(co_await out.send(2));
+        }(ch));
+        // With one worker this runs the sender until it parks behind the full
+        // buffer, so try_recv() must preserve the refill-and-wake slow path.
+        co_await cio::yield();
+
+        const auto first = ch.try_recv();
+        const auto second = ch.try_recv();
+        co_await sender;
+        co_return first == 1 && second == 2;
+    };
+
+    cio::RuntimeOptions options;
+    options.worker_threads = 1;
+    CIO_CHECK(cio::run(body(), options));
+}
+
 void test_close_drains_then_reports() {
     auto body = []() -> cio::Task<bool> {
         auto ch = cio::make_chan<int>(8);
@@ -185,6 +208,7 @@ void test_capacity_overflow_is_rejected() {
 int main() {
     RUN_TEST(test_unbuffered_rendezvous);
     RUN_TEST(test_buffered_capacity);
+    RUN_TEST(test_try_recv_refills_from_blocked_sender);
     RUN_TEST(test_close_drains_then_reports);
     RUN_TEST(test_close_wakes_blocked_receivers);
     RUN_TEST(test_mpmc_throughput);

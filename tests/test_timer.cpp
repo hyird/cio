@@ -1,4 +1,5 @@
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -10,6 +11,16 @@
 using namespace std::chrono_literals;
 
 namespace {
+
+struct RacingTimer : cio::detail::Timer {
+    std::atomic<int>* fired = nullptr;
+
+    static std::coroutine_handle<> fire(cio::detail::Timer* timer) noexcept {
+        static_cast<RacingTimer*>(timer)->fired->fetch_add(
+            1, std::memory_order_relaxed);
+        return {};
+    }
+};
 
 // ------------------------------------------------------------- Timer ---
 
@@ -101,6 +112,82 @@ void test_timer_destructor_stops() {
         // The channel is closed, so this returns rather than waiting 10s.
         auto tick = co_await channel.recv();
         CIO_CHECK(!tick.has_value());
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+void test_concurrent_disarm_has_one_owner() {
+    auto body = []() -> cio::Task<bool> {
+        cio::detail::Timer timer;
+        timer.deadline_ns = cio::now_ns() + 60'000'000'000LL;
+        timer.waiter = std::noop_coroutine();
+        auto& service = cio::detail::current_scheduler()->timers();
+        service.arm(&timer);
+
+        std::barrier start{3};
+        std::atomic<int> owners{0};
+        auto disarm = [&] {
+            start.arrive_and_wait();
+            owners.fetch_add(service.disarm(&timer), std::memory_order_relaxed);
+        };
+        std::thread first(disarm);
+        std::thread second(disarm);
+        start.arrive_and_wait();
+        first.join();
+        second.join();
+
+        CIO_CHECK_EQ(owners.load(std::memory_order_relaxed), 1);
+        CIO_CHECK(!service.disarm(&timer));
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+void test_concurrent_fire_and_disarm_partition_ownership() {
+    auto body = []() -> cio::Task<bool> {
+        constexpr std::size_t kTimers = 1024;
+        auto timers = std::make_unique<RacingTimer[]>(kTimers);
+        auto& service = cio::detail::current_scheduler()->timers();
+        std::atomic<int> fired{0};
+        std::atomic<int> cancelled{0};
+        const std::int64_t deadline = cio::now_ns() - 1;
+
+        for (std::size_t i = 0; i < kTimers; ++i) {
+            timers[i].deadline_ns = deadline - static_cast<std::int64_t>(i);
+            timers[i].waiter = {};
+            timers[i].on_fire = &RacingTimer::fire;
+            timers[i].fired = &fired;
+            service.arm(&timers[i]);
+        }
+
+        std::barrier start{3};
+        std::thread firing([&] {
+            start.arrive_and_wait();
+            service.run_expired();
+        });
+        std::thread cancelling([&] {
+            start.arrive_and_wait();
+            for (std::size_t i = 0; i < kTimers; ++i) {
+                if (service.disarm(&timers[i])) {
+                    cancelled.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+        start.arrive_and_wait();
+        firing.join();
+        cancelling.join();
+
+        CIO_CHECK_EQ(fired.load(std::memory_order_relaxed) +
+                         cancelled.load(std::memory_order_relaxed),
+                     static_cast<int>(kTimers));
+        for (std::size_t i = 0; i < kTimers; ++i) {
+            const auto state = timers[i].state.load(std::memory_order_acquire);
+            CIO_CHECK(state == cio::detail::Timer::kFired ||
+                      state == cio::detail::Timer::kCancelled);
+            CIO_CHECK_EQ(timers[i].heap_index, ~std::uint32_t{0});
+            CIO_CHECK(!service.disarm(&timers[i]));
+        }
         co_return true;
     };
     CIO_CHECK(cio::run(body()));
@@ -392,6 +479,8 @@ int main() {
     RUN_TEST(test_timer_stop_reports_whether_it_won);
     RUN_TEST(test_timer_reset_extends_and_shortens);
     RUN_TEST(test_timer_destructor_stops);
+    RUN_TEST(test_concurrent_disarm_has_one_owner);
+    RUN_TEST(test_concurrent_fire_and_disarm_partition_ownership);
     RUN_TEST(test_timer_selectable);
     RUN_TEST(test_ticker_delivers_repeatedly);
     RUN_TEST(test_ticker_does_not_drift);

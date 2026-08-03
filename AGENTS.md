@@ -151,9 +151,13 @@ go test ./...
 - `Chan<T>` 的内部互斥只保护短小的等待者队列与环形缓冲区临界区，持有期间绝不
   挂起或调度。它先有限自旋、再让出 OS 线程；跨 channel 的 `select` 仍按地址序
   获取这些锁，唤醒仍在全部相关锁释放后发生。
-- `select` 的随机 poll permutation 只包含真正的操作 case；`default` 是全部操作
-  都阻塞后的控制流，绝不参与 ready case 的随机竞争。无 `default` 的 select 仍
-  按完整 case 集合生成均匀 permutation。
+- 非阻塞 `Chan<T>::try_recv()` 只有在缓冲非空且 sender 队列为空时才内联摘取环形
+  缓冲；空缓冲、关闭状态或存在 sender（包括待清理的 select loser）必须回到通用
+  locked primitive，保留补位、winner claim 与锁后唤醒语义。
+- `select` 的随机 poll permutation 只包含 channel send/recv case，并在这些 case
+  之间保持均匀选择。`default` 与 timeout 是全部 channel 都阻塞后的控制流，它们的
+  `case_try` 不可能报告 ready，绝不参与第一阶段扫描或 ready case 的随机竞争；
+  `default` 只在扫描结束后获胜，timer 仍在 channel waiter 全部发布后才 arm。
 
 ### 发布与休眠
 
@@ -178,9 +182,27 @@ go test ./...
 `ChanWaiter` 的 copy/move 只用于组装尚未发布的普通 awaiter 或 select case，目标
 是一个新的惰性空节点，不复制源节点字段。一旦节点进入 channel 等待队列就绝不能
 复制或移动；此后只允许在持锁下摘取/撤回，并按上述规则把调度作为最后动作。
+`ChanWaiter::queued` 是 channel 链接是否有效的唯一标记。普通等待者从队列摘取后
+可以保留陈旧的 `next`/`prev`：`close()` 使用 `next` 前会覆盖它，重新入队会覆盖
+两条链接，`remove()` 必须先检查 `queued`。撤回 select loser 时先修复两侧邻居，
+再以 `queued=false` 让自己的陈旧链接失效；被 waker 摘取的 select 等待者则在竞争
+winner 前仍会断开两条链接，因为其帧还要存活到其余 case 全部撤回。
 
 定时器的 disarm 是无条件的。即使节点看起来已不处于 armed 状态，`disarm()` 也必
 须等出正在触发的回调，节点才能复用。
+
+定时器分片 heap 的锁只保护有限的插入、移除与到期批量摘取，不在持锁期间挂起或
+调度；观察到占用后使用架构自旋提示，有限自旋并周期性让出 OS 线程。无锁读取的
+最早截止时间发布值单独占一条 cache line，monitor 扫描不能与 owner 每次修改的
+锁字及 heap 元数据发生伪共享。
+timer 节点的 unlink 所有权由 shard 锁下的 `heap_index` 哨兵决定；`disarm()` 先从
+heap 摘除、发布 `kNotInHeap` 并更新 earliest，最后才以 release 发布
+`kCancelled`。不得在持有同一 shard 锁时重新引入 state RMW，也不得在最后一次触
+碰节点之前发布 cancelled，否则并发失败者可能提前返回并复用节点。
+`run_expired_shard()` 在同一 shard 锁下弹出的节点必然仍为 armed，不再用 state
+RMW 重复争夺所有权。它必须先把 waiter、callback 与 preferred worker 全部复制到
+批量存储，再以 release 发布 `kFiring` 或 `kFired`；plain timer 发布 fired 后绝不
+再触碰节点，callback timer 则保留 firing，直到回调结束才发布 fired。
 
 `TimeoutCase` 只在 select 的 ready 扫描全部阻塞、确定需要 park 后，才在原始存储
 中构造 `SelectTimer::Node`。已就绪 channel 或 default 获胜时不得初始化未使用的定
@@ -197,12 +219,19 @@ timer shard 的 `earliest` 只在堆根发生变化时 release 发布；插入�
 `wait()` 返回后与仍在收尾的 `done()` 竞态。零计数转换若只摘到一个 waiter，
 直接经 `runnext` 交接；多个 waiter 仍走普通批量唤醒，跨运行时交接仍由
 completion endpoint 降级到共享调度。
+`WaitGroup` 的 waiter 锁只保护短小链表与零转换交接，临界区内绝不挂起或调度；
+它使用有限自旋后让出线程的内部短锁。`wait()` 确实需要发布 waiter 的路径留在
+noinline 慢路，ready 路径不得重新内联锁循环。短锁保留与 `std::mutex` 相同的内部
+占位尺寸，使公开 `WaitGroup` 的尺寸和字段偏移不因锁机制而漂移。
 
 `Mutex` 的无竞争解锁只在状态精确为 locked 时原子换零。首个等待者必须在队列锁
 下先发布 contended 位再入队，使并发解锁要么先释放并由等待者接管，要么进入同一
 队列锁完成直接交接；只有 contended、尚无 locked 的状态是等待者正在接管的瞬态，
 `try_lock()` 绝不能获取它。直接交接得到的 Guard 记住队列模式，队列排空后再把状
 态发布回零。
+`Mutex` 的队列锁只保护 waiter 链、contended 发布与直接交接，临界区内绝不挂起或
+调度；它与 `WaitGroup`、`RWMutex` 共用有限自旋后让出线程的内部短锁。该锁保留
+`std::mutex` 的尺寸与对齐，使三个公开同步类型的尺寸和字段偏移不因锁机制而漂移。
 
 `WaitGroup`、`Mutex`、`RWMutex` 与 `TaskGroup::join()` 的 awaiter 在 ready 快路上
 只保留对齐的 `WaitNode` 原始存储，不构造等待节点。`await_ready()` 失败后、确认操
@@ -214,12 +243,28 @@ completion endpoint 降级到共享调度。
 保留默认构造后按需 `arm()` 的队列发布形状。`Mutex` 与 `RWMutex` awaiter 的 owner
 指针低位记录是否进入了 contended/parked 慢路，解引用前必须清除此位；该编码以
 `std::mutex` 的对齐为编译期前提，不能退回每次 ready 快路都清零一个独立布尔字
-段。
+段。`WaitNode` 发布前以同一次 worker TLS 快照同时取得 completion endpoint 与
+preferred worker；不得把它拆回两次 worker 查询，外部线程的 preferred worker
+保持无效值。
+
+`Chan<T>` 的发送与接收等待者在发布前直接取得当前 worker 已缓存的稳定
+completion endpoint；不得先从 worker 恢复 `Scheduler*`、再经 scheduler 重复加载
+同一端点。外部线程仍通过 acquire 读取默认 scheduler 后取得端点，且空默认值仍
+产生空目标。
 
 `RWMutex` 的写解锁只在状态精确为单独 writer 时走无锁快路。首个读或写等待者必
 须在等待者锁下把 pending 位与所有权状态原子合并，再把自身挂入队列；并发写解锁
 要么先发布零、由等待者直接获取，要么观察 pending 后进入同一把锁。写者直接交接
 必须保留仍排队的读者所需的 pending 位。
+
+`Once::call()` 的公开入口保持普通函数并返回 `Task<void>`。一次 acquire 读取永久
+完成位后，已完成路径只返回持有 callable 的紧凑完成协程，未完成路径才返回含锁、
+gate 与等待状态的慢路协程。两条路径都必须把 callable 移入返回任务；入口本身不
+得调用用户代码，也不要把慢路状态重新并入每次重复调用都会分配的协程帧。
+永久完成位以 release/acquire 发布初始化结果。首次调用没有并发等待者时不得预先
+分配 channel gate；只有后续调用者在 Once 锁下观察到 `running_` 后才创建并复制
+gate，初始化者也必须在同一把锁下复制该 gate 后再发布完成，使延迟构造不会打开
+漏唤醒窗口。已完成调用仍只读完成位，不得进入锁或 gate 路径。
 
 ### reactor 与关停生命周期
 
@@ -255,6 +300,11 @@ completion endpoint 降级到共享调度。
   endpoint 降级到共享调度。
 - `TaskGroup` 的首个异常先在组锁下保存，再以 release 发布异常标志；成功 join
   以 acquire 观察标志为假时不获取组锁，只有失败路径才复制并重抛异常。
+- `TaskGroup` 的组锁只保护异常槽、join waiter 与 finishing 交接，临界区内绝不
+  挂起或调度；它使用有限自旋后让出线程的内部短锁。`join()` 确实需要 park 的
+  发布和失败异常复制留在 noinline 慢路径，ready/成功路径不得重新内联锁循环。
+  组锁保留与 `std::mutex` 相同的内部占位尺寸，使 `GroupState` 的 192 字节布局及
+  原子计数字段偏移不因锁机制而漂移。
 - `TaskGroup` 的取消状态内嵌在组状态中；导出的 token 以 aliasing 所有权共享组
   的控制块，使 token、子任务与组只用一个生命周期根，同时允许 token 独立延寿。
 - `TaskGroup` 的组状态与 `shared_ptr` 控制块通过 FramePool 一次分配；最后所有者
@@ -267,7 +317,12 @@ completion endpoint 降级到共享调度。
   owner 或在线程退出时直接释放本地链，绝不解引用可能已析构的 owner；它的布局
   填充保持既有 TLS footprint，避免扰动同线程的其他热缓存。缓存 miss、中央
   refill/spill 与 re-home drain 走 noinline 慢路径，但这些函数留在普通 text
-  section，不能用全局 cold section 的布局变化去扰动无关热代码。
+  section，不能用全局 cold section 的布局变化去扰动无关热代码。归还侧收到的
+  size 已是精确的二次幂 class：小于 64 KiB 的短 class 循环保持不变，64 KiB 及
+  以上直接按尾零数恢复 class；不要重新用通用 round-up 循环扫描大 class。
+- `PooledBuffer::release()` 只由析构函数，或由随即覆盖全部三个成员的移动赋值调
+  用；归还/释放存储后不清零这份不可再观察的旧状态。不要从其他能继续观察原对象
+  的路径调用它，也不要为析构路径重新引入三次冗余成员写。
 - 取消的 `done` channel 在 token 首次请求时惰性创建；首次请求与 `cancel()` 由
   hook 锁线性化。若取消先发生，之后创建的 channel 必须在返回前关闭；从未请求
   `done()` 的普通 `TaskGroup` 不应为它分配 channel。

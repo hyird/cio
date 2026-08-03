@@ -1,19 +1,20 @@
 #include "cio/pool.hpp"
 
+#include <bit>
 #include <new>
 
 namespace cio {
 
 void PooledBuffer::release() noexcept {
     if (data_ == nullptr) return;
-    BufferPool* const pool = std::exchange(pool_, nullptr);
-    std::byte* const data = std::exchange(data_, nullptr);
-    const std::size_t size = std::exchange(size_, 0);
-    if (pool != nullptr) {
-        pool->put(data, size);
+    // The only callers are the destructor and move-assignment immediately
+    // before all three members are overwritten. Their old values cannot be
+    // observed again, so do not spend three stores clearing dead state.
+    if (pool_ != nullptr) {
+        pool_->put(data_, size_);
     } else {
         // An oversized buffer was never pooled; free it directly.
-        ::operator delete(data, std::align_val_t{alignof(std::max_align_t)});
+        ::operator delete(data_, std::align_val_t{alignof(std::max_align_t)});
     }
 }
 
@@ -134,7 +135,16 @@ void BufferPool::put(std::byte* data, std::size_t size) noexcept {
         return;
     }
 
-    const unsigned index = class_of(size);
+    // PooledBuffer stores class_bytes(index), so every returned pooled size is
+    // an exact power of two. The short loop remains cheaper for the first few
+    // classes; once it reaches 64 KiB, recover the class in one instruction.
+    static constexpr std::size_t kExactClassThreshold = 64u << 10;
+    static_assert(std::has_single_bit(kMinBufferBytes));
+    const unsigned index =
+        size < kExactClassThreshold
+            ? class_of(size)
+            : static_cast<unsigned>(std::countr_zero(size) -
+                                    std::countr_zero(kMinBufferBytes));
     ThreadCache& local = cache();
     if (local.count[index] < kThreadCacheDepth) {
         next_of(data) = local.free_list[index];

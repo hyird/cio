@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -337,6 +338,27 @@ void test_once_waiters_see_the_result() {
     CIO_CHECK(cio::run(body()));
 }
 
+void test_once_preserves_lazy_move_only_calls() {
+    auto body = []() -> cio::Task<bool> {
+        cio::Once once;
+        int value = 0;
+
+        auto delayed = once.call(
+            [increment = std::make_unique<int>(1), &value]() -> cio::Task<> {
+                value += *increment;
+                co_return;
+            });
+        co_await once.call(
+            [increment = std::make_unique<int>(10), &value]() -> cio::Task<> {
+                value += *increment;
+                co_return;
+            });
+        co_await std::move(delayed);
+        co_return value == 10;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 // -------------------------------------------------------------- Cond ---
 
 void test_cond_wait_and_notify() {
@@ -590,6 +612,7 @@ int main() {
     RUN_TEST(test_try_lock_variants);
     RUN_TEST(test_once_runs_exactly_once);
     RUN_TEST(test_once_waiters_see_the_result);
+    RUN_TEST(test_once_preserves_lazy_move_only_calls);
     RUN_TEST(test_cond_wait_and_notify);
     RUN_TEST(test_cond_notify_one);
     return cio_test::summary();

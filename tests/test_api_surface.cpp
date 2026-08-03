@@ -3,6 +3,7 @@
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -344,6 +345,13 @@ cio::Task<int> exercise_concurrency_surface() {
     CIO_CHECK_EQ(co_await three_way, std::size_t{0});
     CIO_CHECK_EQ(three_way.get<0>().value_or(0), 13);
 
+    auto deadline_ready = cio::make_chan<int>(1);
+    CIO_CHECK(deadline_ready.try_send(17));
+    auto timed = cio::select(cio::recv(deadline_ready),
+                             cio::after_deadline(cio::Clock::now() + 1s));
+    CIO_CHECK_EQ(co_await timed, std::size_t{0});
+    CIO_CHECK_EQ(timed.get<0>().value_or(0), 17);
+
     auto joined = cio::spawn([]() -> cio::Task<int> { co_return 5; }());
     const int joined_value = co_await joined;
 
@@ -377,6 +385,12 @@ cio::Task<int> exercise_concurrency_surface() {
     };
     co_await once.call(initialise_once);
     co_await once.call(initialise_once);
+    auto ignored_once = once.call(
+        [increment = std::make_unique<int>(99), &once_calls]() -> cio::Task<> {
+            once_calls += *increment;
+            co_return;
+        });
+    co_await std::move(ignored_once);
     CIO_CHECK(once.done());
     CIO_CHECK_EQ(once_calls, 1);
 

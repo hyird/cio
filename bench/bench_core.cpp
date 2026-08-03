@@ -8,6 +8,7 @@
 //   buffered chan op       ~60-90 ns
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "cio/cio.hpp"
@@ -118,6 +120,14 @@ cio::Task<> task_group_single_child(long count) {
     }
 }
 
+cio::Task<> task_group_reused_single_child(long count) {
+    cio::TaskGroup group;
+    for (long i = 0; i < count; ++i) {
+        group.spawn(empty_task());
+        co_await group.join();
+    }
+}
+
 cio::Task<> task_group_zero_join(long count) {
     cio::TaskGroup group;
     for (long i = 0; i < count; ++i) co_await group.join();
@@ -180,6 +190,27 @@ cio::Task<> chan_buffered_try_ops(long rounds) {
     for (long i = 0; i < rounds; ++i) {
         if (!channel.try_send(static_cast<int>(i))) std::terminate();
         auto value = channel.try_recv();
+        if (!value) std::terminate();
+        sum += *value;
+    }
+    if (sum == -1) std::terminate();
+    co_return;
+}
+
+cio::Task<> chan_buffered_try_recv_miss(long rounds) {
+    auto channel = cio::make_chan<int>(1);
+    for (long i = 0; i < rounds; ++i) {
+        if (channel.try_recv().has_value()) std::terminate();
+    }
+    co_return;
+}
+
+cio::Task<> chan_buffered_await_ops(long rounds) {
+    auto channel = cio::make_chan<int>(1);
+    long sum = 0;
+    for (long i = 0; i < rounds; ++i) {
+        if (!(co_await channel.send(static_cast<int>(i)))) std::terminate();
+        auto value = co_await channel.recv();
         if (!value) std::terminate();
         sum += *value;
     }
@@ -264,6 +295,41 @@ cio::Task<> timer_arm_disarm(long operations) {
     co_return;
 }
 
+// Foreign threads have no worker-local shard, so they all fall back to shard
+// zero. This is the adversarial timer-lock shape: unlike ordinary sleeps and
+// descriptor deadlines, every operation genuinely contends on one heap.
+cio::Task<> timer_foreign_contention(long per_thread, int thread_count) {
+    auto& service = cio::detail::current_scheduler()->timers();
+    std::barrier start(thread_count);
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(thread_count));
+
+    for (int i = 0; i < thread_count; ++i) {
+        threads.emplace_back([&, i] {
+            cio::detail::Timer timer;
+            timer.waiter = std::noop_coroutine();
+            timer.on_fire = nullptr;
+            start.arrive_and_wait();
+            try {
+                for (long round = 0; round < per_thread; ++round) {
+                    timer.deadline_ns = cio::now_ns() + 60'000'000'000LL + i;
+                    service.arm(&timer);
+                    if (!service.disarm(&timer)) {
+                        failed.store(true, std::memory_order_relaxed);
+                        return;
+                    }
+                }
+            } catch (...) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    if (failed.load(std::memory_order_relaxed)) std::terminate();
+    co_return;
+}
+
 // --- mutex ------------------------------------------------------------------
 
 cio::Task<> mutex_uncontended(long count) {
@@ -342,6 +408,44 @@ cio::Task<> once_already_done(long count) {
     for (long i = 0; i < count; ++i) {
         co_await once.call(empty_task);
     }
+}
+
+cio::Task<> once_first_call(long count) {
+    for (long i = 0; i < count; ++i) {
+        cio::Once once;
+        co_await once.call(empty_task);
+    }
+}
+
+cio::Task<> once_first_call_parallel(long rounds) {
+    for (long round = 0; round < rounds; ++round) {
+        cio::Once once;
+        cio::TaskGroup group;
+        for (int task = 0; task < 8; ++task) {
+            group.spawn([](cio::Once& target) -> cio::Task<> {
+                co_await target.call(empty_task);
+            }(once));
+        }
+        co_await group.join();
+    }
+}
+
+cio::Task<> once_completed_parallel(long per_task) {
+    cio::Once once;
+    co_await once.call(empty_task);
+
+    cio::WaitGroup group;
+    group.add(8);
+    for (int i = 0; i < 8; ++i) {
+        cio::go([](cio::Once& value, cio::WaitGroup& done,
+                   long count) -> cio::Task<> {
+            for (long call = 0; call < count; ++call) {
+                co_await value.call(empty_task);
+            }
+            done.done();
+        }(once, group, per_task));
+    }
+    co_await group.wait();
 }
 
 // --- select -----------------------------------------------------------------
@@ -480,6 +584,8 @@ int main(int argc, char** argv) {
             [&] { runtime.block_on(task_group_spawn_and_join(kSpawns)); });
     measure("task group, one child", kSpawns,
             [&] { runtime.block_on(task_group_single_child(kSpawns)); });
+    measure("task group reused, one child", kSpawns,
+            [&] { runtime.block_on(task_group_reused_single_child(kSpawns)); });
     measure("task group, zero join", kMutexOps,
             [&] { runtime.block_on(task_group_zero_join(kMutexOps)); });
     measure("co_await child task", kAwaits,
@@ -506,6 +612,13 @@ int main(int argc, char** argv) {
     const long kTimerArmDisarm = ((kTimers + 2047) / 2048) * 2048;
     measure("timer arm+disarm batch", kTimerArmDisarm,
             [&] { runtime.block_on(timer_arm_disarm(kTimerArmDisarm)); });
+    constexpr int kTimerForeignThreads = 8;
+    const long kTimerForeignPerThread = scaled(100'000);
+    measure("timer foreign contention, 8 threads",
+            kTimerForeignPerThread * kTimerForeignThreads * 2, [&] {
+                runtime.block_on(timer_foreign_contention(
+                    kTimerForeignPerThread, kTimerForeignThreads));
+            });
     measure("mutex uncontended", kMutexOps,
             [&] { runtime.block_on(mutex_uncontended(kMutexOps)); });
     measure("mutex contended, 8 tasks", kMutexOps / 5,
@@ -518,6 +631,16 @@ int main(int argc, char** argv) {
             [&] { runtime.block_on(rwmutex_contended(kMutexOps / 40)); });
     measure("once already done", kMutexOps,
             [&] { runtime.block_on(once_already_done(kMutexOps)); });
+    measure("once first call", kMutexOps,
+            [&] { runtime.block_on(once_first_call(kMutexOps)); });
+    const long kOnceFirstParallel = ((scaled(100'000) + 7) / 8) * 8;
+    measure("once first call, 8 tasks", kOnceFirstParallel, [&] {
+        runtime.block_on(once_first_call_parallel(kOnceFirstParallel / 8));
+    });
+    const long kOnceParallel = ((kMutexOps + 7) / 8) * 8;
+    measure("once completed, 8 tasks", kOnceParallel, [&] {
+        runtime.block_on(once_completed_parallel(kOnceParallel / 8));
+    });
     measure("select, a case ready", kHops,
             [&] { runtime.block_on(select_loop(kHops)); });
     measure("select, parks every round", kHops,
@@ -545,6 +668,11 @@ int main(int argc, char** argv) {
             [&] { runtime.block_on(chan_throughput(kThroughput / 8, 8, 8)); });
     measure("buffered chan try send+recv", kThroughput * 2,
             [&] { runtime.block_on(chan_buffered_try_ops(kThroughput)); });
+    measure("buffered chan try recv miss", kThroughput, [&] {
+        runtime.block_on(chan_buffered_try_recv_miss(kThroughput));
+    });
+    measure("buffered chan await send+recv", kThroughput * 2,
+            [&] { runtime.block_on(chan_buffered_await_ops(kThroughput)); });
     measure("wait group nonzero add+done", kMutexOps * 2,
             [&] { runtime.block_on(wait_group_nonzero_counter(kMutexOps)); });
     measure("wait group, zero wait", kMutexOps,

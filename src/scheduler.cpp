@@ -453,6 +453,32 @@ Scheduler* current_scheduler() noexcept {
     return g_default_scheduler.load(std::memory_order_acquire);
 }
 
+SchedulerTarget current_scheduler_target() noexcept {
+    Worker* const worker = t_worker;
+    if (worker != nullptr) return worker->completion_target();
+
+    Scheduler* const scheduler =
+        g_default_scheduler.load(std::memory_order_acquire);
+    return scheduler == nullptr ? SchedulerTarget{}
+                                : scheduler->completion_target();
+}
+
+void capture_current_scheduler(SchedulerTarget& target,
+                               WorkerId& worker_id) noexcept {
+    Worker* const worker = t_worker;
+    if (worker != nullptr) {
+        target = worker->completion_target();
+        worker_id = worker->index();
+        return;
+    }
+
+    Scheduler* const scheduler =
+        g_default_scheduler.load(std::memory_order_acquire);
+    target = scheduler == nullptr ? SchedulerTarget{}
+                                  : scheduler->completion_target();
+    worker_id = kInvalidWorkerId;
+}
+
 void set_default_scheduler(Scheduler* sched) noexcept {
     g_default_scheduler.store(sched, std::memory_order_release);
 }
@@ -597,8 +623,11 @@ void* Worker::service_fairness() noexcept {
 
     const std::int64_t timer_deadline =
         sched_->timers_->next_deadline_ns(index_);
-    if (timer_deadline != INT64_MAX && timer_deadline <= now_ns()) {
-        sched_->timers_->run_expired(index_);
+    if (timer_deadline != INT64_MAX) {
+        const std::int64_t now = now_ns();
+        if (timer_deadline <= now) {
+            sched_->timers_->run_expired(index_, now);
+        }
     }
 
     if (protect_private_fifo &&
@@ -754,10 +783,15 @@ void* Worker::find_work() noexcept {
         if (void* item = drain_inbox()) return item;
     }
 
-    if (sched_->timers_->next_deadline_ns(index_) <= now_ns() &&
-        sched_->timers_->run_expired(index_) > 0) {
-        if (void* item = take_local()) return item;
-        if (void* item = drain_inbox()) return item;
+    const std::int64_t timer_deadline =
+        sched_->timers_->next_deadline_ns(index_);
+    if (timer_deadline != INT64_MAX) {
+        const std::int64_t now = now_ns();
+        if (timer_deadline <= now &&
+            sched_->timers_->run_expired(index_, now) > 0) {
+            if (void* item = take_local()) return item;
+            if (void* item = drain_inbox()) return item;
+        }
     }
 
     return steal_from_peers();
@@ -1263,8 +1297,9 @@ std::uint8_t Scheduler::prepare_cooperative_io_checkpoint() noexcept {
         timers_->next_deadline_ns(worker->index_);
     if (timer_deadline != INT64_MAX) {
         CIO_METRIC(cooperative_io_timer_checks, 1);
-        if (timer_deadline <= now_ns()) {
-            timers_->run_expired(worker->index_);
+        const std::int64_t now = now_ns();
+        if (timer_deadline <= now) {
+            timers_->run_expired(worker->index_, now);
             if (std::uint8_t debt = runnable_debt();
                 debt != kCooperativeIoDebtNone) {
                 CIO_METRIC(cooperative_io_timer_productive, 1);
@@ -1540,7 +1575,7 @@ void Scheduler::monitor_pass(std::int64_t now) noexcept {
         // unconditionally is a defensive backstop for any stale poll timeout
         // or missed kernel wake.
         if (timers_->next_deadline_ns(worker->index_) <= now) {
-            timers_->run_expired(worker->index_);
+            timers_->run_expired(worker->index_, now);
         }
     }
 }

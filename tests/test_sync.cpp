@@ -228,6 +228,22 @@ void test_taskgroup_zero_join_is_reusable() {
     CIO_CHECK(cio::run(body()));
 }
 
+void test_taskgroup_single_child_completion_is_reusable() {
+    auto body = []() -> cio::Task<bool> {
+        cio::TaskGroup group;
+        int completed = 0;
+        for (int i = 0; i < 10'000; ++i) {
+            group.spawn([](int* count) -> cio::Task<> {
+                ++*count;
+                co_return;
+            }(&completed));
+            co_await group.join();
+        }
+        co_return completed == 10'000;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 void test_taskgroup_parallel_spawns_are_joined() {
     static constexpr int kSpawners = 8;
     static constexpr int kChildrenPerSpawner = 500;
@@ -501,6 +517,7 @@ int main() {
     RUN_TEST(test_mutex_unlock_races_waiter_publication);
     RUN_TEST(test_taskgroup_joins_every_child);
     RUN_TEST(test_taskgroup_zero_join_is_reusable);
+    RUN_TEST(test_taskgroup_single_child_completion_is_reusable);
     RUN_TEST(test_taskgroup_parallel_spawns_are_joined);
     RUN_TEST(test_taskgroup_direct_and_cold_completion_paths);
     RUN_TEST(test_taskgroup_single_joiner_gets_final_handoff);

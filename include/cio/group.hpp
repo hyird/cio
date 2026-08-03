@@ -244,15 +244,24 @@ namespace detail {
 // Shared between the group and its children. Refcounted so that a group
 // destroyed without joining leaks nothing and crashes nothing — the children
 // simply finish into a state that no longer has a listener.
+class GroupMutex : public ChannelMutex {
+private:
+    // Keep GroupState's established field offsets while measuring the lock
+    // mechanism independently from its layout. On Linux pthread_mutex_t is
+    // larger than the one-byte channel lock.
+    [[maybe_unused]] std::byte
+        layout_padding_[sizeof(std::mutex) - sizeof(ChannelMutex)]{};
+};
+static_assert(sizeof(GroupMutex) == sizeof(std::mutex));
+
 struct GroupState {
-    std::mutex mutex;
+    GroupMutex mutex;
     std::atomic<std::size_t> outstanding{0};
     WaitNode* waiters = nullptr;
     std::exception_ptr first_exception;
     std::atomic<bool> has_exception{false};
     CancelState cancel;
-
-    void child_started() {
+    bool child_started() {
         // The finishing sentinel closes the only dangerous zero-transition
         // window: a last child that has decided to detach joiners but has not
         // acquired their lock yet. Every ordinary start, including 0 -> 1,
@@ -260,28 +269,27 @@ struct GroupState {
         std::size_t observed = outstanding.load(std::memory_order_relaxed);
         for (;;) {
             if (observed == kFinishing) {
-                std::lock_guard<std::mutex> lock(mutex);
+                std::lock_guard<ChannelMutex> lock(mutex);
                 observed = outstanding.load(std::memory_order_acquire);
                 if (observed == kFinishing) {
                     // We reached the lock before the finishing child. Keep the
                     // existing generation alive and let it observe our start.
                     outstanding.store(1, std::memory_order_release);
-                    return;
+                    return true;
                 }
-                outstanding.fetch_add(1, std::memory_order_relaxed);
-                return;
+                return outstanding.fetch_add(1, std::memory_order_relaxed) == 0;
             }
             if (outstanding.compare_exchange_weak(observed, observed + 1,
                                                   std::memory_order_relaxed,
                                                   std::memory_order_relaxed)) {
-                return;
+                return observed == 0;
             }
         }
     }
 
     void child_failed(std::exception_ptr e) {
         {
-            std::lock_guard<std::mutex> lock(mutex);
+            std::lock_guard<ChannelMutex> lock(mutex);
             if (first_exception)
                 return;  // keep the first failure, like Go's errgroup
             first_exception = std::move(e);
@@ -291,20 +299,41 @@ struct GroupState {
         cancel.cancel();
     }
 
-    void child_finished() {
+    void child_finished(bool direct_final = false) {
+        // Exactly one child per generation carries the 0 -> 1 hint. If no
+        // sibling ever joined it, claim finishing in one RMW. A concurrent
+        // start can still win 1 -> 2; only this one hinted child then pays the
+        // failed CAS before taking the ordinary decrement path.
+        if (direct_final) {
+            std::size_t expected = 1;
+            if (outstanding.compare_exchange_strong(
+                    expected, kFinishing, std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                finish_generation();
+                return;
+            }
+        }
+
         const std::size_t previous =
             outstanding.fetch_sub(1, std::memory_order_acq_rel);
         if (previous > 1) return;
 
+        // Contending completions may reduce a count observed above one to the
+        // final child before our fetch_sub. Keep the original zero-claim path
+        // for that race.
         std::size_t expected = 0;
         if (!outstanding.compare_exchange_strong(expected, kFinishing,
                                                  std::memory_order_acq_rel,
                                                  std::memory_order_relaxed)) {
             return;
         }
+        finish_generation();
+    }
+
+    void finish_generation() {
         WaitNode* to_wake = nullptr;
         {
-            std::lock_guard<std::mutex> lock(mutex);
+            std::lock_guard<ChannelMutex> lock(mutex);
             // A child that reached this lock first replaced the sentinel with
             // one, cancelling this completion boundary.
             if (outstanding.load(std::memory_order_acquire) != kFinishing)
@@ -322,6 +351,26 @@ struct GroupState {
         }
     }
 
+    CIO_NOINLINE bool park_join(WaitNodeStorage& storage,
+                                std::coroutine_handle<> handle) {
+        std::lock_guard<ChannelMutex> lock(mutex);
+        if (outstanding.load(std::memory_order_acquire) == 0) return false;
+        WaitNode* const node = storage.construct();
+        node->arm(handle);
+        node->next = waiters;
+        waiters = node;
+        return true;
+    }
+
+    CIO_NOINLINE CIO_COLD void rethrow_failure() {
+        std::exception_ptr failure;
+        {
+            std::lock_guard<ChannelMutex> lock(mutex);
+            failure = first_exception;
+        }
+        if (failure) std::rethrow_exception(failure);
+    }
+
     static constexpr std::size_t kFinishing = ~std::size_t{0};
 };
 
@@ -330,8 +379,10 @@ struct GroupState {
 // Each record owns one state reference so destroying the TaskGroup before its
 // children finish remains safe.
 struct GroupCompletion final : DetachedTaskCompletion {
-    explicit GroupCompletion(std::shared_ptr<GroupState> group_state) noexcept
-        : DetachedTaskCompletion{&complete_task},
+    explicit GroupCompletion(std::shared_ptr<GroupState> group_state,
+                             bool direct_final) noexcept
+        : DetachedTaskCompletion{direct_final ? &complete_direct_task
+                                              : &complete_task},
           owner(std::move(group_state)) {}
 
     static void* operator new(std::size_t size) {
@@ -343,39 +394,54 @@ struct GroupCompletion final : DetachedTaskCompletion {
 
     static void complete_task(TaskPromiseBase& promise,
                               DetachedTaskCompletion& completion) noexcept {
+        complete_task_impl(promise, completion, false);
+    }
+
+    static void complete_direct_task(
+        TaskPromiseBase& promise, DetachedTaskCompletion& completion) noexcept {
+        complete_task_impl(promise, completion, true);
+    }
+
+    static void complete_task_impl(TaskPromiseBase& promise,
+                                   DetachedTaskCompletion& completion,
+                                   bool direct_final) noexcept {
         auto& self = static_cast<GroupCompletion&>(completion);
         std::shared_ptr<GroupState> state = std::move(self.owner);
         delete &self;
 
         if (promise.exception) state->child_failed(promise.exception);
-        state->child_finished();
+        state->child_finished(direct_final);
     }
 
     std::shared_ptr<GroupState> owner;
 };
 
 template<typename T>
-Task<void> group_child(Task<T> task, std::shared_ptr<GroupState> state) {
+Task<void> group_child(Task<T> task, std::shared_ptr<GroupState> state,
+                       bool direct_final) {
     try {
         co_await std::move(task);
     } catch (...) {
         state->child_failed(std::current_exception());
     }
-    state->child_finished();
+    state->child_finished(direct_final);
 }
 
 template<typename T>
-void start_group_child(Task<T> task, std::shared_ptr<GroupState> state) {
+void start_group_child(Task<T> task, std::shared_ptr<GroupState> state,
+                       bool direct_final) {
     Scheduler& scheduler = require_scheduler();
 
     // Preserve Task's established invalid/completed semantics without ever
     // resuming a coroutine that is already at final suspend.
     if (!task.valid() || task.done()) {
-        go_on(scheduler, group_child<T>(std::move(task), std::move(state)));
+        go_on(scheduler,
+              group_child<T>(std::move(task), std::move(state), direct_final));
         return;
     }
 
-    auto completion = std::make_unique<GroupCompletion>(std::move(state));
+    auto completion =
+        std::make_unique<GroupCompletion>(std::move(state), direct_final);
     auto child = task.release();
     child.promise().continuation_or_completion = completion.release();
     child.promise().detached = true;
@@ -401,8 +467,8 @@ public:
 
     template<typename T>
     void spawn(Task<T> task) {
-        state_->child_started();
-        detail::start_group_child<T>(std::move(task), state_);
+        const bool direct_final = state_->child_started();
+        detail::start_group_child<T>(std::move(task), state_, direct_final);
     }
 
     // Pass this into children so they can observe cancellation.
@@ -430,16 +496,7 @@ public:
                            std::memory_order_acquire) == 0;
             }
             bool await_suspend(std::coroutine_handle<> h) {
-                std::lock_guard<std::mutex> lock(group->state_->mutex);
-                if (group->state_->outstanding.load(
-                        std::memory_order_acquire) == 0) {
-                    return false;
-                }
-                detail::WaitNode* const node = node_storage.construct();
-                node->arm(h);
-                node->next = group->state_->waiters;
-                group->state_->waiters = node;
-                return true;
+                return group->state_->park_join(node_storage, h);
             }
             void await_resume() const {
                 group->joined_ = true;
@@ -447,12 +504,7 @@ public:
                         std::memory_order_acquire)) {
                     return;
                 }
-                std::exception_ptr failure;
-                {
-                    std::lock_guard<std::mutex> lock(group->state_->mutex);
-                    failure = group->state_->first_exception;
-                }
-                if (failure) std::rethrow_exception(failure);
+                group->state_->rethrow_failure();
             }
         };
         return Awaiter{this};

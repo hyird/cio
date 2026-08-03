@@ -72,6 +72,31 @@ void test_timeout_loses_to_a_ready_channel() {
     CIO_CHECK_EQ(cio::run(body()), std::size_t{0});
 }
 
+void test_timeout_does_not_bias_ready_cases() {
+    auto body = []() -> cio::Task<std::array<int, 3>> {
+        auto a = cio::make_chan<int>();
+        auto b = cio::make_chan<int>();
+        a.close();
+        b.close();
+        const auto deadline = cio::Clock::now() + 24h;
+
+        std::array<int, 3> picked{};
+        for (int i = 0; i < 6000; ++i) {
+            auto sel = cio::select(cio::recv(a), cio::after_deadline(deadline),
+                                   cio::recv(b));
+            ++picked[co_await sel];
+        }
+        co_return picked;
+    };
+
+    const auto picked = cio::run(body());
+    CIO_CHECK(picked[0] > 2500);
+    CIO_CHECK(picked[0] < 3500);
+    CIO_CHECK_EQ(picked[1], 0);
+    CIO_CHECK(picked[2] > 2500);
+    CIO_CHECK(picked[2] < 3500);
+}
+
 void test_default_makes_it_non_blocking() {
     auto body = []() -> cio::Task<std::size_t> {
         auto empty = cio::make_chan<int>(1);
@@ -402,6 +427,7 @@ int main() {
     RUN_TEST(test_blocks_until_a_case_fires);
     RUN_TEST(test_timeout_case_fires);
     RUN_TEST(test_timeout_loses_to_a_ready_channel);
+    RUN_TEST(test_timeout_does_not_bias_ready_cases);
     RUN_TEST(test_default_makes_it_non_blocking);
     RUN_TEST(test_default_does_not_compete_with_ready_cases);
     RUN_TEST(test_send_case);

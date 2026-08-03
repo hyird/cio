@@ -114,6 +114,11 @@ struct ChanWaiter {
     // Must be called with the owning channel's lock held.
     bool try_acquire() noexcept {
         if (select_winner == nullptr) return true;
+        // Ordinary waiters are consumed immediately, but a select frame stays
+        // alive while its other channel cases are retracted. Keep popped
+        // select nodes detached from their old list even though queued already
+        // prevents remove() from following these links.
+        next = prev = nullptr;
         std::uint32_t expected = kNoWinner;
         return select_winner->compare_exchange_strong(
             expected, case_index, std::memory_order_acq_rel,
@@ -165,7 +170,10 @@ public:
         } else {
             tail_ = nullptr;
         }
-        w->next = w->prev = nullptr;
+        // queued is the ownership marker. Ordinary waiters are consumed
+        // immediately, close() overwrites next before using it, and a later
+        // enqueue overwrites both links. Avoid two dead stores on the ordinary
+        // channel hand-off path; try_acquire() still detaches select nodes.
         w->queued = false;
         return w;
     }
@@ -182,7 +190,9 @@ public:
         } else {
             tail_ = w->prev;
         }
-        w->next = w->prev = nullptr;
+        // The neighbouring links are repaired above. queued is the commit
+        // point after which this node's own stale links are no longer valid;
+        // selector destruction or a later enqueue does not read them.
         w->queued = false;
     }
 
@@ -345,6 +355,20 @@ public:
         return OpStatus::kBlocked;
     }
 
+    OpStatus try_recv_now_locked(std::optional<T>* out, ChanWaiter*& to_wake) {
+        to_wake = nullptr;
+        if (count == 0 || !senders.empty()) {
+            return try_recv_locked(out, to_wake);
+        }
+
+        T* cell = buffer_ + recv_index;
+        out->emplace(std::move(*cell));
+        cell->~T();
+        recv_index = next_index(recv_index);
+        --count;
+        return OpStatus::kDone;
+    }
+
     void close() {
         // Collected under the lock, woken after it: waking runs scheduler code,
         // and no channel lock should be held across that.
@@ -413,10 +437,7 @@ public:
             const OpStatus status = channel_->try_send_locked(&value_, to_wake);
             if (status == OpStatus::kBlocked) {
                 waiter_.handle = h;
-                Scheduler* const scheduler = current_scheduler();
-                waiter_.sched = scheduler == nullptr
-                                    ? SchedulerTarget{}
-                                    : scheduler->completion_target();
+                waiter_.sched = current_scheduler_target();
                 waiter_.slot = &value_;
                 waiter_.success = false;
                 waiter_.select_winner = nullptr;
@@ -458,10 +479,7 @@ public:
             const OpStatus status = channel_->try_recv_locked(&value_, to_wake);
             if (status == OpStatus::kBlocked) {
                 waiter_.handle = h;
-                Scheduler* const scheduler = current_scheduler();
-                waiter_.sched = scheduler == nullptr
-                                    ? SchedulerTarget{}
-                                    : scheduler->completion_target();
+                waiter_.sched = current_scheduler_target();
                 waiter_.slot = &value_;
                 waiter_.success = false;
                 waiter_.select_winner = nullptr;
@@ -538,7 +556,7 @@ public:
         detail::ChanWaiter* to_wake = nullptr;
         {
             std::lock_guard<detail::ChannelMutex> lock(impl_->mutex);
-            impl_->try_recv_locked(&out, to_wake);
+            impl_->try_recv_now_locked(&out, to_wake);
         }
         if (to_wake != nullptr) to_wake->wake();
         return out;

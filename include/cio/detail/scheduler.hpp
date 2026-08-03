@@ -72,6 +72,9 @@ class CIO_CACHE_ALIGNED Worker {
 public:
     WorkerId index() const noexcept { return index_; }
     Scheduler& scheduler() const noexcept { return *sched_; }
+    SchedulerTarget completion_target() const noexcept {
+        return SchedulerTarget{completion_endpoint_};
+    }
 
 private:
     friend class Scheduler;
@@ -312,6 +315,9 @@ private:
 Worker* current_worker() noexcept;
 WorkerId current_worker_id(const Scheduler* sched = nullptr) noexcept;
 Scheduler* current_scheduler() noexcept;
+SchedulerTarget current_scheduler_target() noexcept;
+void capture_current_scheduler(SchedulerTarget& target,
+                               WorkerId& worker) noexcept;
 
 inline void reschedule_current(std::coroutine_handle<> handle) noexcept {
     Worker* const worker = current_worker();

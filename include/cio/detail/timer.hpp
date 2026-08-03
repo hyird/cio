@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "cio/clock.hpp"
@@ -95,7 +96,14 @@ public:
     //
     // On the false path it does not return until the firing callback has
     // finished touching the node, so the caller may then destroy it.
-    bool disarm(Timer* t);
+    bool disarm(Timer* t) {
+        const std::uint32_t state = t->state.load(std::memory_order_acquire);
+        if (state == Timer::kIdle || state == Timer::kCancelled ||
+            state == Timer::kFired) {
+            return false;
+        }
+        return disarm_slow(t, state);
+    }
 
     // Nanoseconds until the earliest deadline across all shards, clamped to
     // >= 0. Returns -1 when no timer is armed (poll indefinitely). Nanoseconds
@@ -113,6 +121,9 @@ public:
     // Returns the number fired. Safe to call from any thread.
     std::size_t run_expired();
     std::size_t run_expired(WorkerId worker);
+    // Scheduler checkpoints that already sampled the clock pass that same
+    // timestamp through, avoiding a second clock read on the firing path.
+    std::size_t run_expired(WorkerId worker, std::int64_t now);
 
     // Fires every armed timer with kCancelled, used during shutdown so parked
     // tasks unwind instead of leaking.
@@ -121,12 +132,40 @@ public:
     bool empty() const noexcept;
 
 private:
+    class ShardMutex {
+    public:
+        bool try_lock() noexcept {
+            return !locked_.test_and_set(std::memory_order_acquire);
+        }
+
+        void lock() noexcept {
+            if (try_lock()) return;
+            unsigned spins = 0;
+            for (;;) {
+                while (locked_.test(std::memory_order_relaxed)) {
+                    cio::cpu_relax();
+                    if (++spins == 64) {
+                        spins = 0;
+                        std::this_thread::yield();
+                    }
+                }
+                if (try_lock()) return;
+            }
+        }
+
+        void unlock() noexcept { locked_.clear(std::memory_order_release); }
+
+    private:
+        std::atomic_flag locked_ = ATOMIC_FLAG_INIT;
+    };
+
     struct CIO_CACHE_ALIGNED Shard {
-        mutable std::mutex mutex;
+        mutable ShardMutex mutex;
         std::vector<Timer*> heap;  // 4-ary min-heap on deadline_ns
         // Earliest deadline in `heap`, or INT64_MAX. Written under `mutex`,
-        // read without it by the poller.
-        std::atomic<std::int64_t> earliest{INT64_MAX};
+        // read without it by the poller. Keep monitor scans off the cache line
+        // whose lock word and heap metadata the owner mutates on every arm.
+        CIO_CACHE_ALIGNED std::atomic<std::int64_t> earliest{INT64_MAX};
     };
 
     static void sift_up(std::vector<Timer*>& heap, std::size_t i) noexcept;
@@ -134,6 +173,7 @@ private:
     static void heap_pop_root(std::vector<Timer*>& heap) noexcept;
     static void heap_remove(std::vector<Timer*>& heap, std::size_t i) noexcept;
     void republish(Shard& s) noexcept;
+    bool disarm_slow(Timer* t, std::uint32_t state);
     std::size_t run_expired_shard(Shard& s, std::int64_t now);
 
     Scheduler& sched_;

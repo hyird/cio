@@ -196,6 +196,13 @@ if(CIO_BUILD_BENCHMARKS)
   file(GLOB CIO_BENCH_FILES RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/bench ${CMAKE_CURRENT_SOURCE_DIR}/bench/*.cpp)
   foreach(bench_file ${CIO_BENCH_FILES})
     get_filename_component(bench_name ${bench_file} NAME_WE)
+    # bench_io replaces global new/delete to count coroutine-frame
+    # allocations. Clang's TSan runtime provides strong definitions of the
+    # same interceptors, so this diagnostic binary cannot be linked under
+    # TSan. The runtime, tests, and all other benchmarks remain instrumented.
+    if(CIO_SANITIZE STREQUAL "tsan" AND bench_name STREQUAL "bench_io")
+      continue()
+    endif()
     cio_add_program(bench ${bench_name})
   endforeach()
 endif()

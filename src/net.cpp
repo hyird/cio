@@ -592,10 +592,10 @@ Task<Result<std::vector<SocketAddr>>> Resolver::lookup_host(
             std::move(host), port, std::move(cancel));
     }
 
-    const int family = af_of(this->family);
+    const int address_family = af_of(family);
     co_return co_await cancellable_blocking(
-        [host = std::move(host), port, family] {
-            return lookup_host_blocking(host, port, family);
+        [host = std::move(host), port, address_family] {
+            return lookup_host_blocking(host, port, address_family);
         },
         std::move(cancel));
 }
@@ -860,6 +860,9 @@ Result<SocketAddr> Socket::remote_addr() const {
 Result<std::size_t> TcpConn::try_read(std::span<std::byte> buffer) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) return operation.error;
+    auto operation_guard = detail::try_lock_io_operation(
+        operation.desc, detail::Dir::kRead, operation.generation);
+    if (!operation_guard) return operation_guard.error();
 
     detail::FdUseGuard fd_use{operation.desc, detail::Dir::kRead,
                               operation.generation};
@@ -882,6 +885,9 @@ Result<std::size_t> TcpConn::try_read(std::span<std::byte> buffer) {
 Result<std::size_t> TcpConn::try_write(std::span<const std::byte> buffer) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) return operation.error;
+    auto operation_guard = detail::try_lock_io_operation(
+        operation.desc, detail::Dir::kWrite, operation.generation);
+    if (!operation_guard) return operation_guard.error();
 
     detail::FdUseGuard fd_use{operation.desc, detail::Dir::kWrite,
                               operation.generation};
@@ -907,6 +913,9 @@ Result<std::size_t> TcpConn::try_write(std::span<const std::byte> buffer) {
 Task<Result<std::size_t>> TcpConn::read(std::span<std::byte> buffer) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
+    auto operation_guard = co_await detail::IoOperationAwaiter{
+        operation.desc, detail::Dir::kRead, operation.generation};
+    if (!operation_guard) co_return operation_guard.error();
     co_return co_await tcp_read_some(operation.desc, operation.generation,
                                      buffer);
 }
@@ -917,6 +926,9 @@ Task<Result<std::size_t>> TcpConn::write(std::span<const std::byte> buffer) {
     const std::size_t total = buffer.size();
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
+    auto operation_guard = co_await detail::IoOperationAwaiter{
+        operation.desc, detail::Dir::kWrite, operation.generation};
+    if (!operation_guard) co_return operation_guard.error();
     while (!buffer.empty()) {
         auto n = co_await tcp_write_some(operation.desc, operation.generation,
                                          buffer);
@@ -1380,6 +1392,9 @@ Result<TcpListener> TcpListener::listen(std::string_view host,
 Task<Result<TcpConn>> TcpListener::accept() {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
+    auto operation_guard = co_await detail::IoOperationAwaiter{
+        operation.desc, detail::Dir::kRead, operation.generation};
+    if (!operation_guard) co_return operation_guard.error();
 
     for (;;) {
         if (operation.desc->may_be_ready(detail::Dir::kRead)) {
@@ -1484,6 +1499,9 @@ Task<Result<std::size_t>> UdpConn::read_from(std::span<std::byte> buffer,
                                              SocketAddr& from) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
+    auto operation_guard = co_await detail::IoOperationAwaiter{
+        operation.desc, detail::Dir::kRead, operation.generation};
+    if (!operation_guard) co_return operation_guard.error();
 
     for (;;) {
         sockaddr_storage storage{};
@@ -1529,6 +1547,9 @@ Task<Result<std::size_t>> UdpConn::write_to(std::span<const std::byte> buffer,
                                             const SocketAddr& to) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
+    auto operation_guard = co_await detail::IoOperationAwaiter{
+        operation.desc, detail::Dir::kWrite, operation.generation};
+    if (!operation_guard) co_return operation_guard.error();
 
     for (;;) {
         ssize_t n = -1;
@@ -1719,6 +1740,9 @@ Task<Result<UnixConn>> UnixConn::dial(UnixAddr addr, CancelToken cancel) {
 Task<Result<std::size_t>> UnixConn::read(std::span<std::byte> buffer) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
+    auto operation_guard = co_await detail::IoOperationAwaiter{
+        operation.desc, detail::Dir::kRead, operation.generation};
+    if (!operation_guard) co_return operation_guard.error();
     co_return co_await tcp_read_some(operation.desc, operation.generation,
                                      buffer);
 }
@@ -1727,6 +1751,9 @@ Task<Result<std::size_t>> UnixConn::write(std::span<const std::byte> buffer) {
     const std::size_t total = buffer.size();
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) co_return operation.error;
+    auto operation_guard = co_await detail::IoOperationAwaiter{
+        operation.desc, detail::Dir::kWrite, operation.generation};
+    if (!operation_guard) co_return operation_guard.error();
     while (!buffer.empty()) {
         auto n = co_await tcp_write_some(operation.desc, operation.generation,
                                          buffer);
@@ -1739,6 +1766,9 @@ Task<Result<std::size_t>> UnixConn::write(std::span<const std::byte> buffer) {
 Result<std::size_t> UnixConn::try_read(std::span<std::byte> buffer) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) return operation.error;
+    auto operation_guard = detail::try_lock_io_operation(
+        operation.desc, detail::Dir::kRead, operation.generation);
+    if (!operation_guard) return operation_guard.error();
 
     detail::FdUseGuard fd_use{operation.desc, detail::Dir::kRead,
                               operation.generation};
@@ -1761,6 +1791,9 @@ Result<std::size_t> UnixConn::try_read(std::span<std::byte> buffer) {
 Result<std::size_t> UnixConn::try_write(std::span<const std::byte> buffer) {
     const IoOperation operation = capture_operation(fd_, desc_);
     if (!operation) return operation.error;
+    auto operation_guard = detail::try_lock_io_operation(
+        operation.desc, detail::Dir::kWrite, operation.generation);
+    if (!operation_guard) return operation_guard.error();
 
     detail::FdUseGuard fd_use{operation.desc, detail::Dir::kWrite,
                               operation.generation};
@@ -1850,10 +1883,13 @@ Result<UnixListener> UnixListener::listen(UnixAddr addr, int backlog,
 }
 
 Task<Result<UnixConn>> UnixListener::accept() {
-    for (;;) {
-        const IoOperation operation = capture_operation(fd_, desc_);
-        if (!operation) co_return operation.error;
+    const IoOperation operation = capture_operation(fd_, desc_);
+    if (!operation) co_return operation.error;
+    auto operation_guard = co_await detail::IoOperationAwaiter{
+        operation.desc, detail::Dir::kRead, operation.generation};
+    if (!operation_guard) co_return operation_guard.error();
 
+    for (;;) {
         int accepted = -1;
         {
             detail::FdUseGuard fd_use{operation.desc, detail::Dir::kRead,

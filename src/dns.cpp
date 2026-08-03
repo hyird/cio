@@ -4,15 +4,17 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include <strings.h>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
-#include <strings.h>
 #include <fstream>
 #include <span>
 #include <string_view>
 
+#include "cio/context.hpp"
+#include "cio/io.hpp"
 #include "cio/select.hpp"
 #include "cio/spawn.hpp"
 
@@ -68,7 +70,8 @@ Result<void> encode_name(std::string_view name, std::vector<std::byte>& out) {
     std::size_t start = 0;
     while (start <= name.size()) {
         const std::size_t dot = name.find('.', start);
-        const std::size_t end = dot == std::string_view::npos ? name.size() : dot;
+        const std::size_t end =
+            dot == std::string_view::npos ? name.size() : dot;
         const std::size_t length = end - start;
         if (length == 0 || length > 63) return Error{EINVAL};
         out.push_back(static_cast<std::byte>(length));
@@ -119,8 +122,7 @@ std::uint16_t next_query_id() noexcept {
 namespace detail {
 
 Result<std::vector<std::byte>> build_query(std::string_view name,
-                                           RecordType type,
-                                           std::uint16_t id) {
+                                           RecordType type, std::uint16_t id) {
     std::vector<std::byte> out;
     out.reserve(kHeaderBytes + name.size() + 6);
 
@@ -147,7 +149,7 @@ Result<Answer> parse_response(std::span<const std::byte> message,
     answer.truncated = (flags & 0x0200) != 0;
 
     const unsigned rcode = flags & 0x000F;
-    if (rcode == 3) return Error{ENOENT};        // NXDOMAIN
+    if (rcode == 3) return Error{ENOENT};  // NXDOMAIN
     if (rcode != 0 && !answer.truncated) return Error{EBADMSG};
 
     const std::uint16_t questions = read_u16(message, 4);
@@ -263,9 +265,8 @@ std::vector<net::SocketAddr> system_servers(std::uint16_t port) {
         at = line.find_first_not_of(" \t", at + 10);
         if (at == std::string::npos) continue;
         const std::size_t end = line.find_first_of(" \t%", at);
-        const std::string host =
-            line.substr(at, end == std::string::npos ? std::string::npos
-                                                     : end - at);
+        const std::string host = line.substr(
+            at, end == std::string::npos ? std::string::npos : end - at);
 
         if (auto parsed = net::SocketAddr::parse(host, port); parsed) {
             servers.push_back(*parsed);
@@ -278,25 +279,23 @@ namespace {
 
 // One query against one server, with its own socket so a late reply from a
 // previous attempt cannot be mistaken for this one's.
-Task<Result<detail::Answer>> query_once(net::SocketAddr server,
-                                        std::string name, RecordType type,
-                                        std::uint16_t port, Duration timeout,
-                                        CancelToken cancel) {
-    const std::uint16_t id = next_query_id();
-    auto request = detail::build_query(name, type, id);
-    if (!request) co_return request.error();
-
-    auto socket = net::UdpConn::listen(
-        server.family() == AF_INET6 ? net::SocketAddr::any_v6(0)
-                                    : net::SocketAddr::any_v4(0));
+Task<Result<detail::Answer>> query_udp_once(net::SocketAddr server,
+                                            std::span<const std::byte> request,
+                                            std::uint16_t id,
+                                            std::uint16_t port,
+                                            TimePoint deadline,
+                                            CancelToken cancel) {
+    auto socket = net::UdpConn::listen(server.family() == AF_INET6
+                                           ? net::SocketAddr::any_v6(0)
+                                           : net::SocketAddr::any_v4(0));
     if (!socket) co_return socket.error();
 
     // Cancellation and the attempt deadline both ride the socket, so neither
     // needs a watcher task and both interrupt a parked recvfrom.
     if (cancel) socket->set_cancel(cancel);
-    socket->set_timeout(timeout);
+    socket->set_deadline(deadline);
 
-    if (auto sent = co_await socket->write_to(*request, server); !sent) {
+    if (auto sent = co_await socket->write_to(request, server); !sent) {
         co_return sent.error();
     }
 
@@ -317,16 +316,61 @@ Task<Result<detail::Answer>> query_once(net::SocketAddr server,
     }
 }
 
-Task<Result<std::vector<net::SocketAddr>>> resolve_type(
-    const Config& config, std::string name, std::uint16_t port,
-    RecordType type, CancelToken cancel) {
+// RFC 1035 TCP framing: a two-byte network-order length followed by one DNS
+// message. It retries the same query and transaction id, under the same
+// attempt deadline that covered UDP.
+Task<Result<detail::Answer>> query_tcp_once(net::SocketAddr server,
+                                            std::span<const std::byte> request,
+                                            std::uint16_t id,
+                                            std::uint16_t port,
+                                            TimePoint deadline,
+                                            CancelToken cancel) {
+    CancelSource attempt = with_deadline(cancel, deadline);
+    auto stream = co_await net::TcpConn::dial(server, attempt.token());
+    if (!stream) {
+        if (stream.error().is_cancelled()) {
+            const Error cause = attempt.token().err();
+            if (cause) co_return cause;
+        }
+        co_return stream.error();
+    }
+    stream->set_deadline(deadline);
+    if (cancel) stream->set_cancel(cancel);
+
+    std::vector<std::byte> frame;
+    frame.reserve(request.size() + 2);
+    push_u16(frame, static_cast<std::uint16_t>(request.size()));
+    frame.insert(frame.end(), request.begin(), request.end());
+    if (auto written = co_await stream->write(frame); !written) {
+        co_return written.error();
+    }
+
+    std::byte length_bytes[2];
+    if (auto read = co_await io::read_full(*stream, length_bytes); !read) {
+        co_return read.error();
+    }
+    const std::uint16_t length = read_u16(length_bytes, 0);
+    if (length < kHeaderBytes) co_return Error{EBADMSG};
+
+    std::vector<std::byte> response(length);
+    if (auto read = co_await io::read_full(*stream, response); !read) {
+        co_return read.error();
+    }
+    co_return detail::parse_response(response, id, port);
+}
+
+Task<Result<std::vector<net::SocketAddr>>> resolve_type(const Config& config,
+                                                        std::string name,
+                                                        std::uint16_t port,
+                                                        RecordType type,
+                                                        CancelToken cancel) {
     std::vector<net::SocketAddr> servers = config.servers;
     if (servers.empty()) servers = system_servers();
     if (servers.empty()) co_return Error{ECONNREFUSED};
 
-    const Duration timeout =
-        config.timeout > Duration::zero() ? config.timeout
-                                          : Duration{kDefaultTimeout};
+    const Duration timeout = config.timeout > Duration::zero()
+                                 ? config.timeout
+                                 : Duration{kDefaultTimeout};
     const unsigned attempts = config.attempts == 0 ? 1 : config.attempts;
 
     Error last{ETIMEDOUT};
@@ -334,14 +378,23 @@ Task<Result<std::vector<net::SocketAddr>>> resolve_type(
         for (const auto& server : servers) {
             if (cancel && cancel.cancelled()) co_return Error{Errc::cancelled};
 
-            auto answer = co_await query_once(server, name, type, port,
-                                              timeout, cancel);
+            const std::uint16_t id = next_query_id();
+            auto request = detail::build_query(name, type, id);
+            if (!request) co_return request.error();
+            const TimePoint deadline = Clock::now() + timeout;
+            auto answer = co_await query_udp_once(server, *request, id, port,
+                                                  deadline, cancel);
             if (answer) {
-                // Truncation means the answer did not fit in a datagram. TCP
-                // fallback is not implemented; report it rather than silently
-                // returning a partial address list.
-                if (answer->truncated && answer->addresses.empty()) {
-                    last = Error{EMSGSIZE};
+                if (answer->truncated) {
+                    auto complete = co_await query_tcp_once(
+                        server, *request, id, port, deadline, cancel);
+                    if (complete) {
+                        co_return std::move(complete->addresses);
+                    }
+                    last = complete.error();
+                    if (last.is(ENOENT) || last.is(Errc::cancelled)) {
+                        co_return last;
+                    }
                     continue;
                 }
                 co_return std::move(answer->addresses);
@@ -364,8 +417,7 @@ Task<Result<std::vector<net::SocketAddr>>> Resolver::lookup_type(
         co_return std::vector<net::SocketAddr>{*literal};
     }
     if (config_.use_hosts_file) {
-        const int want =
-            type == RecordType::aaaa ? AF_INET6 : AF_INET;
+        const int want = type == RecordType::aaaa ? AF_INET6 : AF_INET;
         std::vector<net::SocketAddr> from_hosts;
         for (auto& entry : hosts_file_lookup(host, port)) {
             if (entry.family() == want) from_hosts.push_back(entry);
@@ -390,8 +442,8 @@ Task<Result<std::vector<net::SocketAddr>>> Resolver::lookup(
     if (config_.use_hosts_file) {
         std::vector<net::SocketAddr> from_hosts;
         for (auto& entry : hosts_file_lookup(host, port)) {
-            const bool wanted = entry.family() == AF_INET6 ? config_.ipv6
-                                                           : config_.ipv4;
+            const bool wanted =
+                entry.family() == AF_INET6 ? config_.ipv6 : config_.ipv4;
             if (wanted) from_hosts.push_back(entry);
         }
         if (!from_hosts.empty()) co_return from_hosts;
@@ -407,7 +459,8 @@ Task<Result<std::vector<net::SocketAddr>>> Resolver::lookup(
 
     // Both families are queried concurrently: serialising them would make a
     // dual-stack lookup cost two round trips.
-    auto v6 = spawn(resolve_type(config_, host, port, RecordType::aaaa, cancel));
+    auto v6 =
+        spawn(resolve_type(config_, host, port, RecordType::aaaa, cancel));
     auto v4 = co_await resolve_type(config_, host, port, RecordType::a, cancel);
     auto v6_result = co_await v6;
 

@@ -30,8 +30,8 @@ void put16(std::vector<std::byte>& out, std::uint16_t v) {
 // ------------------------------------------------------------- codec ---
 
 void test_query_encoding() {
-    auto query = dns::detail::build_query("example.com", dns::RecordType::a,
-                                          0xBEEF);
+    auto query =
+        dns::detail::build_query("example.com", dns::RecordType::a, 0xBEEF);
     CIO_CHECK(query.has_value());
     const std::span<const std::byte> m{query->data(), query->size()};
 
@@ -48,33 +48,34 @@ void test_query_encoding() {
     expected += char{3};
     expected += "com";
     CIO_CHECK_EQ(query->size(), std::size_t{12 + expected.size() + 1 + 4});
-    CIO_CHECK_EQ(std::memcmp(query->data() + 12, expected.data(),
-                             expected.size()),
-                 0);
+    CIO_CHECK_EQ(
+        std::memcmp(query->data() + 12, expected.data(), expected.size()), 0);
     CIO_CHECK_EQ(be16(m, m.size() - 4),
                  static_cast<std::uint16_t>(dns::RecordType::a));
     CIO_CHECK_EQ(be16(m, m.size() - 2), std::uint16_t{1});  // IN
 
     // A trailing root dot is accepted and means the same thing.
-    auto rooted = dns::detail::build_query("example.com.", dns::RecordType::a, 1);
+    auto rooted =
+        dns::detail::build_query("example.com.", dns::RecordType::a, 1);
     CIO_CHECK(rooted.has_value());
     CIO_CHECK_EQ(rooted->size(), query->size());
 }
 
 void test_query_encoding_rejects_bad_names() {
     CIO_CHECK(!dns::detail::build_query("", dns::RecordType::a, 1).has_value());
-    CIO_CHECK(!dns::detail::build_query(".", dns::RecordType::a, 1).has_value());
+    CIO_CHECK(
+        !dns::detail::build_query(".", dns::RecordType::a, 1).has_value());
     // An empty label.
     CIO_CHECK(
         !dns::detail::build_query("a..b", dns::RecordType::a, 1).has_value());
     // A label over 63 bytes.
-    CIO_CHECK(!dns::detail::build_query(std::string(64, 'a'),
-                                        dns::RecordType::a, 1)
-                   .has_value());
+    CIO_CHECK(
+        !dns::detail::build_query(std::string(64, 'a'), dns::RecordType::a, 1)
+             .has_value());
     // A name over 253 bytes.
-    CIO_CHECK(!dns::detail::build_query(std::string(300, 'a'),
-                                        dns::RecordType::a, 1)
-                   .has_value());
+    CIO_CHECK(
+        !dns::detail::build_query(std::string(300, 'a'), dns::RecordType::a, 1)
+             .has_value());
 }
 
 // Builds a response for "example.com" carrying the given A records.
@@ -154,9 +155,8 @@ void test_response_parsing_rejects_bad_messages() {
 
     // Cut mid-record: the length fields must be bounds-checked, not trusted.
     for (std::size_t cut = 12; cut < message.size(); cut += 3) {
-        auto partial =
-            dns::detail::parse_response(
-                std::span<const std::byte>{message.data(), cut}, 0x1234, 53);
+        auto partial = dns::detail::parse_response(
+            std::span<const std::byte>{message.data(), cut}, 0x1234, 53);
         // Either a clean error or a short address list; never a crash or an
         // address read past the end.
         if (partial) CIO_CHECK(partial->addresses.size() <= 1);
@@ -205,6 +205,84 @@ cio::Task<> stub_server(net::UdpConn socket, cio::CancelToken quit) {
     }
 }
 
+cio::Task<bool> truncated_udp_server(net::UdpConn socket) {
+    socket.set_timeout(2s);
+    std::vector<std::byte> buffer(4096);
+    net::SocketAddr from;
+    auto n = co_await socket.read_from(buffer, from);
+    CIO_CHECK(n.has_value());
+    const std::span<const std::byte> query{buffer.data(), *n};
+    auto reply = make_response(be16(query, 0), {}, 0x8380);
+    CIO_CHECK((co_await socket.write_to(reply, from)).has_value());
+    co_return true;
+}
+
+cio::Task<bool> complete_tcp_server(net::TcpListener listener) {
+    listener.set_deadline(cio::Clock::now() + 2s);
+    auto stream = co_await listener.accept();
+    CIO_CHECK(stream.has_value());
+    stream->set_timeout(2s);
+
+    std::byte length_bytes[2];
+    CIO_CHECK((co_await cio::io::read_full(*stream, length_bytes)).has_value());
+    const std::uint16_t length = be16(length_bytes, 0);
+    std::vector<std::byte> query(length);
+    CIO_CHECK((co_await cio::io::read_full(*stream, query)).has_value());
+
+    auto response = make_response(be16(query, 0), {"203.0.113.19"});
+    std::vector<std::byte> frame;
+    put16(frame, static_cast<std::uint16_t>(response.size()));
+    frame.insert(frame.end(), response.begin(), response.end());
+    CIO_CHECK((co_await stream->write(frame)).has_value());
+    co_return true;
+}
+
+cio::Task<bool> stalled_tcp_server(net::TcpListener listener) {
+    listener.set_deadline(cio::Clock::now() + 2s);
+    auto stream = co_await listener.accept();
+    CIO_CHECK(stream.has_value());
+    stream->set_timeout(2s);
+
+    std::byte length_bytes[2];
+    CIO_CHECK((co_await cio::io::read_full(*stream, length_bytes)).has_value());
+    const std::uint16_t length = be16(length_bytes, 0);
+    std::vector<std::byte> query(length);
+    CIO_CHECK((co_await cio::io::read_full(*stream, query)).has_value());
+
+    // The resolver's attempt deadline must end its parked read and destroy the
+    // connection. Reading EOF proves the timed-out attempt was not abandoned.
+    std::byte discarded{};
+    auto eof = co_await stream->read({&discarded, 1});
+    CIO_CHECK(eof.has_value());
+    CIO_CHECK_EQ(*eof, std::size_t{0});
+    co_return true;
+}
+
+struct DnsStubSockets {
+    net::UdpConn udp;
+    net::TcpListener tcp;
+    net::SocketAddr addr;
+};
+
+cio::Result<DnsStubSockets> listen_dns_stub() {
+    cio::Error last{EADDRINUSE};
+    for (unsigned attempt = 0; attempt < 32; ++attempt) {
+        auto tcp = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        if (!tcp) return tcp.error();
+        auto addr = tcp->addr();
+        if (!addr) return addr.error();
+
+        auto udp =
+            net::UdpConn::listen(net::SocketAddr::loopback_v4(addr->port()));
+        if (udp) {
+            return DnsStubSockets{std::move(*udp), std::move(*tcp), *addr};
+        }
+        last = udp.error();
+        if (!last.is(EADDRINUSE)) return last;
+    }
+    return last;
+}
+
 void test_lookup_against_a_stub_server() {
     auto body = []() -> cio::Task<bool> {
         auto server = net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
@@ -212,7 +290,8 @@ void test_lookup_against_a_stub_server() {
         const auto server_addr = server->local_addr().value();
 
         cio::CancelSource quit;
-        auto serving = cio::spawn(stub_server(std::move(*server), quit.token()));
+        auto serving =
+            cio::spawn(stub_server(std::move(*server), quit.token()));
 
         dns::Config config;
         config.servers = {server_addr};
@@ -232,10 +311,73 @@ void test_lookup_against_a_stub_server() {
         auto literal = co_await resolver.lookup("127.0.0.1", 8080);
         CIO_CHECK(literal.has_value());
         CIO_CHECK_EQ(literal->size(), std::size_t{1});
-        CIO_CHECK_EQ(literal->front().to_string(), std::string("127.0.0.1:8080"));
+        CIO_CHECK_EQ(literal->front().to_string(),
+                     std::string("127.0.0.1:8080"));
 
         quit.cancel();
         co_await serving;
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+void test_truncated_udp_response_retries_over_tcp() {
+    auto body = []() -> cio::Task<bool> {
+        auto sockets = listen_dns_stub();
+        CIO_CHECK(sockets.has_value());
+        if (!sockets) co_return false;
+
+        auto udp_task =
+            cio::spawn(truncated_udp_server(std::move(sockets->udp)));
+        auto tcp_task =
+            cio::spawn(complete_tcp_server(std::move(sockets->tcp)));
+
+        dns::Config config;
+        config.servers = {sockets->addr};
+        config.timeout = 500ms;
+        config.attempts = 1;
+        config.use_hosts_file = false;
+        dns::Resolver resolver{config};
+
+        auto addresses = co_await resolver.lookup_type("example.com", 443,
+                                                       dns::RecordType::a);
+        CIO_CHECK(addresses.has_value());
+        CIO_CHECK_EQ(addresses->size(), std::size_t{1});
+        CIO_CHECK_EQ(addresses->front().to_string(),
+                     std::string("203.0.113.19:443"));
+        CIO_CHECK(co_await udp_task);
+        CIO_CHECK(co_await tcp_task);
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
+void test_tcp_fallback_honours_attempt_deadline() {
+    auto body = []() -> cio::Task<bool> {
+        auto sockets = listen_dns_stub();
+        CIO_CHECK(sockets.has_value());
+        if (!sockets) co_return false;
+
+        auto udp_task =
+            cio::spawn(truncated_udp_server(std::move(sockets->udp)));
+        auto tcp_task = cio::spawn(stalled_tcp_server(std::move(sockets->tcp)));
+
+        dns::Config config;
+        config.servers = {sockets->addr};
+        config.timeout = 60ms;
+        config.attempts = 1;
+        config.use_hosts_file = false;
+        dns::Resolver resolver{config};
+
+        const auto started = cio::Clock::now();
+        auto result = co_await resolver.lookup_type("example.com", 443,
+                                                    dns::RecordType::a);
+        const auto elapsed = cio::Clock::now() - started;
+        CIO_CHECK(!result.has_value());
+        CIO_CHECK(result.error().is(cio::Errc::timed_out));
+        CIO_CHECK(elapsed < 5s);
+        CIO_CHECK(co_await udp_task);
+        CIO_CHECK(co_await tcp_task);
         co_return true;
     };
     CIO_CHECK(cio::run(body()));
@@ -280,10 +422,11 @@ void test_lookup_is_cancellable_mid_flight() {
         dns::Resolver resolver{config};
 
         cio::CancelSource stop;
-        auto canceller = cio::spawn([](cio::CancelSource source) -> cio::Task<> {
-            co_await cio::sleep(40ms);
-            source.cancel();
-        }(stop));
+        auto canceller =
+            cio::spawn([](cio::CancelSource source) -> cio::Task<> {
+                co_await cio::sleep(40ms);
+                source.cancel();
+            }(stop));
 
         const auto started = cio::Clock::now();
         auto result = co_await resolver.lookup("example.com", 53, stop.token());
@@ -320,7 +463,8 @@ void test_resolver_backend_selection() {
         // A literal goes through either backend unchanged.
         auto literal = co_await builtin.lookup_host("127.0.0.1", 8080);
         CIO_CHECK(literal.has_value());
-        CIO_CHECK_EQ(literal->front().to_string(), std::string("127.0.0.1:8080"));
+        CIO_CHECK_EQ(literal->front().to_string(),
+                     std::string("127.0.0.1:8080"));
         co_return true;
     };
     CIO_CHECK(cio::run(body()));
@@ -373,6 +517,8 @@ int main() {
     RUN_TEST(test_response_parsing);
     RUN_TEST(test_response_parsing_rejects_bad_messages);
     RUN_TEST(test_lookup_against_a_stub_server);
+    RUN_TEST(test_truncated_udp_response_retries_over_tcp);
+    RUN_TEST(test_tcp_fallback_honours_attempt_deadline);
     RUN_TEST(test_lookup_times_out_without_a_server);
     RUN_TEST(test_lookup_is_cancellable_mid_flight);
     RUN_TEST(test_resolver_backend_selection);

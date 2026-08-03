@@ -16,8 +16,8 @@
 //
 // This is the same split Go makes, and for the same stated reason: a blocked
 // DNS query costs one task, while a blocked getaddrinfo() costs an OS thread.
-// Select between them with net::LookupOptions::prefer_builtin rather than by
-// naming this type directly.
+// Select between them with net::Resolver::prefer_builtin rather than by naming
+// this type directly.
 //
 // /etc/hosts is honoured, as Go's built-in resolver does. nsswitch.conf
 // ordering, NIS and mDNS are not.
@@ -97,8 +97,7 @@ namespace detail {
 // Exposed for testing: the wire codec is where a DNS implementation gets its
 // bugs, so it is reachable without a network.
 Result<std::vector<std::byte>> build_query(std::string_view name,
-                                           RecordType type,
-                                           std::uint16_t id);
+                                           RecordType type, std::uint16_t id);
 
 struct Answer {
     std::vector<net::SocketAddr> addresses;

@@ -1,12 +1,15 @@
 #include "cio/process.hpp"
 
 #include <fcntl.h>
+#include <sys/epoll.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <cstring>
+#include <stdexcept>
+#include <thread>
 #include <utility>
 
 #include "cio/io.hpp"
@@ -22,6 +25,70 @@ int pidfd_open(int pid) noexcept {
 int pidfd_send_signal(int pidfd, int signal) noexcept {
     return static_cast<int>(
         ::syscall(SYS_pidfd_send_signal, pidfd, signal, nullptr, 0u));
+}
+
+// A Child destructor cannot suspend or block a runtime worker, but closing its
+// pidfd without waitid leaves an exited child as a zombie. One process-wide
+// epoll thread owns duplicated pidfds for abandoned children and reaps only
+// those children; it never consumes SIGCHLD state belonging to application
+// code. The object intentionally lives until process exit, as does its detached
+// thread.
+class ChildReaper {
+public:
+    ChildReaper() {
+        epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
+        if (epoll_fd_ < 0) throw std::runtime_error("epoll_create1");
+        try {
+            std::thread([this] { run(); }).detach();
+        } catch (...) {
+            ::close(epoll_fd_);
+            throw;
+        }
+    }
+
+    bool adopt(int pidfd) noexcept {
+        epoll_event event{};
+        event.events = EPOLLIN;
+        event.data.fd = pidfd;
+        return ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, pidfd, &event) == 0;
+    }
+
+private:
+    void run() noexcept {
+        epoll_event events[32];
+        for (;;) {
+            int count;
+            do {
+                count = ::epoll_wait(epoll_fd_, events,
+                                     static_cast<int>(std::size(events)), -1);
+            } while (count < 0 && errno == EINTR);
+            if (count < 0) continue;
+
+            for (int i = 0; i < count; ++i) {
+                const int pidfd = events[i].data.fd;
+                siginfo_t info{};
+                int result;
+                do {
+                    result = ::waitid(static_cast<idtype_t>(P_PIDFD),
+                                      static_cast<id_t>(pidfd), &info, WEXITED);
+                } while (result != 0 && errno == EINTR);
+                ::close(pidfd);
+            }
+        }
+    }
+
+    int epoll_fd_ = -1;
+};
+
+ChildReaper* child_reaper() noexcept {
+    static ChildReaper* instance = []() noexcept -> ChildReaper* {
+        try {
+            return new ChildReaper;
+        } catch (...) {
+            return nullptr;
+        }
+    }();
+    return instance;
 }
 
 // A close-on-exec pipe pair. RAII because the child path must not leak a
@@ -85,9 +152,7 @@ bool redirect(int fd, int target) noexcept {
 }  // namespace
 
 Child::~Child() {
-    // Deliberately does not wait: a destructor cannot suspend, and blocking here
-    // would stall a worker. An un-waited child is reparented and reaped by init,
-    // which is what Go's os.Process does too.
+    release_unwaited();
 }
 
 Child::Child(Child&& other) noexcept
@@ -100,6 +165,7 @@ Child::Child(Child&& other) noexcept
 
 Child& Child::operator=(Child&& other) noexcept {
     if (this != &other) {
+        release_unwaited();
         pid_ = std::exchange(other.pid_, -1);
         pidfd_ = std::move(other.pidfd_);
         stdin_ = std::move(other.stdin_);
@@ -108,6 +174,26 @@ Child& Child::operator=(Child&& other) noexcept {
         status_ = std::move(other.status_);
     }
     return *this;
+}
+
+void Child::release_unwaited() noexcept {
+    if (status_ || !pidfd_ || !pidfd_->valid()) return;
+
+    const int source = pidfd_->native_handle();
+    siginfo_t info{};
+    int result;
+    do {
+        result = ::waitid(static_cast<idtype_t>(P_PIDFD),
+                          static_cast<id_t>(source), &info, WEXITED | WNOHANG);
+    } while (result != 0 && errno == EINTR);
+    if (result == 0 && info.si_pid != 0) return;
+
+    const int duplicate = ::fcntl(source, F_DUPFD_CLOEXEC, 0);
+    if (duplicate < 0) return;
+    ChildReaper* const reaper = child_reaper();
+    if (reaper == nullptr || !reaper->adopt(duplicate)) {
+        ::close(duplicate);
+    }
 }
 
 Result<void> Child::signal(int number) const {
@@ -146,8 +232,8 @@ Task<Result<Status>> Child::wait() {
     }
 
     siginfo_t info{};
-    // WEXITED on the pidfd reaps the child; P_PIDFD is what makes this immune to
-    // pid reuse.
+    // WEXITED on the pidfd reaps the child; P_PIDFD is what makes this immune
+    // to pid reuse.
     if (::waitid(static_cast<idtype_t>(P_PIDFD),
                  static_cast<id_t>(pidfd_->native_handle()), &info,
                  WEXITED) != 0) {
@@ -255,14 +341,16 @@ Result<Child> Command::start() const {
     const int pidfd = pidfd_open(static_cast<int>(pid));
     if (pidfd < 0) {
         const int error = errno;
-        // Without a pidfd there is no non-blocking way to wait, so reap the child
-        // and report rather than silently degrading to a blocking waitpid.
+        // Without a pidfd there is no non-blocking way to wait, so reap the
+        // child and report rather than silently degrading to a blocking
+        // waitpid.
         int discarded = 0;
         (void)::waitpid(pid, &discarded, 0);
         return Error{error == ENOSYS ? ENOSYS : error};
     }
 
-    // Did exec succeed? A successful exec closes the write end, so this reads 0.
+    // Did exec succeed? A successful exec closes the write end, so this reads
+    // 0.
     int child_errno = 0;
     ssize_t got = 0;
     do {

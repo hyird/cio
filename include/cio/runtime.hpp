@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "cio/detail/scheduler.hpp"
+#include "cio/group.hpp"
 #include "cio/spawn.hpp"
 #include "cio/task.hpp"
 
@@ -46,17 +47,17 @@ public:
 
     // Runs `task` on the runtime and blocks the calling thread until it
     // finishes. The calling thread is not a worker; it just waits.
-    template <typename T>
+    template<typename T>
     T block_on(Task<T> task);
 
-    template <typename T>
+    template<typename T>
     JoinHandle<T> spawn(Task<T> task) {
-        return detail::spawn_on(*sched_, std::move(task));
+        return detail::spawn_on(*sched_, std::move(task), true);
     }
 
-    template <typename T>
+    template<typename T>
     void go(Task<T> task) {
-        detail::go_on(*sched_, std::move(task));
+        detail::go_on(*sched_, std::move(task), true);
     }
 
     std::size_t worker_count() const noexcept { return sched_->worker_count(); }
@@ -66,15 +67,26 @@ public:
     // with std::logic_error.
     void shutdown();
 
+    // Cooperative graceful shutdown. New roots submitted from outside this
+    // Runtime are rejected, shutdown_token() is cancelled, and this call waits
+    // for roots submitted through this Runtime. Structured cleanup children
+    // remain covered while their root joins them. A root that ignores the
+    // token can keep this call waiting.
+    void graceful_shutdown();
+    CancelToken shutdown_token() const noexcept {
+        return shutdown_source_.token();
+    }
+
     detail::Scheduler& scheduler() noexcept { return *sched_; }
 
 private:
     std::shared_ptr<detail::Scheduler> sched_;
+    CancelSource shutdown_source_;
 };
 
 namespace detail {
 
-template <typename T>
+template<typename T>
 struct BlockOnSync {
     std::mutex mutex;
     std::condition_variable cv;
@@ -92,7 +104,7 @@ struct BlockOnSync {
     }
 };
 
-template <typename T>
+template<typename T>
 Task<void> block_on_runner(Task<T> task, BlockOnSync<T>* sync) {
     try {
         if constexpr (std::is_void_v<T>) {
@@ -108,10 +120,11 @@ Task<void> block_on_runner(Task<T> task, BlockOnSync<T>* sync) {
 
 }  // namespace detail
 
-template <typename T>
+template<typename T>
 T Runtime::block_on(Task<T> task) {
     detail::BlockOnSync<T> sync;
-    detail::go_on(*sched_, detail::block_on_runner<T>(std::move(task), &sync));
+    detail::go_on(*sched_, detail::block_on_runner<T>(std::move(task), &sync),
+                  true);
 
     {
         std::unique_lock<std::mutex> lock(sync.mutex);
@@ -123,7 +136,7 @@ T Runtime::block_on(Task<T> task) {
 }
 
 // Convenience: build a runtime, run one task on it, tear it down.
-template <typename T>
+template<typename T>
 T run(Task<T> task, RuntimeOptions options = {}) {
     Runtime runtime(options);
     return runtime.block_on(std::move(task));

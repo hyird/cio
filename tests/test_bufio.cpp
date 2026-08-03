@@ -12,10 +12,6 @@ namespace net = cio::net;
 
 namespace {
 
-std::span<const std::byte> bytes_of(std::string_view s) {
-    return {reinterpret_cast<const std::byte*>(s.data()), s.size()};
-}
-
 // Hands out one byte at a time, so buffering and reassembly are actually
 // exercised rather than accidentally satisfied by a single large read.
 struct DribbleSource {

@@ -3209,6 +3209,87 @@ void test_shutdown_from_own_worker_is_rejected() {
     runtime.shutdown();
 }
 
+cio::Task<> graceful_shutdown_root(cio::Runtime* runtime,
+                                   cio::CancelToken shutdown,
+                                   std::atomic<bool>* started,
+                                   std::atomic<bool>* child_finished,
+                                   std::atomic<bool>* root_finished) {
+    started->store(true, std::memory_order_release);
+    (void)co_await shutdown.done().recv();
+
+    // Admission is already closed to foreign callers, but a live root may
+    // still submit cleanup work from its own worker. The root deliberately
+    // does not join it: graceful shutdown must track both submissions.
+    runtime->go([](std::atomic<bool>* finished) -> cio::Task<> {
+        co_await cio::sleep(2ms);
+        finished->store(true, std::memory_order_release);
+    }(child_finished));
+    root_finished->store(true, std::memory_order_release);
+}
+
+void test_graceful_shutdown_cancels_and_joins_runtime_roots() {
+    cio::RuntimeOptions options;
+    options.worker_threads = 2;
+    cio::Runtime runtime(options);
+
+    std::atomic<bool> started{false};
+    std::atomic<bool> child_finished{false};
+    std::atomic<bool> root_finished{false};
+    runtime.go(graceful_shutdown_root(&runtime, runtime.shutdown_token(),
+                                      &started, &child_finished,
+                                      &root_finished));
+
+    const auto deadline = cio::Clock::now() + 2s;
+    while (!started.load(std::memory_order_acquire) &&
+           cio::Clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    CIO_CHECK(started.load(std::memory_order_acquire));
+
+    runtime.graceful_shutdown();
+    CIO_CHECK(child_finished.load(std::memory_order_acquire));
+    CIO_CHECK(root_finished.load(std::memory_order_acquire));
+
+    bool rejected = false;
+    try {
+        runtime.go([]() -> cio::Task<> { co_return; }());
+    } catch (const cio::SystemError& error) {
+        rejected = error.error().is(cio::Errc::shutdown);
+    }
+    CIO_CHECK(rejected);
+
+    // Both graceful shutdown and a graceful call after immediate shutdown are
+    // idempotent and must not wait on work an immediate stop abandoned.
+    runtime.graceful_shutdown();
+
+    cio::Runtime stopped(options);
+    stopped.shutdown();
+    stopped.graceful_shutdown();
+}
+
+void test_graceful_shutdown_from_own_worker_is_rejected() {
+    cio::RuntimeOptions options;
+    options.worker_threads = 1;
+    cio::Runtime runtime(options);
+    const cio::CancelToken shutdown = runtime.shutdown_token();
+
+    const bool rejected = runtime.block_on([&runtime]() -> cio::Task<bool> {
+        try {
+            runtime.graceful_shutdown();
+        } catch (const std::logic_error&) {
+            co_return true;
+        }
+        co_return false;
+    }());
+    CIO_CHECK(rejected);
+    CIO_CHECK(!shutdown.cancelled());
+    CIO_CHECK_EQ(runtime.block_on([]() -> cio::Task<int> { co_return 7; }()),
+                 7);
+
+    runtime.graceful_shutdown();
+    CIO_CHECK(shutdown.cancelled());
+}
+
 }  // namespace
 
 int main() {
@@ -3283,5 +3364,7 @@ int main() {
     RUN_TEST(test_completion_endpoint_shutdown_waits_out_foreign_leases);
     RUN_TEST(test_invalid_async_handles_report_errors);
     RUN_TEST(test_shutdown_from_own_worker_is_rejected);
+    RUN_TEST(test_graceful_shutdown_cancels_and_joins_runtime_roots);
+    RUN_TEST(test_graceful_shutdown_from_own_worker_is_rejected);
     return cio_test::summary();
 }

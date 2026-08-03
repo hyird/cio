@@ -4,12 +4,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <algorithm>
 #include <limits>
 #include <string>
 #include <thread>
@@ -25,8 +25,7 @@ namespace net = cio::net;
 namespace cio::detail {
 
 struct SchedulerTestAccess {
-    static void push_global(
-        Scheduler& scheduler, void* frame) {
+    static void push_global(Scheduler& scheduler, void* frame) {
         scheduler.global_.push(frame);
     }
 };
@@ -60,19 +59,16 @@ public:
 struct ReadyHintTestAccess {
     static bool waiter_is_parked(cio::detail::IoDesc* desc,
                                  cio::detail::Dir dir) noexcept {
-        void* const slot =
-            desc->dir_slot(dir).load(std::memory_order_acquire);
+        void* const slot = desc->dir_slot(dir).load(std::memory_order_acquire);
         return slot != nullptr && slot != cio::detail::kIoReady;
     }
 
     static bool slot_is_empty(cio::detail::IoDesc* desc,
                               cio::detail::Dir dir) noexcept {
-        return desc->dir_slot(dir).load(std::memory_order_acquire) ==
-               nullptr;
+        return desc->dir_slot(dir).load(std::memory_order_acquire) == nullptr;
     }
 
-    static void complete(cio::detail::IoDesc* desc,
-                         cio::detail::Dir dir,
+    static void complete(cio::detail::IoDesc* desc, cio::detail::Dir dir,
                          cio::Error error) noexcept {
         desc->owner->unblock(desc, dir, error);
     }
@@ -86,12 +82,20 @@ struct ReadyHintTestAccess {
                              cio::detail::Dir dir) noexcept {
         return desc->may_be_ready(dir);
     }
+
+    static bool operation_is_queued(cio::detail::IoDesc* desc,
+                                    cio::detail::Dir dir) noexcept {
+        const unsigned index = static_cast<unsigned>(dir);
+        desc->lock_lifecycle();
+        const bool queued = desc->operation_head[index] != nullptr;
+        desc->unlock_lifecycle();
+        return queued;
+    }
 };
 
 bool open_nonblocking_socket_pair(int fds[2]) {
-    return ::socketpair(AF_UNIX,
-                        SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
-                        0, fds) == 0;
+    return ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
+                        fds) == 0;
 }
 
 void test_deadline_state_precedes_callback_dispatch() {
@@ -119,29 +123,27 @@ void test_deadline_state_precedes_callback_dispatch() {
     const char sent = 'D';
     CIO_CHECK_EQ(::send(fds[1], &sent, 1, MSG_NOSIGNAL), 1);
 
-    reactor.set_deadline(
-        desc, cio::detail::Dir::kRead, generation,
-        cio::now_ns() + cio::to_ns(1h));
+    reactor.set_deadline(desc, cio::detail::Dir::kRead, generation,
+                         cio::now_ns() + cio::to_ns(1h));
     {
-        cio::detail::FdUseGuard future{
-            desc, cio::detail::Dir::kRead, generation};
+        cio::detail::FdUseGuard future{desc, cio::detail::Dir::kRead,
+                                       generation};
         CIO_CHECK(static_cast<bool>(future));
     }
 
-    reactor.set_deadline(
-        desc, cio::detail::Dir::kRead, generation,
-        cio::now_ns() - 1);
+    reactor.set_deadline(desc, cio::detail::Dir::kRead, generation,
+                         cio::now_ns() - 1);
     {
-        cio::detail::FdUseGuard expired{
-            desc, cio::detail::Dir::kRead, generation};
+        cio::detail::FdUseGuard expired{desc, cio::detail::Dir::kRead,
+                                        generation};
         CIO_CHECK(!expired);
         CIO_CHECK(expired.error().is(cio::Errc::timed_out));
     }
 
     reactor.set_deadline(desc, cio::detail::Dir::kRead, generation, 0);
     {
-        cio::detail::FdUseGuard cleared{
-            desc, cio::detail::Dir::kRead, generation};
+        cio::detail::FdUseGuard cleared{desc, cio::detail::Dir::kRead,
+                                        generation};
         CIO_CHECK(static_cast<bool>(cleared));
         if (cleared) {
             char received = '\0';
@@ -194,36 +196,28 @@ void test_stale_deadline_setter_cannot_disarm_reused_descriptor() {
     CIO_CHECK(new_desc == old_desc);
     CIO_CHECK(new_generation != old_generation);
 
-    const std::int64_t future_deadline =
-        cio::now_ns() + cio::to_ns(1h);
-    reactor.set_deadline(
-        new_desc, cio::detail::Dir::kRead, new_generation,
-        future_deadline);
+    const std::int64_t future_deadline = cio::now_ns() + cio::to_ns(1h);
+    reactor.set_deadline(new_desc, cio::detail::Dir::kRead, new_generation,
+                         future_deadline);
     const unsigned read = static_cast<unsigned>(cio::detail::Dir::kRead);
     CIO_CHECK_EQ(
-        new_desc->absolute_deadline_ns[read].load(
-            std::memory_order_acquire),
+        new_desc->absolute_deadline_ns[read].load(std::memory_order_acquire),
         future_deadline);
     CIO_CHECK_EQ(
-        new_desc->deadline_timer[read].state.load(
-            std::memory_order_acquire),
+        new_desc->deadline_timer[read].state.load(std::memory_order_acquire),
         cio::detail::Timer::kArmed);
 
     // An operation token captured from the previous fd incarnation must be
     // rejected before set_deadline() touches the reused timer node.
-    reactor.set_deadline(
-        new_desc, cio::detail::Dir::kRead, old_generation, 0);
+    reactor.set_deadline(new_desc, cio::detail::Dir::kRead, old_generation, 0);
     CIO_CHECK_EQ(
-        new_desc->absolute_deadline_ns[read].load(
-            std::memory_order_acquire),
+        new_desc->absolute_deadline_ns[read].load(std::memory_order_acquire),
         future_deadline);
     CIO_CHECK_EQ(
-        new_desc->deadline_timer[read].state.load(
-            std::memory_order_acquire),
+        new_desc->deadline_timer[read].state.load(std::memory_order_acquire),
         cio::detail::Timer::kArmed);
 
-    reactor.set_deadline(
-        new_desc, cio::detail::Dir::kRead, new_generation, 0);
+    reactor.set_deadline(new_desc, cio::detail::Dir::kRead, new_generation, 0);
     reactor.detach(new_desc);
     ::close(new_fds[0]);
     ::close(new_fds[1]);
@@ -254,9 +248,8 @@ void test_close_published_before_firing_deadline_wins() {
     const std::uint32_t generation =
         desc->generation.load(std::memory_order_acquire);
     const unsigned read = static_cast<unsigned>(cio::detail::Dir::kRead);
-    reactor.set_deadline(
-        desc, cio::detail::Dir::kRead, generation,
-        cio::now_ns() + cio::to_ns(1ms));
+    reactor.set_deadline(desc, cio::detail::Dir::kRead, generation,
+                         cio::now_ns() + cio::to_ns(1ms));
 
     cio::detail::IoWait waiter;
     desc->slot[read].store(&waiter, std::memory_order_release);
@@ -270,20 +263,17 @@ void test_close_published_before_firing_deadline_wins() {
     }
 
     std::size_t fired_count = 0;
-    std::thread firing([&] {
-        fired_count = scheduler.timers().run_expired(0);
-    });
+    std::thread firing(
+        [&] { fired_count = scheduler.timers().run_expired(0); });
 
     const auto firing_deadline = cio::Clock::now() + 1s;
-    while (desc->deadline_timer[read].state.load(
-               std::memory_order_acquire) !=
+    while (desc->deadline_timer[read].state.load(std::memory_order_acquire) !=
                cio::detail::Timer::kFiring &&
            cio::Clock::now() < firing_deadline) {
         std::this_thread::yield();
     }
     const bool callback_waiting =
-        desc->deadline_timer[read].state.load(
-            std::memory_order_acquire) ==
+        desc->deadline_timer[read].state.load(std::memory_order_acquire) ==
         cio::detail::Timer::kFiring;
     CIO_CHECK(callback_waiting);
 
@@ -322,9 +312,8 @@ void test_concurrent_deadline_setters_are_serialized() {
     auto setter = [&](std::int64_t offset) {
         for (int i = 0; i < kRounds; ++i) {
             rendezvous.arrive_and_wait();
-            reactor.set_deadline(
-                desc, cio::detail::Dir::kRead, generation,
-                cio::now_ns() + cio::to_ns(1h) + offset + i);
+            reactor.set_deadline(desc, cio::detail::Dir::kRead, generation,
+                                 cio::now_ns() + cio::to_ns(1h) + offset + i);
         }
     };
     std::thread first(setter, 1);
@@ -333,26 +322,21 @@ void test_concurrent_deadline_setters_are_serialized() {
     second.join();
 
     const unsigned read = static_cast<unsigned>(cio::detail::Dir::kRead);
+    CIO_CHECK_EQ(desc->deadline_seq[read].load(std::memory_order_acquire),
+                 std::uint32_t{1 + 2 * kRounds});
+    CIO_CHECK(desc->absolute_deadline_ns[read].load(std::memory_order_acquire) >
+              cio::now_ns());
     CIO_CHECK_EQ(
-        desc->deadline_seq[read].load(std::memory_order_acquire),
-        std::uint32_t{1 + 2 * kRounds});
-    CIO_CHECK(
-        desc->absolute_deadline_ns[read].load(
-            std::memory_order_acquire) > cio::now_ns());
-    CIO_CHECK_EQ(
-        desc->deadline_timer[read].state.load(
-            std::memory_order_acquire),
+        desc->deadline_timer[read].state.load(std::memory_order_acquire),
         cio::detail::Timer::kArmed);
 
-    reactor.set_deadline(
-        desc, cio::detail::Dir::kRead, generation, 0);
+    reactor.set_deadline(desc, cio::detail::Dir::kRead, generation, 0);
     reactor.detach(desc);
     ::close(fds[0]);
     ::close(fds[1]);
 }
 
-bool force_socket_pair_fd_reuse(int target_fd, int& reused_fd,
-                                int& peer_fd) {
+bool force_socket_pair_fd_reuse(int target_fd, int& reused_fd, int& peer_fd) {
     int replacement[2] = {-1, -1};
     if (!open_nonblocking_socket_pair(replacement)) return false;
 
@@ -387,8 +371,8 @@ cio::Result<InspectableUdpConn> bind_inspectable_udp() {
     addr.sin_family = AF_INET;
     addr.sin_port = 0;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (::bind(fd, reinterpret_cast<const sockaddr*>(&addr),
-               sizeof(addr)) != 0) {
+    if (::bind(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) !=
+        0) {
         const cio::Error error = cio::Error::from_errno();
         ::close(fd);
         return error;
@@ -416,8 +400,8 @@ struct SwitchToWorker {
 
 using TcpPair = std::pair<net::TcpConn, net::TcpConn>;
 
-cio::Task<cio::Result<TcpPair>> open_tcp_pair(
-    net::TcpListener& listener, net::SocketAddr addr) {
+cio::Task<cio::Result<TcpPair>> open_tcp_pair(net::TcpListener& listener,
+                                              net::SocketAddr addr) {
     auto connecting = cio::spawn(net::TcpConn::dial(addr));
     auto accepted = co_await listener.accept();
     auto client = co_await connecting;
@@ -455,16 +439,19 @@ cio::Task<> echo_connection(net::TcpConn stream) {
     for (;;) {
         auto n = co_await stream.read(buffer);
         if (!n || *n == 0) break;
-        if (auto written = co_await stream.write(std::span(buffer, *n)); !written) break;
+        if (auto written = co_await stream.write(std::span(buffer, *n));
+            !written)
+            break;
     }
 }
 
 // Cancellable accept loop, and the reason it is shaped this way: cancellation
 // does not interrupt a parked accept(), so a server that only checks a token
-// after accept returns never returns at all once traffic stops. A short listener
-// deadline makes accept come back on its own, which lets the loop observe the
-// token without a second task closing the socket underneath it. Everything it
-// spawns is joined, so nothing is still parked when the runtime is destroyed.
+// after accept returns never returns at all once traffic stops. A short
+// listener deadline makes accept come back on its own, which lets the loop
+// observe the token without a second task closing the socket underneath it.
+// Everything it spawns is joined, so nothing is still parked when the runtime
+// is destroyed.
 cio::Task<> echo_server(net::TcpListener listener, cio::CancelToken stop) {
     cio::TaskGroup connections;
     for (;;) {
@@ -482,12 +469,14 @@ cio::Task<> echo_server(net::TcpListener listener, cio::CancelToken stop) {
 
 void test_echo_round_trip() {
     auto body = []() -> cio::Task<std::string> {
-        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        auto listener =
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->addr().value();
 
         cio::CancelSource stop;
-        auto server = cio::spawn(echo_server(std::move(*listener), stop.token()));
+        auto server =
+            cio::spawn(echo_server(std::move(*listener), stop.token()));
 
         auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
@@ -521,14 +510,16 @@ void test_echo_round_trip() {
 // admission, so a write refuses before it can succeed into a large send buffer.
 void test_combined_deadline_covers_both_directions() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        auto listener =
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->addr().value();
 
-        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
-            auto conn = co_await l.accept();
-            co_return std::move(conn.value());
-        }(std::move(*listener)));
+        auto accepted =
+            cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
+                auto conn = co_await l.accept();
+                co_return std::move(conn.value());
+            }(std::move(*listener)));
 
         auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
@@ -612,15 +603,17 @@ void test_udp_combined_deadline_and_clear() {
 
 void test_read_deadline() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        auto listener =
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->addr().value();
 
         // A server that accepts and then stays silent.
-        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
-            auto conn = co_await l.accept();
-            co_return std::move(conn.value());
-        }(std::move(*listener)));
+        auto accepted =
+            cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
+                auto conn = co_await l.accept();
+                co_return std::move(conn.value());
+            }(std::move(*listener)));
 
         auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
@@ -676,8 +669,8 @@ void test_immediate_deadline_remains_persistent_during_waiter_publication() {
 
             std::byte byte;
             client->set_read_deadline(cio::Clock::now());
-            const auto read = co_await client->read(
-                std::span<std::byte>{&byte, 1});
+            const auto read =
+                co_await client->read(std::span<std::byte>{&byte, 1});
             CIO_CHECK(!read);
             CIO_CHECK(read.error().is(cio::Errc::timed_out));
             if (read || !read.error().is(cio::Errc::timed_out)) {
@@ -714,8 +707,7 @@ void test_expired_deadline_precedes_ready_data_write_and_eof() {
             co_await data_client.read(std::span<std::byte>{&byte, 1});
         CIO_CHECK(!data_read);
         CIO_CHECK(data_read.error().is(cio::Errc::timed_out));
-        if (data_read ||
-            !data_read.error().is(cio::Errc::timed_out)) {
+        if (data_read || !data_read.error().is(cio::Errc::timed_out)) {
             co_return false;
         }
 
@@ -735,8 +727,7 @@ void test_expired_deadline_precedes_ready_data_write_and_eof() {
             co_await eof_client.read(std::span<std::byte>{&byte, 1});
         CIO_CHECK(!eof_read);
         CIO_CHECK(eof_read.error().is(cio::Errc::timed_out));
-        if (eof_read ||
-            !eof_read.error().is(cio::Errc::timed_out)) {
+        if (eof_read || !eof_read.error().is(cio::Errc::timed_out)) {
             co_return false;
         }
 
@@ -750,12 +741,10 @@ void test_expired_deadline_precedes_ready_data_write_and_eof() {
         write_client.set_write_deadline(cio::Clock::now());
         co_await cio::sleep(2ms);
         if (!(co_await observe_write_timeout(write_client))) co_return false;
-        auto write =
-            co_await write_client.write(bytes_of("x"));
+        auto write = co_await write_client.write(bytes_of("x"));
         CIO_CHECK(!write);
         CIO_CHECK(write.error().is(cio::Errc::timed_out));
-        co_return !write &&
-                  write.error().is(cio::Errc::timed_out);
+        co_return !write && write.error().is(cio::Errc::timed_out);
     };
 
     CIO_CHECK(cio::run(body()));
@@ -770,8 +759,7 @@ void test_expired_deadline_precedes_ready_accept_and_udp() {
 
         // Complete the handshake without accepting it, leaving a connection
         // ready in the listener backlog.
-        auto client =
-            co_await net::TcpConn::dial(listener->addr().value());
+        auto client = co_await net::TcpConn::dial(listener->addr().value());
         CIO_CHECK(client.has_value());
         if (!client) co_return false;
         listener->set_deadline(cio::Clock::now());
@@ -779,15 +767,12 @@ void test_expired_deadline_precedes_ready_accept_and_udp() {
         auto accepted = co_await listener->accept();
         CIO_CHECK(!accepted);
         CIO_CHECK(accepted.error().is(cio::Errc::timed_out));
-        if (accepted ||
-            !accepted.error().is(cio::Errc::timed_out)) {
+        if (accepted || !accepted.error().is(cio::Errc::timed_out)) {
             co_return false;
         }
 
-        auto receiver =
-            net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
-        auto sender =
-            net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
+        auto receiver = net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
+        auto sender = net::UdpConn::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(receiver.has_value());
         CIO_CHECK(sender.has_value());
         if (!receiver || !sender) co_return false;
@@ -803,12 +788,11 @@ void test_expired_deadline_precedes_ready_accept_and_udp() {
         co_await cio::sleep(2ms);
         std::byte byte{};
         net::SocketAddr from;
-        auto received = co_await receiver->read_from(
-            std::span<std::byte>{&byte, 1}, from);
+        auto received =
+            co_await receiver->read_from(std::span<std::byte>{&byte, 1}, from);
         CIO_CHECK(!received);
         CIO_CHECK(received.error().is(cio::Errc::timed_out));
-        if (received ||
-            !received.error().is(cio::Errc::timed_out)) {
+        if (received || !received.error().is(cio::Errc::timed_out)) {
             co_return false;
         }
 
@@ -817,8 +801,7 @@ void test_expired_deadline_precedes_ready_accept_and_udp() {
         auto sent = co_await sender->write_to(bytes_of("y"), *target);
         CIO_CHECK(!sent);
         CIO_CHECK(sent.error().is(cio::Errc::timed_out));
-        co_return !sent &&
-                  sent.error().is(cio::Errc::timed_out);
+        co_return !sent && sent.error().is(cio::Errc::timed_out);
     };
 
     CIO_CHECK(cio::run(body()));
@@ -829,11 +812,13 @@ void test_connect_refused() {
         // Bind and immediately drop, so the port is almost certainly closed.
         std::uint16_t port = 0;
         {
-            auto probe = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+            auto probe =
+                net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
             CIO_CHECK(probe.has_value());
             port = probe->addr().value().port();
         }
-        auto result = co_await net::TcpConn::dial(net::SocketAddr::loopback_v4(port));
+        auto result =
+            co_await net::TcpConn::dial(net::SocketAddr::loopback_v4(port));
         CIO_CHECK(!result.has_value());
         co_return !result.has_value();
     };
@@ -885,18 +870,21 @@ void test_many_concurrent_connections() {
     static constexpr int kRoundTrips = 20;
 
     auto body = []() -> cio::Task<int> {
-        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        auto listener =
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->addr().value();
 
         cio::CancelSource stop;
-        auto server = cio::spawn(echo_server(std::move(*listener), stop.token()));
+        auto server =
+            cio::spawn(echo_server(std::move(*listener), stop.token()));
 
         cio::TaskGroup clients;
         auto successes = cio::make_chan<int>(kClients);
 
         for (int i = 0; i < kClients; ++i) {
-            clients.spawn([](net::SocketAddr target, cio::Chan<int> out) -> cio::Task<> {
+            clients.spawn([](net::SocketAddr target,
+                             cio::Chan<int> out) -> cio::Task<> {
                 auto stream = co_await net::TcpConn::dial(target);
                 if (!stream) {
                     co_await out.send(0);
@@ -910,13 +898,15 @@ void test_many_concurrent_connections() {
 
                     std::size_t got = 0;
                     while (got < payload.size()) {
-                        auto n = co_await stream->read(std::span(buffer + got,
-                                                                 sizeof(buffer) - got));
+                        auto n = co_await stream->read(
+                            std::span(buffer + got, sizeof(buffer) - got));
                         if (!n || *n == 0) break;
                         got += *n;
                     }
                     if (got != payload.size()) break;
-                    if (std::memcmp(buffer, payload.data(), payload.size()) != 0) break;
+                    if (std::memcmp(buffer, payload.data(), payload.size()) !=
+                        0)
+                        break;
                     ++ok;
                 }
                 co_await out.send(ok);
@@ -952,8 +942,8 @@ void test_accept_distributes_new_streams_across_workers() {
             CIO_CHECK(accepted.has_value());
             if (!accepted) co_return seen;
 
-            const auto worker =
-                cio::detail::current_worker_id(cio::detail::current_scheduler());
+            const auto worker = cio::detail::current_worker_id(
+                cio::detail::current_scheduler());
             CIO_CHECK(worker < kWorkers);
             if (worker < kWorkers) seen[worker] = true;
 
@@ -974,14 +964,16 @@ void test_accept_distributes_new_streams_across_workers() {
 
 void test_close_wakes_a_parked_reader() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        auto listener =
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->addr().value();
 
-        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
-            auto conn = co_await l.accept();
-            co_return std::move(conn.value());
-        }(std::move(*listener)));
+        auto accepted =
+            cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
+                auto conn = co_await l.accept();
+                co_return std::move(conn.value());
+            }(std::move(*listener)));
 
         auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
@@ -1002,26 +994,135 @@ void test_close_wakes_a_parked_reader() {
     CIO_CHECK(cio::run(body()));
 }
 
+cio::Task<bool> read_one_byte(net::TcpConn* stream, std::byte* byte) {
+    auto read = co_await stream->read({byte, 1});
+    co_return read.has_value() && *read == 1;
+}
+
+cio::Task<cio::Error> read_one_byte_error(net::TcpConn* stream) {
+    std::byte byte{};
+    auto read = co_await stream->read({&byte, 1});
+    co_return read ? cio::Error{} : read.error();
+}
+
+void test_same_direction_reads_queue_instead_of_failing() {
+    auto body = []() -> cio::Task<bool> {
+        int fds[2] = {-1, -1};
+        CIO_CHECK(open_nonblocking_socket_pair(fds));
+        if (fds[0] < 0 || fds[1] < 0) co_return false;
+
+        InspectableTcpConn stream;
+        CIO_CHECK(stream.adopt_for_test(fds[0]).has_value());
+        cio::detail::IoDesc* const desc = stream.descriptor();
+
+        std::byte first{};
+        std::byte second{};
+        auto first_read = cio::spawn(read_one_byte(&stream, &first));
+
+        const auto deadline = cio::Clock::now() + 2s;
+        while (!ReadyHintTestAccess::waiter_is_parked(
+                   desc, cio::detail::Dir::kRead) &&
+               cio::Clock::now() < deadline) {
+            co_await cio::yield();
+        }
+        CIO_CHECK(ReadyHintTestAccess::waiter_is_parked(
+            desc, cio::detail::Dir::kRead));
+
+        auto second_read = cio::spawn(read_one_byte(&stream, &second));
+        while (!ReadyHintTestAccess::operation_is_queued(
+                   desc, cio::detail::Dir::kRead) &&
+               cio::Clock::now() < deadline) {
+            co_await cio::yield();
+        }
+        CIO_CHECK(ReadyHintTestAccess::operation_is_queued(
+            desc, cio::detail::Dir::kRead));
+
+        std::byte unused{};
+        auto nonblocking = stream.try_read({&unused, 1});
+        CIO_CHECK(!nonblocking.has_value());
+        CIO_CHECK(nonblocking.error().is(cio::Errc::would_block));
+
+        const char payload[] = {'A', 'B'};
+        CIO_CHECK_EQ(::send(fds[1], payload, sizeof(payload), MSG_NOSIGNAL),
+                     static_cast<ssize_t>(sizeof(payload)));
+        CIO_CHECK(co_await first_read);
+        CIO_CHECK(co_await second_read);
+        CIO_CHECK(first == std::byte{'A'});
+        CIO_CHECK(second == std::byte{'B'});
+
+        stream.close();
+        ::close(fds[1]);
+        co_return true;
+    };
+
+    cio::RuntimeOptions options;
+    options.worker_threads = 2;
+    CIO_CHECK(cio::run(body(), options));
+}
+
+void test_close_drains_same_direction_operation_queue() {
+    auto body = []() -> cio::Task<bool> {
+        int fds[2] = {-1, -1};
+        CIO_CHECK(open_nonblocking_socket_pair(fds));
+        if (fds[0] < 0 || fds[1] < 0) co_return false;
+
+        InspectableTcpConn stream;
+        CIO_CHECK(stream.adopt_for_test(fds[0]).has_value());
+        cio::detail::IoDesc* const desc = stream.descriptor();
+        auto first = cio::spawn(read_one_byte_error(&stream));
+
+        const auto deadline = cio::Clock::now() + 2s;
+        while (!ReadyHintTestAccess::waiter_is_parked(
+                   desc, cio::detail::Dir::kRead) &&
+               cio::Clock::now() < deadline) {
+            co_await cio::yield();
+        }
+        auto second = cio::spawn(read_one_byte_error(&stream));
+        while (!ReadyHintTestAccess::operation_is_queued(
+                   desc, cio::detail::Dir::kRead) &&
+               cio::Clock::now() < deadline) {
+            co_await cio::yield();
+        }
+        CIO_CHECK(ReadyHintTestAccess::operation_is_queued(
+            desc, cio::detail::Dir::kRead));
+
+        stream.close();
+        const cio::Error first_error = co_await first;
+        const cio::Error second_error = co_await second;
+        CIO_CHECK(first_error.is(cio::Errc::closed));
+        CIO_CHECK(second_error.is(cio::Errc::closed));
+        ::close(fds[1]);
+        co_return true;
+    };
+
+    cio::RuntimeOptions options;
+    options.worker_threads = 2;
+    CIO_CHECK(cio::run(body(), options));
+}
+
 void test_local_close_wakes_a_parked_reader() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        auto listener =
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->addr().value();
 
-        auto accepted = cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
-            auto conn = co_await l.accept();
-            co_return std::move(conn.value());
-        }(std::move(*listener)));
+        auto accepted =
+            cio::spawn([](net::TcpListener l) -> cio::Task<net::TcpConn> {
+                auto conn = co_await l.accept();
+                co_return std::move(conn.value());
+            }(std::move(*listener)));
 
         auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
         auto server_side = co_await accepted;
 
-        auto reader = cio::spawn([](net::TcpConn& stream) -> cio::Task<cio::Error> {
-            std::byte buffer[16];
-            auto result = co_await stream.read(buffer);
-            co_return result.error();
-        }(*client));
+        auto reader =
+            cio::spawn([](net::TcpConn& stream) -> cio::Task<cio::Error> {
+                std::byte buffer[16];
+                auto result = co_await stream.read(buffer);
+                co_return result.error();
+            }(*client));
 
         co_await cio::sleep(20ms);
         client->close();
@@ -1039,12 +1140,11 @@ struct ReadyHintAwaitObservation {
 
 cio::Task<ReadyHintAwaitObservation> observe_ready_hint_after_await(
     cio::detail::IoDesc* desc, std::uint32_t generation) {
-    auto ready = co_await cio::detail::IoAwaiter{
-        desc, cio::detail::Dir::kRead, generation};
+    auto ready = co_await cio::detail::IoAwaiter{desc, cio::detail::Dir::kRead,
+                                                 generation};
     co_return ReadyHintAwaitObservation{
         ready ? cio::Error{} : ready.error(),
-        ReadyHintTestAccess::may_be_ready(
-            desc, cio::detail::Dir::kRead)};
+        ReadyHintTestAccess::may_be_ready(desc, cio::detail::Dir::kRead)};
 }
 
 cio::Task<bool> run_ready_hint_completion_case(bool successful) {
@@ -1064,16 +1164,14 @@ cio::Task<bool> run_ready_hint_completion_case(bool successful) {
     const std::uint32_t generation =
         desc->generation.load(std::memory_order_acquire);
 
-    ReadyHintTestAccess::overwrite_not_ready(
-        desc, cio::detail::Dir::kRead);
-    auto waiter =
-        cio::spawn(observe_ready_hint_after_await(desc, generation));
+    ReadyHintTestAccess::overwrite_not_ready(desc, cio::detail::Dir::kRead);
+    auto waiter = cio::spawn(observe_ready_hint_after_await(desc, generation));
 
     bool parked = false;
     for (int attempt = 0; attempt < 8 && !parked; ++attempt) {
         co_await cio::yield();
-        parked = ReadyHintTestAccess::waiter_is_parked(
-            desc, cio::detail::Dir::kRead);
+        parked = ReadyHintTestAccess::waiter_is_parked(desc,
+                                                       cio::detail::Dir::kRead);
     }
     CIO_CHECK(parked);
     if (!parked) {
@@ -1085,13 +1183,12 @@ cio::Task<bool> run_ready_hint_completion_case(bool successful) {
 
     ReadyHintTestAccess::complete(
         desc, cio::detail::Dir::kRead,
-        successful ? cio::Error{}
-                   : cio::Error{cio::Errc::timed_out});
+        successful ? cio::Error{} : cio::Error{cio::Errc::timed_out});
 
     // One worker is running this coordinator, so unblock() has claimed and
     // queued the waiter but cannot resume it until this coroutine suspends.
-    const bool claimed = ReadyHintTestAccess::slot_is_empty(
-        desc, cio::detail::Dir::kRead);
+    const bool claimed =
+        ReadyHintTestAccess::slot_is_empty(desc, cio::detail::Dir::kRead);
     const bool resume_is_pending = !waiter.done();
     CIO_CHECK(claimed);
     CIO_CHECK(resume_is_pending);
@@ -1099,42 +1196,38 @@ cio::Task<bool> run_ready_hint_completion_case(bool successful) {
     // Model the late false writer that used to overwrite the reactor's eager
     // true publication. A successful await_resume() must be the final
     // readiness observer; an error completion must not pretend to be ready.
-    ReadyHintTestAccess::overwrite_not_ready(
-        desc, cio::detail::Dir::kRead);
+    ReadyHintTestAccess::overwrite_not_ready(desc, cio::detail::Dir::kRead);
     const bool false_before_resume =
-        !ReadyHintTestAccess::may_be_ready(
-            desc, cio::detail::Dir::kRead);
+        !ReadyHintTestAccess::may_be_ready(desc, cio::detail::Dir::kRead);
     CIO_CHECK(false_before_resume);
 
     const ReadyHintAwaitObservation observation = co_await waiter;
     const bool result_matches =
-        successful
-            ? !observation.error
-            : observation.error.is(cio::Errc::timed_out);
-    const bool hint_matches =
-        observation.hint_on_resume == successful;
+        successful ? !observation.error
+                   : observation.error.is(cio::Errc::timed_out);
+    const bool hint_matches = observation.hint_on_resume == successful;
 
     stream.close();
     ::close(fds[1]);
 
     CIO_CHECK(result_matches);
     CIO_CHECK(hint_matches);
-    co_return claimed && resume_is_pending && false_before_resume &&
-              result_matches && hint_matches;
+    co_return claimed&& resume_is_pending&& false_before_resume&& result_matches&&
+        hint_matches;
 }
 
 void test_successful_io_awaiter_restores_ready_hint_after_claim() {
     cio::RuntimeOptions options;
     options.worker_threads = 1;
-    CIO_CHECK(cio::run(
-        run_ready_hint_completion_case(/*successful=*/true), options));
+    CIO_CHECK(
+        cio::run(run_ready_hint_completion_case(/*successful=*/true), options));
 }
 
 void test_failed_io_awaiter_does_not_restore_ready_hint() {
     cio::RuntimeOptions options;
     options.worker_threads = 1;
-    CIO_CHECK(cio::run(
-        run_ready_hint_completion_case(/*successful=*/false), options));
+    CIO_CHECK(cio::run(run_ready_hint_completion_case(/*successful=*/false),
+                       options));
 }
 
 void test_fd_use_guard_delays_physical_close() {
@@ -1163,8 +1256,8 @@ void test_fd_use_guard_delays_physical_close() {
         bool fd_stayed_open = false;
         bool original_data_read = false;
         {
-            cio::detail::FdUseGuard guard{
-                desc, cio::detail::Dir::kRead, generation};
+            cio::detail::FdUseGuard guard{desc, cio::detail::Dir::kRead,
+                                          generation};
             CIO_CHECK(static_cast<bool>(guard));
             if (!guard) {
                 ::close(fds[1]);
@@ -1172,9 +1265,7 @@ void test_fd_use_guard_delays_physical_close() {
             }
 
             const char payload = 'G';
-            CIO_CHECK_EQ(
-                ::send(fds[1], &payload, 1, MSG_NOSIGNAL),
-                ssize_t{1});
+            CIO_CHECK_EQ(::send(fds[1], &payload, 1, MSG_NOSIGNAL), ssize_t{1});
 
             closer = std::thread([&] {
                 stream.close();
@@ -1186,8 +1277,7 @@ void test_fd_use_guard_delays_physical_close() {
                    cio::Clock::now() < deadline) {
                 std::this_thread::yield();
             }
-            closing_published =
-                desc->closing.load(std::memory_order_acquire);
+            closing_published = desc->closing.load(std::memory_order_acquire);
 
             // Once closing is visible, detach is forbidden to hold the
             // lifecycle lock while waiting: this guard must still be able to
@@ -1196,12 +1286,10 @@ void test_fd_use_guard_delays_physical_close() {
             fd_stayed_open = ::fcntl(guard.fd(), F_GETFD) >= 0;
             char received = '\0';
             original_data_read =
-                ::recv(guard.fd(), &received, 1, 0) == 1 &&
-                received == payload;
+                ::recv(guard.fd(), &received, 1, 0) == 1 && received == payload;
 
             std::this_thread::sleep_for(2ms);
-            close_waited =
-                !close_returned.load(std::memory_order_acquire);
+            close_waited = !close_returned.load(std::memory_order_acquire);
         }
 
         if (closer.joinable()) closer.join();
@@ -1218,9 +1306,8 @@ void test_fd_use_guard_delays_physical_close() {
         CIO_CHECK(original_data_read);
         CIO_CHECK(close_completed);
         CIO_CHECK(physically_closed);
-        co_return closing_published && close_waited && fd_stayed_open &&
-                  original_data_read && close_completed &&
-                  physically_closed;
+        co_return closing_published&& close_waited&& fd_stayed_open&& original_data_read&& close_completed&&
+            physically_closed;
     };
 
     cio::RuntimeOptions options;
@@ -1244,22 +1331,19 @@ void test_readiness_then_close_cannot_read_reused_fd() {
 
         cio::detail::IoDesc* const desc = stream.descriptor();
         const int original_fd = stream.native_handle();
-        auto reader = cio::spawn(
-            [](InspectableTcpConn* socket)
-                -> cio::Task<cio::Result<std::size_t>> {
-                std::byte byte{};
-                co_return co_await socket->read(
-                    std::span<std::byte>{&byte, 1});
-            }(&stream));
+        auto reader = cio::spawn([](InspectableTcpConn* socket)
+                                     -> cio::Task<cio::Result<std::size_t>> {
+            std::byte byte{};
+            co_return co_await socket->read(std::span<std::byte>{&byte, 1});
+        }(&stream));
 
         // Let the read prove EAGAIN and publish its IoWait.
         bool parked = false;
         for (int attempt = 0; attempt < 8 && !parked; ++attempt) {
             co_await cio::yield();
             void* const slot =
-                desc->slot[static_cast<unsigned>(
-                               cio::detail::Dir::kRead)]
-                    .load(std::memory_order_acquire);
+                desc->slot[static_cast<unsigned>(cio::detail::Dir::kRead)].load(
+                    std::memory_order_acquire);
             parked = slot != nullptr && slot != cio::detail::kIoReady;
         }
         CIO_CHECK(parked);
@@ -1274,11 +1358,9 @@ void test_readiness_then_close_cannot_read_reused_fd() {
         // waiter out of its readiness slot without yielding the worker. The
         // continuation is now runnable but has not reached its next syscall.
         const char old_payload = 'O';
-        CIO_CHECK_EQ(
-            ::send(original[1], &old_payload, 1, MSG_NOSIGNAL),
-            ssize_t{1});
-        desc->owner->unblock(desc, cio::detail::Dir::kRead,
-                             cio::Error{});
+        CIO_CHECK_EQ(::send(original[1], &old_payload, 1, MSG_NOSIGNAL),
+                     ssize_t{1});
+        desc->owner->unblock(desc, cio::detail::Dir::kRead, cio::Error{});
 
         stream.close();
         errno = 0;
@@ -1287,8 +1369,8 @@ void test_readiness_then_close_cannot_read_reused_fd() {
 
         int reused_fd = -1;
         int replacement_peer = -1;
-        const bool reused = force_socket_pair_fd_reuse(
-            original_fd, reused_fd, replacement_peer);
+        const bool reused = force_socket_pair_fd_reuse(original_fd, reused_fd,
+                                                       replacement_peer);
         CIO_CHECK(reused);
         if (!reused) {
             (void)co_await reader;
@@ -1301,8 +1383,7 @@ void test_readiness_then_close_cannot_read_reused_fd() {
             ::send(replacement_peer, &new_payload, 1, MSG_NOSIGNAL) == 1;
 
         auto read = co_await reader;
-        const bool read_closed =
-            !read && read.error().is(cio::Errc::closed);
+        const bool read_closed = !read && read.error().is(cio::Errc::closed);
 
         char still_buffered = '\0';
         const bool new_data_untouched =
@@ -1318,8 +1399,8 @@ void test_readiness_then_close_cannot_read_reused_fd() {
         CIO_CHECK(new_data_sent);
         CIO_CHECK(read_closed);
         CIO_CHECK(new_data_untouched);
-        co_return old_fd_closed && reused_fd == original_fd &&
-                  new_data_sent && read_closed && new_data_untouched;
+        co_return old_fd_closed&& reused_fd ==
+            original_fd&& new_data_sent&& read_closed&& new_data_untouched;
     };
 
     cio::RuntimeOptions options;
@@ -1337,13 +1418,12 @@ cio::Task<BusyIoObservation> receive_during_runnext_chain(
     std::atomic<bool>* done) {
     std::byte byte{};
     net::SocketAddr from;
-    auto received = co_await receiver->read_from(
-        std::span<std::byte>{&byte, 1}, from);
+    auto received =
+        co_await receiver->read_from(std::span<std::byte>{&byte, 1}, from);
 
     BusyIoObservation observation;
     observation.received =
-        received.has_value() && *received == 1 &&
-        byte == std::byte{'I'};
+        received.has_value() && *received == 1 && byte == std::byte{'I'};
     observation.resumed_at_ns = cio::now_ns();
     done->store(true, std::memory_order_release);
     left.close();
@@ -1389,22 +1469,19 @@ void test_busy_runnext_chain_services_udp_with_wall_time_bound() {
         std::atomic<bool> send_ok{false};
         std::atomic<bool> watchdog_fired{false};
 
-        auto read = cio::spawn(receive_during_runnext_chain(
-            &receiver, left, right, &io_done));
+        auto read = cio::spawn(
+            receive_during_runnext_chain(&receiver, left, right, &io_done));
 
         // Receiver must be on the netpoll list before the hot runnable chain
         // starts, otherwise the first recv could simply consume queued data.
         bool receiver_parked = false;
         cio::detail::IoDesc* const desc = receiver.descriptor();
-        for (int attempt = 0;
-             attempt < 8 && !receiver_parked; ++attempt) {
+        for (int attempt = 0; attempt < 8 && !receiver_parked; ++attempt) {
             co_await cio::yield();
             void* const slot =
-                desc->slot[static_cast<unsigned>(
-                               cio::detail::Dir::kRead)]
-                    .load(std::memory_order_acquire);
-            receiver_parked =
-                slot != nullptr && slot != cio::detail::kIoReady;
+                desc->slot[static_cast<unsigned>(cio::detail::Dir::kRead)].load(
+                    std::memory_order_acquire);
+            receiver_parked = slot != nullptr && slot != cio::detail::kIoReady;
         }
         CIO_CHECK(receiver_parked);
         if (!receiver_parked) {
@@ -1418,41 +1495,32 @@ void test_busy_runnext_chain_services_udp_with_wall_time_bound() {
         (void)desc->owner->take_owner_poll_request_ns();
 
         std::thread sender([&, target = *target] {
-            const auto warmup_deadline =
-                cio::Clock::now() + 1s;
-            while (handoffs.load(std::memory_order_acquire) <
-                       kWarmupHandoffs &&
+            const auto warmup_deadline = cio::Clock::now() + 1s;
+            while (handoffs.load(std::memory_order_acquire) < kWarmupHandoffs &&
                    cio::Clock::now() < warmup_deadline) {
                 std::this_thread::yield();
             }
 
             const int fd = ::socket(
-                target.family(),
-                SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+                target.family(), SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
             if (fd >= 0 &&
-                handoffs.load(std::memory_order_acquire) >=
-                    kWarmupHandoffs) {
+                handoffs.load(std::memory_order_acquire) >= kWarmupHandoffs) {
                 const char payload = 'I';
-                const std::int64_t send_started_ns =
-                    cio::now_ns();
-                const bool sent =
-                    ::sendto(fd, &payload, 1, MSG_NOSIGNAL,
-                             target.raw(), target.length()) == 1;
-                sent_at_ns.store(
-                    send_started_ns, std::memory_order_release);
+                const std::int64_t send_started_ns = cio::now_ns();
+                const bool sent = ::sendto(fd, &payload, 1, MSG_NOSIGNAL,
+                                           target.raw(), target.length()) == 1;
+                sent_at_ns.store(send_started_ns, std::memory_order_release);
                 send_ok.store(sent, std::memory_order_release);
             }
             if (fd >= 0) ::close(fd);
 
-            const auto completion_deadline =
-                cio::Clock::now() + 500ms;
+            const auto completion_deadline = cio::Clock::now() + 500ms;
             while (!io_done.load(std::memory_order_acquire) &&
                    cio::Clock::now() < completion_deadline) {
                 std::this_thread::yield();
             }
             if (!io_done.load(std::memory_order_acquire)) {
-                watchdog_fired.store(true,
-                                     std::memory_order_release);
+                watchdog_fired.store(true, std::memory_order_release);
                 receiver.close();
             }
         });
@@ -1466,21 +1534,18 @@ void test_busy_runnext_chain_services_udp_with_wall_time_bound() {
         co_await chain.join();
         sender.join();
 
-        const std::int64_t sent_ns =
-            sent_at_ns.load(std::memory_order_acquire);
+        const std::int64_t sent_ns = sent_at_ns.load(std::memory_order_acquire);
         const bool bounded =
             sent_ns != std::numeric_limits<std::int64_t>::max() &&
             (observation.resumed_at_ns <= sent_ns ||
-             observation.resumed_at_ns - sent_ns <
-                 kWallTimeBoundNs);
+             observation.resumed_at_ns - sent_ns < kWallTimeBoundNs);
         CIO_CHECK(send_ok.load(std::memory_order_acquire));
         CIO_CHECK(observation.received);
         CIO_CHECK(!watchdog_fired.load(std::memory_order_acquire));
         CIO_CHECK(bounded);
         co_return send_ok.load(std::memory_order_acquire) &&
-                  observation.received &&
-                  !watchdog_fired.load(std::memory_order_acquire) &&
-                  bounded;
+            observation.received &&
+            !watchdog_fired.load(std::memory_order_acquire) && bounded;
     };
 
     cio::RuntimeOptions options;
@@ -1495,34 +1560,33 @@ struct MonitorCompletionState {
         cio::detail::kInvalidWorkerId};
 };
 
-cio::Task<> read_udp_on_worker(
-    InspectableUdpConn* receiver, cio::detail::Scheduler* scheduler,
-    cio::detail::WorkerId worker, bool expect_timeout,
-    MonitorCompletionState* state) {
+cio::Task<> read_udp_on_worker(InspectableUdpConn* receiver,
+                               cio::detail::Scheduler* scheduler,
+                               cio::detail::WorkerId worker,
+                               bool expect_timeout,
+                               MonitorCompletionState* state) {
     co_await SwitchToWorker{scheduler, worker};
 
     std::byte byte{};
     net::SocketAddr from;
-    auto received = co_await receiver->read_from(
-        std::span<std::byte>{&byte, 1}, from);
+    auto received =
+        co_await receiver->read_from(std::span<std::byte>{&byte, 1}, from);
 
-    const bool ok =
-        expect_timeout
-            ? (!received &&
-               received.error().is(cio::Errc::timed_out))
-            : (received.has_value() && *received == 1 &&
-               byte == std::byte{'M'});
-    state->resumed_on.store(
-        cio::detail::current_worker_id(scheduler),
-        std::memory_order_release);
+    const bool ok = expect_timeout ? (!received &&
+                                      received.error().is(cio::Errc::timed_out))
+                                   : (received.has_value() && *received == 1 &&
+                                      byte == std::byte{'M'});
+    state->resumed_on.store(cio::detail::current_worker_id(scheduler),
+                            std::memory_order_release);
     state->result_ok.store(ok, std::memory_order_release);
     state->done.store(true, std::memory_order_release);
 }
 
-cio::Task<> occupy_worker_without_suspending(
-    cio::detail::Scheduler* scheduler, cio::detail::WorkerId worker,
-    std::atomic<bool>* started, std::atomic<bool>* release,
-    std::atomic<bool>* finished) {
+cio::Task<> occupy_worker_without_suspending(cio::detail::Scheduler* scheduler,
+                                             cio::detail::WorkerId worker,
+                                             std::atomic<bool>* started,
+                                             std::atomic<bool>* release,
+                                             std::atomic<bool>* finished) {
     co_await SwitchToWorker{scheduler, worker};
     started->store(true, std::memory_order_release);
     while (!release->load(std::memory_order_acquire)) {
@@ -1536,8 +1600,8 @@ cio::Task<> occupy_worker_without_suspending(
 bool io_waiter_is_parked(const InspectableUdpConn& socket) {
     cio::detail::IoDesc* const desc = socket.descriptor();
     void* const slot =
-        desc->slot[static_cast<unsigned>(cio::detail::Dir::kRead)]
-            .load(std::memory_order_acquire);
+        desc->slot[static_cast<unsigned>(cio::detail::Dir::kRead)].load(
+            std::memory_order_acquire);
     return slot != nullptr && slot != cio::detail::kIoReady;
 }
 
@@ -1555,10 +1619,8 @@ void test_monitor_completions_escape_cpu_bound_owner() {
         co_return bind_inspectable_udp();
     };
 
-    auto ready_receiver_result =
-        runtime.block_on(bind_on_busy_worker());
-    auto timeout_receiver_result =
-        runtime.block_on(bind_on_busy_worker());
+    auto ready_receiver_result = runtime.block_on(bind_on_busy_worker());
+    auto timeout_receiver_result = runtime.block_on(bind_on_busy_worker());
     CIO_CHECK(ready_receiver_result.has_value());
     CIO_CHECK(timeout_receiver_result.has_value());
     if (!ready_receiver_result || !timeout_receiver_result) return;
@@ -1571,12 +1633,10 @@ void test_monitor_completions_escape_cpu_bound_owner() {
 
     MonitorCompletionState ready_state;
     MonitorCompletionState timeout_state;
-    runtime.go(read_udp_on_worker(
-        &ready_receiver, scheduler, kBusyWorker,
-        /*expect_timeout=*/false, &ready_state));
-    runtime.go(read_udp_on_worker(
-        &timeout_receiver, scheduler, kBusyWorker,
-        /*expect_timeout=*/true, &timeout_state));
+    runtime.go(read_udp_on_worker(&ready_receiver, scheduler, kBusyWorker,
+                                  /*expect_timeout=*/false, &ready_state));
+    runtime.go(read_udp_on_worker(&timeout_receiver, scheduler, kBusyWorker,
+                                  /*expect_timeout=*/true, &timeout_state));
 
     const auto park_deadline = cio::Clock::now() + 1s;
     while ((!io_waiter_is_parked(ready_receiver) ||
@@ -1584,17 +1644,15 @@ void test_monitor_completions_escape_cpu_bound_owner() {
            cio::Clock::now() < park_deadline) {
         std::this_thread::yield();
     }
-    const bool both_parked =
-        io_waiter_is_parked(ready_receiver) &&
-        io_waiter_is_parked(timeout_receiver);
+    const bool both_parked = io_waiter_is_parked(ready_receiver) &&
+                             io_waiter_is_parked(timeout_receiver);
     CIO_CHECK(both_parked);
 
     std::atomic<bool> hog_started{false};
     std::atomic<bool> release_hog{false};
     std::atomic<bool> hog_finished{false};
     runtime.go(occupy_worker_without_suspending(
-        scheduler, kBusyWorker, &hog_started, &release_hog,
-        &hog_finished));
+        scheduler, kBusyWorker, &hog_started, &release_hog, &hog_finished));
 
     const auto start_deadline = cio::Clock::now() + 1s;
     while (!hog_started.load(std::memory_order_acquire) &&
@@ -1605,16 +1663,13 @@ void test_monitor_completions_escape_cpu_bound_owner() {
 
     int sender = -1;
     bool sent = false;
-    if (both_parked &&
-        hog_started.load(std::memory_order_acquire)) {
+    if (both_parked && hog_started.load(std::memory_order_acquire)) {
         sender = ::socket(target->family(),
-                          SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
-                          0);
+                          SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
         if (sender >= 0) {
             const char payload = 'M';
-            sent =
-                ::sendto(sender, &payload, 1, MSG_NOSIGNAL,
-                         target->raw(), target->length()) == 1;
+            sent = ::sendto(sender, &payload, 1, MSG_NOSIGNAL, target->raw(),
+                            target->length()) == 1;
         }
         timeout_receiver.set_read_deadline(cio::Clock::now());
     }
@@ -1657,12 +1712,10 @@ void test_monitor_completions_escape_cpu_bound_owner() {
     CIO_CHECK(completed_while_owner_busy);
     CIO_CHECK(ready_state.result_ok.load(std::memory_order_acquire));
     CIO_CHECK(timeout_state.result_ok.load(std::memory_order_acquire));
-    CIO_CHECK_EQ(
-        ready_state.resumed_on.load(std::memory_order_acquire),
-        cio::detail::WorkerId{1});
-    CIO_CHECK_EQ(
-        timeout_state.resumed_on.load(std::memory_order_acquire),
-        cio::detail::WorkerId{1});
+    CIO_CHECK_EQ(ready_state.resumed_on.load(std::memory_order_acquire),
+                 cio::detail::WorkerId{1});
+    CIO_CHECK_EQ(timeout_state.resumed_on.load(std::memory_order_acquire),
+                 cio::detail::WorkerId{1});
 }
 
 void test_udp_round_trip() {
@@ -1690,7 +1743,8 @@ void test_udp_round_trip() {
         auto n = co_await client->read_from(buffer, from);
         CIO_CHECK(n.has_value());
         co_await echo;
-        co_return std::string(reinterpret_cast<const char*>(buffer), n.value_or(0));
+        co_return std::string(reinterpret_cast<const char*>(buffer),
+                              n.value_or(0));
     };
     CIO_CHECK_EQ(cio::run(body()), std::string("udp hello"));
 }
@@ -1709,7 +1763,8 @@ cio::Task<> open_cross_runtime_send_gate(std::atomic<bool>* gate) {
     gate->store(true, std::memory_order_release);
 }
 
-cio::Task<bool> send_after_gate(std::atomic<bool>* gate, net::SocketAddr target) {
+cio::Task<bool> send_after_gate(std::atomic<bool>* gate,
+                                net::SocketAddr target) {
     while (!gate->load(std::memory_order_acquire)) co_await cio::yield();
 
     // Leave B ample time to return from the gate task to a blocking epoll wait.
@@ -1759,9 +1814,8 @@ cio::Task<CrossRuntimeReadObservation> read_a_socket_on_b(
 
     CrossRuntimeReadObservation observation;
     observation.read_ok = received.has_value();
-    observation.payload_ok =
-        received.has_value() && *received == 4 &&
-        std::memcmp(buffer, "wake", 4) == 0;
+    observation.payload_ok = received.has_value() && *received == 4 &&
+                             std::memcmp(buffer, "wake", 4) == 0;
     observation.watchdog_fired = watchdog_fired;
     observation.elapsed = elapsed;
     co_return observation;
@@ -1796,8 +1850,8 @@ void test_foreign_reactor_readiness_wakes_awaiting_runtime() {
     std::atomic<bool> read_done{false};
     auto sender = runtime_a.spawn(send_after_gate(&send_gate, *target));
 
-    const auto observation =
-        runtime_b.block_on(read_a_socket_on_b(&receiver, &send_gate, &read_done));
+    const auto observation = runtime_b.block_on(
+        read_a_socket_on_b(&receiver, &send_gate, &read_done));
     const bool sender_ok =
         runtime_a.block_on(join_sender_and_close(std::move(sender), &receiver));
 
@@ -1809,15 +1863,13 @@ void test_foreign_reactor_readiness_wakes_awaiting_runtime() {
 }
 
 cio::Task<net::TcpListener> return_open_listener() {
-    auto listener =
-        net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+    auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
     CIO_CHECK(listener.has_value());
     co_return std::move(listener).value();
 }
 
 void test_socket_returned_from_run_keeps_reactor_alive() {
-    net::TcpListener listener =
-        cio::run(return_open_listener());
+    net::TcpListener listener = cio::run(return_open_listener());
     CIO_CHECK(listener.valid());
 
     // The Runtime created by the first run() is already stopped, but the open
@@ -1851,8 +1903,8 @@ void test_readiness_ignores_destroyed_target_runtime() {
     if (fds[0] < 0 || fds[1] < 0) return;
 
     InspectableTcpConn stream;
-    const bool adopted = source.block_on(
-        [&stream, fd = fds[0]]() -> cio::Task<bool> {
+    const bool adopted =
+        source.block_on([&stream, fd = fds[0]]() -> cio::Task<bool> {
             co_return stream.adopt_for_test(fd).has_value();
         }());
     CIO_CHECK(adopted);
@@ -1866,8 +1918,7 @@ void test_readiness_ignores_destroyed_target_runtime() {
     waiter.handle = std::noop_coroutine();
     {
         cio::Runtime target(options);
-        waiter.sched =
-            target.scheduler().completion_target();
+        waiter.sched = target.scheduler().completion_target();
         waiter.preferred_worker = 0;
     }
     CIO_CHECK(!waiter.sched.lock());
@@ -1877,33 +1928,27 @@ void test_readiness_ignores_destroyed_target_runtime() {
     // exists. The stable completion endpoint must make this a safe no-op.
     desc->dir_slot(cio::detail::Dir::kRead)
         .store(&waiter, std::memory_order_release);
-    ReadyHintTestAccess::complete(
-        desc, cio::detail::Dir::kRead, cio::Error{});
-    CIO_CHECK(ReadyHintTestAccess::slot_is_empty(
-        desc, cio::detail::Dir::kRead));
+    ReadyHintTestAccess::complete(desc, cio::detail::Dir::kRead, cio::Error{});
+    CIO_CHECK(
+        ReadyHintTestAccess::slot_is_empty(desc, cio::detail::Dir::kRead));
 
     stream.close();
     ::close(fds[1]);
 }
 
-cio::Task<> read_until_closed_while_source_stops(
-    InspectableTcpConn* stream,
-    std::atomic<bool>* entered,
-    std::atomic<bool>* resumed,
-    std::atomic<int>* error) {
+cio::Task<> read_until_closed_while_source_stops(InspectableTcpConn* stream,
+                                                 std::atomic<bool>* entered,
+                                                 std::atomic<bool>* resumed,
+                                                 std::atomic<int>* error) {
     entered->store(true, std::memory_order_release);
     std::byte byte;
-    auto result = co_await stream->read(
-        std::span<std::byte>{&byte, 1});
-    error->store(
-        result ? 0 : result.error().raw(),
-        std::memory_order_release);
+    auto result = co_await stream->read(std::span<std::byte>{&byte, 1});
+    error->store(result ? 0 : result.error().raw(), std::memory_order_release);
     resumed->store(true, std::memory_order_release);
 }
 
-cio::Task<> occupy_net_worker(
-    std::atomic<bool>* entered,
-    std::atomic<bool>* release) {
+cio::Task<> occupy_net_worker(std::atomic<bool>* entered,
+                              std::atomic<bool>* release) {
     entered->store(true, std::memory_order_release);
     while (!release->load(std::memory_order_acquire)) {
         std::this_thread::yield();
@@ -1914,8 +1959,7 @@ cio::Task<> occupy_net_worker(
 void test_parked_io_retains_source_reactor_after_socket_replacement() {
     cio::RuntimeOptions options;
     options.worker_threads = 1;
-    auto source =
-        std::make_unique<cio::Runtime>(options);
+    auto source = std::make_unique<cio::Runtime>(options);
     cio::Runtime target(options);
 
     int fds[2] = {-1, -1};
@@ -1923,8 +1967,8 @@ void test_parked_io_retains_source_reactor_after_socket_replacement() {
     if (fds[0] < 0 || fds[1] < 0) return;
 
     InspectableTcpConn stream;
-    const bool adopted = source->block_on(
-        [&stream, fd = fds[0]]() -> cio::Task<bool> {
+    const bool adopted =
+        source->block_on([&stream, fd = fds[0]]() -> cio::Task<bool> {
             co_return stream.adopt_for_test(fd).has_value();
         }());
     CIO_CHECK(adopted);
@@ -1936,19 +1980,18 @@ void test_parked_io_retains_source_reactor_after_socket_replacement() {
     std::atomic<bool> read_entered{false};
     std::atomic<bool> read_resumed{false};
     std::atomic<int> read_error{0};
-    target.go(read_until_closed_while_source_stops(
-        &stream, &read_entered, &read_resumed, &read_error));
+    target.go(read_until_closed_while_source_stops(&stream, &read_entered,
+                                                   &read_resumed, &read_error));
 
     const auto park_deadline = cio::Clock::now() + 1s;
     while ((!read_entered.load(std::memory_order_acquire) ||
-            !ReadyHintTestAccess::waiter_is_parked(
-                stream.descriptor(), cio::detail::Dir::kRead)) &&
+            !ReadyHintTestAccess::waiter_is_parked(stream.descriptor(),
+                                                   cio::detail::Dir::kRead)) &&
            cio::Clock::now() < park_deadline) {
         std::this_thread::yield();
     }
-    const bool parked =
-        ReadyHintTestAccess::waiter_is_parked(
-            stream.descriptor(), cio::detail::Dir::kRead);
+    const bool parked = ReadyHintTestAccess::waiter_is_parked(
+        stream.descriptor(), cio::detail::Dir::kRead);
     CIO_CHECK(parked);
     if (!parked) {
         stream.close();
@@ -1964,8 +2007,7 @@ void test_parked_io_retains_source_reactor_after_socket_replacement() {
 
     std::atomic<bool> hog_entered{false};
     std::atomic<bool> release_hog{false};
-    target.go(occupy_net_worker(
-        &hog_entered, &release_hog));
+    target.go(occupy_net_worker(&hog_entered, &release_hog));
     const auto hog_deadline = cio::Clock::now() + 1s;
     while (!hog_entered.load(std::memory_order_acquire) &&
            cio::Clock::now() < hog_deadline) {
@@ -1975,8 +2017,8 @@ void test_parked_io_retains_source_reactor_after_socket_replacement() {
 
     // close() removes the IoWait and queues it on target, but the CPU hog keeps
     // it from running. Replacing the still-live Socket then drops its source
-    // lifetime reference. IoAwaiter must independently retain the Reactor
-    // until its destructor releases the descriptor reference.
+    // lifetime reference. The parked readiness awaiter and its complete
+    // operation owner must retain the Reactor until both have unwound.
     stream.close();
     stream = InspectableTcpConn{};
     CIO_CHECK(!read_resumed.load(std::memory_order_acquire));
@@ -1988,21 +2030,16 @@ void test_parked_io_retains_source_reactor_after_socket_replacement() {
         std::this_thread::yield();
     }
     CIO_CHECK(read_resumed.load(std::memory_order_acquire));
-    CIO_CHECK_EQ(
-        read_error.load(std::memory_order_acquire),
-        static_cast<int>(cio::Errc::closed));
+    CIO_CHECK_EQ(read_error.load(std::memory_order_acquire),
+                 static_cast<int>(cio::Errc::closed));
     ::close(fds[1]);
 }
 
 cio::Task<> close_after_successful_read_checkpoint(
-    InspectableTcpConn* stream,
-    cio::detail::IoDesc* desc,
-    std::atomic<bool>* lease_was_released,
-    std::atomic<bool>* closed) {
+    InspectableTcpConn* stream, cio::detail::IoDesc* desc,
+    std::atomic<bool>* lease_was_released, std::atomic<bool>* closed) {
     lease_was_released->store(
-        !desc->syscall_active[
-             static_cast<unsigned>(
-                 cio::detail::Dir::kRead)]
+        !desc->syscall_active[static_cast<unsigned>(cio::detail::Dir::kRead)]
              .load(std::memory_order_acquire),
         std::memory_order_release);
     stream->close();
@@ -2011,42 +2048,32 @@ cio::Task<> close_after_successful_read_checkpoint(
 }
 
 cio::Task<bool> successful_read_checkpoint_body(
-    int fd,
-    std::atomic<bool>* lease_was_released,
-    std::atomic<bool>* closed) {
+    int fd, std::atomic<bool>* lease_was_released, std::atomic<bool>* closed) {
     InspectableTcpConn stream;
-    auto adopted =
-        stream.adopt_for_test(fd);
+    auto adopted = stream.adopt_for_test(fd);
     if (!adopted) co_return false;
-    cio::detail::IoDesc* const desc =
-        stream.descriptor();
+    cio::detail::IoDesc* const desc = stream.descriptor();
     (void)desc->owner->take_owner_poll_request_ns();
 
     std::byte byte{};
-    for (std::uint32_t i = 0;
-         i <= cio::detail::kCooperativeIoBudget; ++i) {
+    for (std::uint32_t i = 0; i <= cio::detail::kCooperativeIoBudget; ++i) {
         if (i == cio::detail::kCooperativeIoBudget) {
-            auto observer =
-                close_after_successful_read_checkpoint(
-                    &stream, desc, lease_was_released, closed);
+            auto observer = close_after_successful_read_checkpoint(
+                &stream, desc, lease_was_released, closed);
             auto handle = observer.release();
             handle.promise().detached = true;
-            auto* const scheduler =
-                cio::detail::current_scheduler();
+            auto* const scheduler = cio::detail::current_scheduler();
             if (scheduler == nullptr) co_return false;
-            cio::detail::SchedulerTestAccess::push_global(
-                *scheduler, handle.address());
+            cio::detail::SchedulerTestAccess::push_global(*scheduler,
+                                                          handle.address());
         }
 
-        auto read = co_await stream.read(
-            std::span<std::byte>{&byte, 1});
+        auto read = co_await stream.read(std::span<std::byte>{&byte, 1});
         if (!read || *read != 1) co_return false;
     }
 
-    co_return
-        lease_was_released->load(std::memory_order_acquire) &&
-        closed->load(std::memory_order_acquire) &&
-        !stream.valid();
+    co_return lease_was_released->load(std::memory_order_acquire) &&
+        closed->load(std::memory_order_acquire) && !stream.valid();
 }
 
 void test_successful_io_checkpoint_releases_fd_lease_before_yield() {
@@ -2054,20 +2081,17 @@ void test_successful_io_checkpoint_releases_fd_lease_before_yield() {
     CIO_CHECK(open_nonblocking_socket_pair(fds));
     if (fds[0] < 0 || fds[1] < 0) return;
 
-    char payload[
-        cio::detail::kCooperativeIoBudget + 1];
+    char payload[cio::detail::kCooperativeIoBudget + 1];
     std::memset(payload, 'R', sizeof(payload));
-    CIO_CHECK_EQ(
-        ::send(fds[1], payload, sizeof(payload), MSG_NOSIGNAL),
-        static_cast<ssize_t>(sizeof(payload)));
+    CIO_CHECK_EQ(::send(fds[1], payload, sizeof(payload), MSG_NOSIGNAL),
+                 static_cast<ssize_t>(sizeof(payload)));
 
     std::atomic<bool> lease_was_released{false};
     std::atomic<bool> closed{false};
     cio::RuntimeOptions options;
     options.worker_threads = 1;
     const bool ok = cio::run(
-        successful_read_checkpoint_body(
-            fds[0], &lease_was_released, &closed),
+        successful_read_checkpoint_body(fds[0], &lease_was_released, &closed),
         options);
     CIO_CHECK(ok);
     CIO_CHECK(lease_was_released.load(std::memory_order_acquire));
@@ -2076,86 +2100,60 @@ void test_successful_io_checkpoint_releases_fd_lease_before_yield() {
 }
 
 cio::Task<> hold_checkpoint_owner_until_parent_escapes(
-    std::atomic<bool>* parent_resumed,
-    std::atomic<bool>* parent_escaped,
+    std::atomic<bool>* parent_resumed, std::atomic<bool>* parent_escaped,
     std::atomic<bool>* done) {
-    const auto deadline =
-        cio::Clock::now() + 1s;
-    while (!parent_resumed->load(
-               std::memory_order_acquire) &&
+    const auto deadline = cio::Clock::now() + 1s;
+    while (!parent_resumed->load(std::memory_order_acquire) &&
            cio::Clock::now() < deadline) {
         // Intentionally non-suspending. The cooperative checkpoint must
         // publish its parent so the other worker can steal it.
-        std::atomic_signal_fence(
-            std::memory_order_seq_cst);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
     }
-    parent_escaped->store(
-        parent_resumed->load(
-            std::memory_order_acquire),
-        std::memory_order_release);
+    parent_escaped->store(parent_resumed->load(std::memory_order_acquire),
+                          std::memory_order_release);
     done->store(true, std::memory_order_release);
     co_return;
 }
 
-cio::Task<bool>
-successful_read_checkpoint_publication_body(
-    int fd, int cycles) {
+cio::Task<bool> successful_read_checkpoint_publication_body(int fd,
+                                                            int cycles) {
     InspectableTcpConn stream;
     auto adopted = stream.adopt_for_test(fd);
     if (!adopted) co_return false;
 
-    auto* const scheduler =
-        cio::detail::current_scheduler();
+    auto* const scheduler = cio::detail::current_scheduler();
     if (scheduler == nullptr) co_return false;
 
     std::byte byte{};
-    for (int cycle = 0; cycle < cycles;
-         ++cycle) {
+    for (int cycle = 0; cycle < cycles; ++cycle) {
         std::atomic<bool> parent_resumed{false};
         std::atomic<bool> parent_escaped{false};
         std::atomic<bool> observer_done{false};
-        for (std::uint32_t i = 0;
-             i <=
-             cio::detail::kCooperativeIoBudget;
-             ++i) {
-            if (i ==
-                cio::detail::
-                    kCooperativeIoBudget) {
-                auto observer =
-                    hold_checkpoint_owner_until_parent_escapes(
-                        &parent_resumed,
-                        &parent_escaped,
-                        &observer_done);
+        for (std::uint32_t i = 0; i <= cio::detail::kCooperativeIoBudget; ++i) {
+            if (i == cio::detail::kCooperativeIoBudget) {
+                auto observer = hold_checkpoint_owner_until_parent_escapes(
+                    &parent_resumed, &parent_escaped, &observer_done);
                 auto handle = observer.release();
                 handle.promise().detached = true;
-                cio::detail::SchedulerTestAccess::
-                    push_global(
-                        *scheduler,
-                        handle.address());
+                cio::detail::SchedulerTestAccess::push_global(*scheduler,
+                                                              handle.address());
             }
 
-            auto read = co_await stream.read(
-                std::span<std::byte>{
-                    &byte, 1});
+            auto read = co_await stream.read(std::span<std::byte>{&byte, 1});
             if (!read || *read != 1) {
                 co_return false;
             }
         }
 
-        parent_resumed.store(
-            true, std::memory_order_release);
+        parent_resumed.store(true, std::memory_order_release);
 
-        const auto deadline =
-            cio::Clock::now() + 1s;
-        while (!observer_done.load(
-                   std::memory_order_acquire) &&
+        const auto deadline = cio::Clock::now() + 1s;
+        while (!observer_done.load(std::memory_order_acquire) &&
                cio::Clock::now() < deadline) {
             co_await cio::yield();
         }
-        if (!observer_done.load(
-                std::memory_order_acquire) ||
-            !parent_escaped.load(
-                std::memory_order_acquire)) {
+        if (!observer_done.load(std::memory_order_acquire) ||
+            !parent_escaped.load(std::memory_order_acquire)) {
             co_return false;
         }
     }
@@ -2166,26 +2164,20 @@ successful_read_checkpoint_publication_body(
 void test_successful_io_checkpoint_publishes_parent_before_hog() {
     constexpr int kCycles = 16;
     constexpr std::size_t kBytes =
-        kCycles *
-        (cio::detail::kCooperativeIoBudget +
-         1);
+        kCycles * (cio::detail::kCooperativeIoBudget + 1);
 
     int fds[2] = {-1, -1};
     CIO_CHECK(open_nonblocking_socket_pair(fds));
     if (fds[0] < 0 || fds[1] < 0) return;
 
     std::vector<char> payload(kBytes, 'P');
-    CIO_CHECK_EQ(
-        ::send(fds[1], payload.data(),
-               payload.size(), MSG_NOSIGNAL),
-        static_cast<ssize_t>(payload.size()));
+    CIO_CHECK_EQ(::send(fds[1], payload.data(), payload.size(), MSG_NOSIGNAL),
+                 static_cast<ssize_t>(payload.size()));
 
     cio::RuntimeOptions options;
     options.worker_threads = 2;
     CIO_CHECK(cio::run(
-        successful_read_checkpoint_publication_body(
-            fds[0], kCycles),
-        options));
+        successful_read_checkpoint_publication_body(fds[0], kCycles), options));
     ::close(fds[1]);
 }
 
@@ -2276,16 +2268,18 @@ void test_cancelled_lookup_leaves_nothing_at_shutdown() {
             // free slot and succeed, which is a different path than this test
             // exists to cover.
             auto occupied = cio::make_chan<cio::Unit>(1);
-            auto hog = cio::spawn([](cio::Chan<cio::Unit> signal) -> cio::Task<> {
-                (void)co_await cio::detail::blocking_in_class(
-                    [signal]() -> cio::Result<int> {
-                        // Sent from the pool thread: the slot is now in use.
-                        (void)signal.try_send(cio::Unit{});
-                        std::this_thread::sleep_for(200ms);
-                        return 0;
-                    },
-                    cio::detail::BlockingClass::resolver);
-            }(occupied));
+            auto hog =
+                cio::spawn([](cio::Chan<cio::Unit> signal) -> cio::Task<> {
+                    (void)co_await cio::detail::blocking_in_class(
+                        [signal]() -> cio::Result<int> {
+                            // Sent from the pool thread: the slot is now in
+                            // use.
+                            (void)signal.try_send(cio::Unit{});
+                            std::this_thread::sleep_for(200ms);
+                            return 0;
+                        },
+                        cio::detail::BlockingClass::resolver);
+                }(occupied));
             co_await occupied.recv();
 
             cio::CancelSource stop;
@@ -2295,8 +2289,7 @@ void test_cancelled_lookup_leaves_nothing_at_shutdown() {
             net::Resolver resolver;
             resolver.prefer_builtin = false;
             auto queued = cio::spawn(
-                [](net::Resolver r, cio::CancelToken token)
-                    -> cio::Task<bool> {
+                [](net::Resolver r, cio::CancelToken token) -> cio::Task<bool> {
                     auto result =
                         co_await r.lookup_host("localhost", 80, token);
                     co_return !result.has_value();
@@ -2343,14 +2336,14 @@ void test_connect_cancellation_resumes_caller() {
             net::SocketAddr::parse("203.0.113.1", 9).value();
 
         cio::CancelSource stop;
-        auto canceller = cio::spawn([](cio::CancelSource source) -> cio::Task<> {
-            co_await cio::sleep(30ms);
-            source.cancel();
-        }(stop));
+        auto canceller =
+            cio::spawn([](cio::CancelSource source) -> cio::Task<> {
+                co_await cio::sleep(30ms);
+                source.cancel();
+            }(stop));
 
         const auto started = cio::Clock::now();
-        auto cancelled =
-            co_await net::TcpConn::dial(unreachable, stop.token());
+        auto cancelled = co_await net::TcpConn::dial(unreachable, stop.token());
         const auto elapsed = cio::Clock::now() - started;
         co_await canceller;
 
@@ -2381,7 +2374,8 @@ void test_connect_cancelled_before_start() {
 // its overall timeout when every address is silent.
 void test_dialer_connects_and_times_out() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        auto listener =
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->addr().value();
 
@@ -2416,7 +2410,8 @@ void test_dialer_connects_and_times_out() {
 // stagger rather than after the first address exhausts the kernel's retries.
 void test_dialer_races_past_a_silent_address() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        auto listener =
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->addr().value();
 
@@ -2471,16 +2466,18 @@ void test_dialer_joins_losing_attempts() {
 void test_dialer_cancellation() {
     auto body = []() -> cio::Task<bool> {
         cio::CancelSource stop;
-        auto canceller = cio::spawn([](cio::CancelSource source) -> cio::Task<> {
-            co_await cio::sleep(40ms);
-            source.cancel();
-        }(stop));
+        auto canceller =
+            cio::spawn([](cio::CancelSource source) -> cio::Task<> {
+                co_await cio::sleep(40ms);
+                source.cancel();
+            }(stop));
 
         net::Dialer dialer;
         dialer.fallback_delay = 30ms;
 
         const auto started = cio::Clock::now();
-        auto cancelled = co_await dialer.dial_tcp("203.0.113.1", 9, stop.token());
+        auto cancelled =
+            co_await dialer.dial_tcp("203.0.113.1", 9, stop.token());
         const auto elapsed = cio::Clock::now() - started;
         co_await canceller;
 
@@ -2502,14 +2499,15 @@ struct MemoryStream {
 
     cio::Task<cio::Result<std::size_t>> read(std::span<std::byte> buffer) {
         const std::size_t available = incoming.size() - read_cursor;
-        const std::size_t n =
-            std::min({buffer.size(), available, read_chunk});
-        for (std::size_t i = 0; i < n; ++i) buffer[i] = incoming[read_cursor + i];
+        const std::size_t n = std::min({buffer.size(), available, read_chunk});
+        for (std::size_t i = 0; i < n; ++i)
+            buffer[i] = incoming[read_cursor + i];
         read_cursor += n;
         co_return n;
     }
 
-    cio::Task<cio::Result<std::size_t>> write(std::span<const std::byte> buffer) {
+    cio::Task<cio::Result<std::size_t>> write(
+        std::span<const std::byte> buffer) {
         // The Writer contract: everything is accepted unless an error stops it.
         written.insert(written.end(), buffer.begin(), buffer.end());
         co_return buffer.size();
@@ -2519,7 +2517,8 @@ struct MemoryStream {
 // A writer that reports a short count without an error violates the io::Writer
 // contract, exactly as Go's io.Writer forbids it.
 struct ShortWriter {
-    cio::Task<cio::Result<std::size_t>> write(std::span<const std::byte> buffer) {
+    cio::Task<cio::Result<std::size_t>> write(
+        std::span<const std::byte> buffer) {
         co_return std::min(buffer.size(), std::size_t{2});
     }
 };
@@ -2536,14 +2535,17 @@ void test_stream_algorithms_over_short_io() {
         MemoryStream source;
         source.incoming.assign(
             reinterpret_cast<const std::byte*>(payload.data()),
-            reinterpret_cast<const std::byte*>(payload.data()) + payload.size());
+            reinterpret_cast<const std::byte*>(payload.data()) +
+                payload.size());
 
         // read_full must reassemble across one-byte reads.
         std::vector<std::byte> exact(9);
-        auto filled = co_await cio::io::read_full(source, std::span<std::byte>{exact});
+        auto filled =
+            co_await cio::io::read_full(source, std::span<std::byte>{exact});
         CIO_CHECK(filled.has_value());
-        CIO_CHECK_EQ(std::string(reinterpret_cast<const char*>(exact.data()), 9),
-                     std::string("the quick"));
+        CIO_CHECK_EQ(
+            std::string(reinterpret_cast<const char*>(exact.data()), 9),
+            std::string("the quick"));
 
         // copy drains the rest. Destination first, as io.Copy(dst, src) is.
         MemoryStream sink;
@@ -2568,7 +2570,8 @@ void test_stream_algorithms_over_short_io() {
         // io.Copy reports ErrShortWrite.
         MemoryStream more;
         more.incoming.assign(4, std::byte{'x'});
-        more.read_chunk = 4;  // hand copy a 4-byte chunk so the 2-byte writer shorts
+        more.read_chunk =
+            4;  // hand copy a 4-byte chunk so the 2-byte writer shorts
         ShortWriter bad;
         auto rejected = co_await cio::io::copy(bad, more);
         CIO_CHECK(!rejected.has_value());
@@ -2581,20 +2584,23 @@ void test_stream_algorithms_over_short_io() {
 // The same free functions over a real socket pair.
 void test_stream_algorithms_over_tcp() {
     auto body = []() -> cio::Task<bool> {
-        auto listener = net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
+        auto listener =
+            net::TcpListener::listen(net::SocketAddr::loopback_v4(0));
         CIO_CHECK(listener.has_value());
         const auto addr = listener->addr().value();
 
-        auto server = cio::spawn([](net::TcpListener l) -> cio::Task<std::string> {
-            auto conn = co_await l.accept();
-            if (!conn) co_return std::string{};
-            std::vector<std::byte> buffer(11);
-            auto filled =
-                co_await cio::io::read_full(*conn, std::span<std::byte>{buffer});
-            if (!filled) co_return std::string{};
-            co_return std::string(reinterpret_cast<const char*>(buffer.data()),
-                                  buffer.size());
-        }(std::move(*listener)));
+        auto server =
+            cio::spawn([](net::TcpListener l) -> cio::Task<std::string> {
+                auto conn = co_await l.accept();
+                if (!conn) co_return std::string{};
+                std::vector<std::byte> buffer(11);
+                auto filled = co_await cio::io::read_full(
+                    *conn, std::span<std::byte>{buffer});
+                if (!filled) co_return std::string{};
+                co_return std::string(
+                    reinterpret_cast<const char*>(buffer.data()),
+                    buffer.size());
+            }(std::move(*listener)));
 
         auto client = co_await net::TcpConn::dial(addr);
         CIO_CHECK(client.has_value());
@@ -2664,7 +2670,8 @@ void test_invalid_socket_operations_return_ebadf() {
 
         net::UdpConn udp;
         auto received = co_await udp.read_from(buffer, from);
-        auto sent = co_await udp.write_to(bytes_of("x"), net::SocketAddr::loopback_v4(9));
+        auto sent = co_await udp.write_to(bytes_of("x"),
+                                          net::SocketAddr::loopback_v4(9));
         CIO_CHECK(!received && received.error().is(EBADF));
         CIO_CHECK(!sent && sent.error().is(EBADF));
         udp.set_read_deadline(cio::Clock::now());
@@ -2685,7 +2692,8 @@ int main() {
     RUN_TEST(test_read_deadline);
     RUN_TEST(test_combined_deadline_covers_both_directions);
     RUN_TEST(test_udp_combined_deadline_and_clear);
-    RUN_TEST(test_immediate_deadline_remains_persistent_during_waiter_publication);
+    RUN_TEST(
+        test_immediate_deadline_remains_persistent_during_waiter_publication);
     RUN_TEST(test_expired_deadline_precedes_ready_data_write_and_eof);
     RUN_TEST(test_expired_deadline_precedes_ready_accept_and_udp);
     RUN_TEST(test_connect_refused);
@@ -2693,6 +2701,8 @@ int main() {
     RUN_TEST(test_many_concurrent_connections);
     RUN_TEST(test_accept_distributes_new_streams_across_workers);
     RUN_TEST(test_close_wakes_a_parked_reader);
+    RUN_TEST(test_same_direction_reads_queue_instead_of_failing);
+    RUN_TEST(test_close_drains_same_direction_operation_queue);
     RUN_TEST(test_local_close_wakes_a_parked_reader);
     RUN_TEST(test_successful_io_awaiter_restores_ready_hint_after_claim);
     RUN_TEST(test_failed_io_awaiter_does_not_restore_ready_hint);

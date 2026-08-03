@@ -20,9 +20,11 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <coroutine>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -167,6 +169,12 @@ public:
     void start();
     // Requests stop, wakes everything parked, joins all threads. Idempotent.
     void shutdown();
+    // Closes external root-task admission, then waits until every tracked root
+    // already owned by this scheduler has completed.
+    void begin_graceful_shutdown();
+    void wait_for_runtime_roots();
+    bool register_runtime_root() noexcept;
+    void complete_runtime_root() noexcept;
     bool stopping() const noexcept {
         return stop_.load(std::memory_order_acquire);
     }
@@ -307,6 +315,10 @@ private:
 
     std::atomic<bool> stop_{false};
     std::atomic<bool> started_{false};
+    std::atomic<std::size_t> runtime_roots_{0};
+    std::mutex graceful_mutex_;
+    std::condition_variable graceful_cv_;
+    bool external_admission_closed_ = false;
     std::thread monitor_;
     SchedulerTarget completion_target_;
 };

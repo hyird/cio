@@ -1,5 +1,7 @@
 #include <signal.h>
+#include <sys/wait.h>
 
+#include <cerrno>
 #include <chrono>
 #include <span>
 #include <string>
@@ -122,6 +124,35 @@ void test_kill_reports_signal() {
     CIO_CHECK(cio::run(body()));
 }
 
+void test_destroyed_child_is_reaped_without_blocking() {
+    auto body = []() -> cio::Task<bool> {
+        int pid = -1;
+        const auto started = cio::Clock::now();
+        {
+            process::Command cmd("/bin/sleep");
+            cmd.args = {"0.05"};
+            auto child = cmd.start();
+            CIO_CHECK(child.has_value());
+            pid = child->pid();
+        }
+        CIO_CHECK(cio::Clock::now() - started < 1s);
+
+        const auto deadline = cio::Clock::now() + 5s;
+        for (;;) {
+            siginfo_t info{};
+            errno = 0;
+            const int result = ::waitid(P_PID, static_cast<id_t>(pid), &info,
+                                        WEXITED | WNOHANG | WNOWAIT);
+            if (result != 0 && errno == ECHILD) break;
+            CIO_CHECK(result == 0);
+            CIO_CHECK(cio::Clock::now() < deadline);
+            co_await cio::sleep(1ms);
+        }
+        co_return true;
+    };
+    CIO_CHECK(cio::run(body()));
+}
+
 // Waiting goes through the reactor, so a deadline interrupts it without leaving
 // a thread parked in waitpid.
 void test_wait_honours_a_deadline() {
@@ -180,7 +211,8 @@ void test_env_and_working_dir() {
     auto body = []() -> cio::Task<bool> {
         process::Command cmd("/bin/sh");
         cmd.args = {"-c", "echo $CIO_TEST_VAR; pwd"};
-        cmd.env = std::vector<std::string>{"CIO_TEST_VAR=set-by-test", "PATH=/bin"};
+        cmd.env =
+            std::vector<std::string>{"CIO_TEST_VAR=set-by-test", "PATH=/bin"};
         cmd.dir = "/tmp";
 
         auto result = co_await cmd.output();
@@ -245,6 +277,7 @@ int main() {
     RUN_TEST(test_missing_program_reports_enoent);
     RUN_TEST(test_stdin_pipe_feeds_a_filter);
     RUN_TEST(test_kill_reports_signal);
+    RUN_TEST(test_destroyed_child_is_reaped_without_blocking);
     RUN_TEST(test_wait_honours_a_deadline);
     RUN_TEST(test_wait_is_cancellable);
     RUN_TEST(test_env_and_working_dir);

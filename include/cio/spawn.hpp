@@ -170,24 +170,20 @@ private:
 
         try {
             if (promise.exception) {
-                self.set_task_exception(
-                    promise.detached == TaskPromiseBase::kDetachedDirect,
-                    promise.exception);
+                self.set_task_exception(promise.direct_detached_completion(),
+                                        promise.exception);
             } else if constexpr (std::is_void_v<T>) {
-                self.set_task_value(promise.detached ==
-                                    TaskPromiseBase::kDetachedDirect);
+                self.set_task_value(promise.direct_detached_completion());
             } else {
-                self.set_task_value(
-                    promise.detached == TaskPromiseBase::kDetachedDirect,
-                    std::move(*promise.value));
+                self.set_task_value(promise.direct_detached_completion(),
+                                    std::move(*promise.value));
             }
         } catch (...) {
             // Moving the completed result into shared state is part of the
             // spawned task's result path, just as it was in the former wrapper
             // coroutine. Preserve that exception for the JoinHandle.
-            self.set_task_exception(
-                promise.detached == TaskPromiseBase::kDetachedDirect,
-                std::current_exception());
+            self.set_task_exception(promise.direct_detached_completion(),
+                                    std::current_exception());
         }
 
         // The scheduled task owns one of the two seeded references. Its frame
@@ -376,12 +372,19 @@ void go(Task<T> task) {
 namespace detail {
 
 template<typename T>
-inline void go_on(Scheduler& sched, Task<T> task) {
+inline void go_on(Scheduler& sched, Task<T> task, bool runtime_root = false) {
     auto handle = task.release();
     if (!handle)
         throw std::invalid_argument("cio: cannot schedule an invalid Task");
     handle.promise().continuation_or_completion = nullptr;
-    handle.promise().detached = true;
+    handle.promise().detached = TaskPromiseBase::kDetached;
+    if (runtime_root) {
+        handle.promise().detached |= TaskPromiseBase::kRuntimeTracked;
+        if (!sched.register_runtime_root()) {
+            handle.destroy();
+            throw SystemError{Error{Errc::shutdown}};
+        }
+    }
     sched.schedule(handle);
 }
 
@@ -404,7 +407,8 @@ Task<void> completed_spawn_runner(Task<T> task, StateRef<T> state) {
 }
 
 template<typename T>
-JoinHandle<T> spawn_on(Scheduler& sched, Task<T> task) {
+JoinHandle<T> spawn_on(Scheduler& sched, Task<T> task,
+                       bool runtime_root = false) {
     static_assert(TaskPromiseBase::kDetached == 1);
     static_assert(TaskPromiseBase::kDetachedDirect == 2);
     // Exactly two owners exist: the returned handle and the scheduled task.
@@ -416,7 +420,8 @@ JoinHandle<T> spawn_on(Scheduler& sched, Task<T> task) {
     if (!task.valid() || task.done()) {
         detail::StateRef<T> runner_state{raw, detail::StateRef<T>::adopt};
         go_on(sched,
-              completed_spawn_runner(std::move(task), std::move(runner_state)));
+              completed_spawn_runner(std::move(task), std::move(runner_state)),
+              runtime_root);
         return handle;
     }
 
@@ -427,6 +432,14 @@ JoinHandle<T> spawn_on(Scheduler& sched, Task<T> task) {
     child.promise().continuation_or_completion =
         static_cast<DetachedTaskCompletion*>(raw);
     child.promise().detached = TaskPromiseBase::kDetached;
+    if (runtime_root) {
+        child.promise().detached |= TaskPromiseBase::kRuntimeTracked;
+        if (!sched.register_runtime_root()) {
+            child.destroy();
+            raw->release();
+            throw SystemError{Error{Errc::shutdown}};
+        }
+    }
     sched.schedule_spawn(child, &child.promise().detached);
     return handle;
 }

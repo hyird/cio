@@ -888,10 +888,55 @@ void Scheduler::start() {
     monitor_ = std::thread([this] { monitor_main(); });
 }
 
+void Scheduler::begin_graceful_shutdown() {
+    if (t_worker != nullptr && t_worker->sched_ == this) {
+        throw std::logic_error(
+            "cio: Runtime::graceful_shutdown() cannot run on its own worker");
+    }
+    std::lock_guard<std::mutex> lock(graceful_mutex_);
+    external_admission_closed_ = true;
+}
+
+void Scheduler::wait_for_runtime_roots() {
+    std::unique_lock<std::mutex> lock(graceful_mutex_);
+    graceful_cv_.wait(lock, [this] {
+        return runtime_roots_.load(std::memory_order_acquire) == 0;
+    });
+}
+
+bool Scheduler::register_runtime_root() noexcept {
+    Worker* const worker = t_worker;
+    if (worker != nullptr && worker->sched_ == this) {
+        if (stopping()) return false;
+        runtime_roots_.fetch_add(1, std::memory_order_relaxed);
+        if (!stopping()) return true;
+        complete_runtime_root();
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(graceful_mutex_);
+    if (external_admission_closed_ || stopping()) return false;
+    runtime_roots_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void Scheduler::complete_runtime_root() noexcept {
+    const std::size_t previous =
+        runtime_roots_.fetch_sub(1, std::memory_order_acq_rel);
+    assert(previous != 0 && "cio: runtime root accounting underflow");
+    if (previous != 1) return;
+    std::lock_guard<std::mutex> lock(graceful_mutex_);
+    graceful_cv_.notify_all();
+}
+
 void Scheduler::shutdown() {
     if (t_worker != nullptr && t_worker->sched_ == this) {
         throw std::logic_error(
             "cio: Runtime::shutdown() cannot run on its own worker");
+    }
+    {
+        std::lock_guard<std::mutex> lock(graceful_mutex_);
+        external_admission_closed_ = true;
     }
     if (stop_.exchange(true, std::memory_order_acq_rel)) return;
 
@@ -915,6 +960,12 @@ void Scheduler::shutdown() {
     if (g_default_scheduler.load(std::memory_order_acquire) == this) {
         g_default_scheduler.store(nullptr, std::memory_order_release);
     }
+}
+
+void complete_current_runtime_root() noexcept {
+    Scheduler* const scheduler = current_scheduler();
+    if (scheduler == nullptr) std::terminate();
+    scheduler->complete_runtime_root();
 }
 
 WorkerId Scheduler::current_worker_id() const noexcept {
@@ -1098,7 +1149,7 @@ void Scheduler::schedule_frame(void* frame) noexcept {
 
 void Scheduler::schedule_spawn_frame(void* frame,
                                      std::uint8_t* spawn_mode) noexcept {
-    *spawn_mode = 1;
+    *spawn_mode = static_cast<std::uint8_t>((*spawn_mode & ~3u) | 1u);
     Worker* worker = t_worker;
     if (worker != nullptr && worker->sched_ == this) {
         worker->push(frame, true, spawn_mode);

@@ -11,10 +11,9 @@ namespace cio {
 Runtime::Runtime(RuntimeOptions options)
     : sched_(std::make_shared<detail::Scheduler>(
           options.worker_threads,
-          detail::BlockingLimits{options.max_blocking_threads,
-                                 options.max_blocking_queue,
-                                 options.max_file_operations,
-                                 options.max_resolver_operations})) {
+          detail::BlockingLimits{
+              options.max_blocking_threads, options.max_blocking_queue,
+              options.max_file_operations, options.max_resolver_operations})) {
     detail::set_default_scheduler(sched_.get());
     sched_->start();
 }
@@ -27,6 +26,15 @@ void Runtime::shutdown() {
     if (sched_) sched_->shutdown();
 }
 
+void Runtime::graceful_shutdown() {
+    if (!sched_) return;
+    sched_->begin_graceful_shutdown();
+    shutdown_source_.cancel();
+    if (sched_->stopping()) return;
+    sched_->wait_for_runtime_roots();
+    sched_->shutdown();
+}
+
 namespace detail {
 
 int run_main(Task<int> task) noexcept {
@@ -34,7 +42,8 @@ int run_main(Task<int> task) noexcept {
         Runtime runtime;
         return runtime.block_on(std::move(task));
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "cio: unhandled exception escaped main: %s\n", e.what());
+        std::fprintf(stderr, "cio: unhandled exception escaped main: %s\n",
+                     e.what());
         return 1;
     } catch (...) {
         std::fprintf(stderr, "cio: unhandled exception escaped main\n");
@@ -50,12 +59,15 @@ int run_main(Task<int> task) noexcept {
         what = ex.what();
     } catch (...) {
     }
-    std::fprintf(stderr, "cio: unhandled exception escaped a detached task: %s\n", what);
+    std::fprintf(
+        stderr, "cio: unhandled exception escaped a detached task: %s\n", what);
     std::fflush(stderr);
     std::abort();
 }
 
-[[noreturn]] void throw_system_error(Error e) { throw SystemError(e); }
+[[noreturn]] void throw_system_error(Error e) {
+    throw SystemError(e);
+}
 
 }  // namespace detail
 }  // namespace cio

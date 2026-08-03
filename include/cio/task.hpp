@@ -37,6 +37,7 @@ namespace detail {
 // Go's rule: an unrecovered panic in a goroutine takes down the process, and
 // silently swallowing it is worse than crashing.
 [[noreturn]] void abort_on_unhandled_exception(std::exception_ptr e) noexcept;
+void complete_current_runtime_root() noexcept;
 
 struct TaskPromiseBase;
 
@@ -55,6 +56,8 @@ struct TaskPromiseBase {
     static constexpr std::uint8_t kAttached = 0;
     static constexpr std::uint8_t kDetached = 1;
     static constexpr std::uint8_t kDetachedDirect = 2;
+    static constexpr std::uint8_t kDetachedModeMask = 3;
+    static constexpr std::uint8_t kRuntimeTracked = 4;
 
     // Route every task frame through the per-thread pool. Only the sized delete
     // is declared: the coroutine machinery always knows the frame size, and
@@ -71,13 +74,17 @@ struct TaskPromiseBase {
         TaskPromiseBase* promise;
 
         bool await_ready() noexcept {
-            if (promise->detached != kAttached) {
+            const std::uint8_t mode = promise->detached;
+            if (mode != kAttached) {
                 auto* const completion = static_cast<DetachedTaskCompletion*>(
                     promise->continuation_or_completion);
                 if (completion != nullptr) {
                     // The callback may release and destroy its JoinState. Do
                     // not inspect `completion` again after this call.
                     completion->callback(*promise, *completion);
+                }
+                if ((mode & kRuntimeTracked) != 0) {
+                    complete_current_runtime_root();
                 }
                 // Not suspending here completes the coroutine, which destroys
                 // its own frame. That is exactly what a detached task wants,
@@ -124,6 +131,10 @@ struct TaskPromiseBase {
     // when it was the only local FIFO item. Keep the mode in the original
     // one-byte slot so small coroutine frames do not cross a pool size class.
     std::uint8_t detached = kAttached;
+
+    bool direct_detached_completion() const noexcept {
+        return (detached & kDetachedModeMask) == kDetachedDirect;
+    }
 
 private:
     static void abort_detached(TaskPromiseBase& promise,

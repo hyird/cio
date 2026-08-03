@@ -65,6 +65,16 @@ void Reactor::free_desc(IoDesc* desc) noexcept {
     desc->closing.store(true, std::memory_order_relaxed);
     desc->slot[0].store(nullptr, std::memory_order_relaxed);
     desc->slot[1].store(nullptr, std::memory_order_relaxed);
+    for (unsigned i = 0; i < kDirCount; ++i) {
+        // An uncontended operation does not pin the descriptor. It may still
+        // hold a stale guard, whose generation check makes its later release
+        // inert after this slot is recycled.
+        assert(!desc->operation_pinned[i]);
+        assert(desc->operation_head[i] == nullptr);
+        assert(desc->operation_tail[i] == nullptr);
+        assert(!desc->operation_lifetime[i]);
+        desc->operation_owner[i].store(0, std::memory_order_relaxed);
+    }
     assert(!desc->syscall_active[0].load(std::memory_order_relaxed));
     assert(!desc->syscall_active[1].load(std::memory_order_relaxed));
     desc->unlock_lifecycle();
@@ -79,6 +89,244 @@ void Reactor::release_desc(IoDesc* desc) noexcept {
         desc->refs.fetch_sub(1, std::memory_order_acq_rel);
     assert(previous > 0 && "cio: descriptor reference underflow");
     if (previous == 1) free_desc(desc);
+}
+
+// ------------------------------------------------------ operation queues ---
+
+static std::shared_ptr<Scheduler> retain_foreign_operation_source(
+    IoDesc* desc) noexcept {
+    Scheduler& source = desc->owner->scheduler();
+    Worker* const worker = current_worker();
+    if (worker != nullptr && &worker->scheduler() == &source) return {};
+    return source.shared_handle();
+}
+
+static void pin_operation(IoDesc* desc, unsigned index) noexcept {
+    if (desc->operation_pinned[index]) return;
+    const std::uint32_t refs =
+        desc->refs.fetch_add(1, std::memory_order_relaxed);
+    if (refs == std::numeric_limits<std::uint32_t>::max()) std::terminate();
+    desc->operation_pinned[index] = true;
+}
+
+static void publish_operation_lifetime_locked(
+    IoDesc* desc, unsigned index, std::uint64_t tag,
+    std::shared_ptr<Scheduler> source_lifetime) noexcept {
+    if (!source_lifetime) return;
+    pin_operation(desc, index);
+    desc->operation_lifetime[index] = std::move(source_lifetime);
+    desc->operation_owner[index].store(tag | 1u, std::memory_order_release);
+}
+
+static Error validate_operation_owner(
+    IoDesc* desc, Dir dir, std::uint32_t generation, unsigned index,
+    std::uint64_t tag, std::shared_ptr<Scheduler> source_lifetime) noexcept {
+    if (!source_lifetime) return desc->io_error(dir, generation);
+
+    desc->lock_lifecycle();
+    Error state = desc->io_error(dir, generation);
+    const std::uint64_t owner =
+        desc->operation_owner[index].load(std::memory_order_relaxed);
+    if (!state && owner != tag && owner != (tag | 1u)) {
+        state = Error{Errc::closed};
+    }
+    if (!state) {
+        publish_operation_lifetime_locked(desc, index, tag,
+                                          std::move(source_lifetime));
+    }
+    desc->unlock_lifecycle();
+    return state;
+}
+
+IoOperationGuard::~IoOperationGuard() {
+    reset();
+}
+
+void IoOperationGuard::reset() noexcept {
+    if (desc_ == nullptr) return;
+    IoDesc* const desc = std::exchange(desc_, nullptr);
+    const std::uint64_t tag = IoDesc::operation_tag(generation_);
+    std::uint64_t expected = tag;
+    if (desc->operation_owner[static_cast<unsigned>(dir_)]
+            .compare_exchange_strong(expected, 0, std::memory_order_release,
+                                     std::memory_order_relaxed)) {
+        return;
+    }
+    desc->owner->release_operation(desc, dir_, generation_);
+}
+
+IoOperationAwaiter::~IoOperationAwaiter() {
+    if (retained_) desc_->owner->release_desc(desc_);
+}
+
+bool IoOperationAwaiter::await_ready() noexcept {
+    if (desc_ == nullptr) {
+        error_ = Error{EBADF};
+        return true;
+    }
+
+    const unsigned index = static_cast<unsigned>(dir_);
+    const std::uint64_t tag = IoDesc::operation_tag(generation_);
+    std::shared_ptr<Scheduler> source_lifetime =
+        retain_foreign_operation_source(desc_);
+    std::uint64_t expected = 0;
+    if (!desc_->operation_owner[index].compare_exchange_strong(
+            expected, tag, std::memory_order_acquire,
+            std::memory_order_relaxed)) {
+        return false;
+    }
+
+    const Error state = validate_operation_owner(
+        desc_, dir_, generation_, index, tag, std::move(source_lifetime));
+    if (state) {
+        error_ = state;
+        IoOperationGuard{desc_, dir_, generation_}.reset();
+    }
+    return true;
+}
+
+bool IoOperationAwaiter::await_suspend(
+    std::coroutine_handle<> handle) noexcept {
+    IoDesc* const desc = desc_;
+    const Dir dir = dir_;
+    const std::uint32_t generation = generation_;
+    const unsigned index = static_cast<unsigned>(dir);
+    const std::uint64_t tag = IoDesc::operation_tag(generation);
+
+    if (desc == nullptr) {
+        error_ = Error{EBADF};
+        return false;
+    }
+    std::shared_ptr<Scheduler> source_lifetime =
+        retain_foreign_operation_source(desc);
+
+    wait_.handle = handle;
+    capture_current_scheduler(wait_.sched, wait_.preferred_worker);
+
+    desc->lock_lifecycle();
+    if (Error state = desc->io_error(dir, generation); state) {
+        desc->unlock_lifecycle();
+        error_ = state;
+        return false;
+    }
+
+    for (;;) {
+        std::uint64_t owner =
+            desc->operation_owner[index].load(std::memory_order_acquire);
+        if (owner == 0) {
+            if (desc->operation_owner[index].compare_exchange_weak(
+                    owner, tag, std::memory_order_acquire,
+                    std::memory_order_relaxed)) {
+                publish_operation_lifetime_locked(desc, index, tag,
+                                                  std::move(source_lifetime));
+                desc->unlock_lifecycle();
+                return false;
+            }
+            continue;
+        }
+        if (owner != tag && owner != (tag | 1u)) {
+            desc->unlock_lifecycle();
+            error_ = Error{Errc::closed};
+            return false;
+        }
+        if (owner == tag && !desc->operation_owner[index].compare_exchange_weak(
+                                owner, tag | 1u, std::memory_order_acq_rel,
+                                std::memory_order_relaxed)) {
+            continue;
+        }
+        break;
+    }
+
+    // The uncontended owner deliberately carries no reference. Once a waiter
+    // appears, pin that owner in the same lifecycle transaction before giving
+    // the waiter its own reference; close can no longer recycle the node until
+    // the FIFO drains.
+    pin_operation(desc, index);
+    publish_operation_lifetime_locked(desc, index, tag,
+                                      std::move(source_lifetime));
+    const std::uint32_t refs =
+        desc->refs.fetch_add(1, std::memory_order_relaxed);
+    if (refs == std::numeric_limits<std::uint32_t>::max()) std::terminate();
+    retained_ = true;
+
+    wait_.next = nullptr;
+    if (desc->operation_tail[index] != nullptr) {
+        desc->operation_tail[index]->next = &wait_;
+    } else {
+        desc->operation_head[index] = &wait_;
+    }
+    desc->operation_tail[index] = &wait_;
+    desc->unlock_lifecycle();
+    return true;
+}
+
+Result<IoOperationGuard> IoOperationAwaiter::await_resume() noexcept {
+    if (error_) return error_;
+    retained_ = false;
+    return IoOperationGuard{desc_, dir_, generation_};
+}
+
+Result<IoOperationGuard> try_lock_io_operation(
+    IoDesc* desc, Dir dir, std::uint32_t generation) noexcept {
+    if (desc == nullptr) return Error{EBADF};
+    const unsigned index = static_cast<unsigned>(dir);
+    const std::uint64_t tag = IoDesc::operation_tag(generation);
+    std::shared_ptr<Scheduler> source_lifetime =
+        retain_foreign_operation_source(desc);
+    std::uint64_t expected = 0;
+    if (!desc->operation_owner[index].compare_exchange_strong(
+            expected, tag, std::memory_order_acquire,
+            std::memory_order_relaxed)) {
+        return Error{Errc::would_block};
+    }
+
+    const Error state = validate_operation_owner(
+        desc, dir, generation, index, tag, std::move(source_lifetime));
+    if (state) {
+        IoOperationGuard{desc, dir, generation}.reset();
+        return state;
+    }
+    return IoOperationGuard{desc, dir, generation};
+}
+
+void Reactor::release_operation(IoDesc* desc, Dir dir,
+                                std::uint32_t generation) noexcept {
+    const unsigned index = static_cast<unsigned>(dir);
+    IoOperationWait* next = nullptr;
+    bool release_reference = false;
+    std::shared_ptr<Scheduler> source_lifetime_guard;
+
+    desc->lock_lifecycle();
+    if (desc->generation.load(std::memory_order_acquire) != generation) {
+        desc->unlock_lifecycle();
+        return;
+    }
+    assert(desc->operation_owner[index].load(std::memory_order_relaxed) ==
+           (IoDesc::operation_tag(generation) | 1u));
+    next = desc->operation_head[index];
+    release_reference = desc->operation_pinned[index];
+    if (next != nullptr) {
+        desc->operation_head[index] = next->next;
+        if (desc->operation_head[index] == nullptr) {
+            desc->operation_tail[index] = nullptr;
+        }
+    } else {
+        desc->operation_owner[index].store(0, std::memory_order_release);
+        desc->operation_pinned[index] = false;
+        source_lifetime_guard = std::move(desc->operation_lifetime[index]);
+    }
+    desc->unlock_lifecycle();
+
+    // The next waiter already owns its own descriptor reference. Release this
+    // operation's pin before handing the waiter frame to another worker, since
+    // dispatch must be the final action that can observe its queue node.
+    if (release_reference) release_desc(desc);
+    if (next != nullptr) {
+        const SchedulerTarget sched = next->sched;
+        const WorkerId preferred_worker = next->preferred_worker;
+        std::coroutine_handle<> handle = next->handle;
+        SchedulerTarget::dispatch_completion(sched, handle, preferred_worker);
+    }
 }
 
 // --------------------------------------------------------- readiness core ---
@@ -101,7 +349,8 @@ void Reactor::unblock_impl(IoDesc* desc, Dir dir, Error err,
             // instead of parking — without this, edge-triggered polling loses
             // the wakeup for any operation that was between its EAGAIN and its
             // park when the event arrived.
-            if (slot.compare_exchange_weak(old, kIoReady, std::memory_order_acq_rel,
+            if (slot.compare_exchange_weak(old, kIoReady,
+                                           std::memory_order_acq_rel,
                                            std::memory_order_relaxed)) {
                 return;
             }
@@ -123,17 +372,16 @@ void Reactor::unblock_impl(IoDesc* desc, Dir dir, Error err,
         if (batch != nullptr) {
             Scheduler::IoCompletionRoute route =
                 Scheduler::IoCompletionRoute::kSharedFallback;
-            if (SchedulerTarget::dispatch_io(
-                    sched, handle, preferred_worker, route)) {
-                if (route ==
-                    Scheduler::IoCompletionRoute::kLocalFifo) {
+            if (SchedulerTarget::dispatch_io(sched, handle, preferred_worker,
+                                             route)) {
+                if (route == Scheduler::IoCompletionRoute::kLocalFifo) {
                     ++batch->unpublished_local_fifo;
                 }
                 ++batch->total;
             }
         } else {
-            SchedulerTarget::dispatch_completion(
-                sched, handle, preferred_worker);
+            SchedulerTarget::dispatch_completion(sched, handle,
+                                                 preferred_worker);
         }
         return;
     }
@@ -157,13 +405,12 @@ void Reactor::dispatch(std::uint64_t token, unsigned dirs,
     // incarnation's temporary reference.
     std::uint32_t refs = desc->refs.load(std::memory_order_acquire);
     for (;;) {
-        if (refs == 0 ||
-            refs == std::numeric_limits<std::uint32_t>::max()) {
+        if (refs == 0 || refs == std::numeric_limits<std::uint32_t>::max()) {
             return;
         }
-        if (desc->refs.compare_exchange_weak(
-                refs, refs + 1, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
+        if (desc->refs.compare_exchange_weak(refs, refs + 1,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) {
             break;
         }
     }
@@ -201,11 +448,9 @@ std::coroutine_handle<> Reactor::on_deadline(Timer* timer) noexcept {
     // check also makes a stale callback harmless if a future implementation
     // changes that waiting strategy.
     if (!desc->closing.load(std::memory_order_acquire) &&
-        self->seq ==
-            desc->deadline_seq[i].load(std::memory_order_acquire)) {
+        self->seq == desc->deadline_seq[i].load(std::memory_order_acquire)) {
         desc->expired_seq[i].store(self->seq, std::memory_order_release);
-        self->reactor->unblock(desc, self->dir,
-                              Error{Errc::timed_out});
+        self->reactor->unblock(desc, self->dir, Error{Errc::timed_out});
     }
     desc->unlock_lifecycle();
     return {};  // unblock() already scheduled whoever was parked
@@ -229,8 +474,7 @@ void Reactor::set_deadline(IoDesc* desc, Dir dir,
     if (desc == nullptr) return;
     const auto i = static_cast<unsigned>(dir);
     IoTimer& timer = desc->deadline_timer[i];
-    std::lock_guard<std::mutex> update_lock(
-        desc->deadline_update_mutex[i]);
+    std::lock_guard<std::mutex> update_lock(desc->deadline_update_mutex[i]);
 
     // Pin the validated incarnation before dropping lifecycle_lock for
     // disarm(). disarm may wait for a callback that itself needs the lifecycle
@@ -309,16 +553,14 @@ void Reactor::set_deadline(IoDesc* desc, Dir dir,
         release_desc(desc);
         throw;
     }
-    desc->absolute_deadline_ns[i].store(deadline_ns,
-                                        std::memory_order_release);
+    desc->absolute_deadline_ns[i].store(deadline_ns, std::memory_order_release);
     desc->unlock_lifecycle();
     release_desc(desc);
 }
 
 // ---------------------------------------------------------------- awaiter ---
 
-IoAwaiter::IoAwaiter(IoDesc* desc, Dir dir,
-                     std::uint32_t generation) noexcept
+IoAwaiter::IoAwaiter(IoDesc* desc, Dir dir, std::uint32_t generation) noexcept
     : desc_(desc), dir_(dir), generation_(generation) {}
 
 IoAwaiter::~IoAwaiter() {
@@ -353,10 +595,8 @@ bool IoAwaiter::await_suspend(std::coroutine_handle<> h) noexcept {
 
     self->handle = h;
     Scheduler* const scheduler = current_scheduler();
-    self->sched =
-        scheduler == nullptr
-            ? SchedulerTarget{}
-            : scheduler->completion_target();
+    self->sched = scheduler == nullptr ? SchedulerTarget{}
+                                       : scheduler->completion_target();
     self->preferred_worker = current_worker_id(scheduler);
     self->err = Error{};
 
@@ -367,8 +607,7 @@ bool IoAwaiter::await_suspend(std::coroutine_handle<> h) noexcept {
         return false;
     }
 
-    source_lifetime_ =
-        desc->owner->scheduler().shared_handle();
+    source_lifetime_ = desc->owner->scheduler().shared_handle();
 
     // Acquire the operation reference only when the coroutine really reaches
     // suspension setup. The slab address itself is stable, and the generation
@@ -383,7 +622,8 @@ bool IoAwaiter::await_suspend(std::coroutine_handle<> h) noexcept {
         void* old = slot.load(std::memory_order_acquire);
 
         if (old == kIoReady) {
-            if (slot.compare_exchange_weak(old, nullptr, std::memory_order_acq_rel,
+            if (slot.compare_exchange_weak(old, nullptr,
+                                           std::memory_order_acq_rel,
                                            std::memory_order_relaxed)) {
                 desc->unlock_lifecycle();
                 return false;  // readiness arrived between await_ready and now
@@ -401,7 +641,8 @@ bool IoAwaiter::await_suspend(std::coroutine_handle<> h) noexcept {
         }
 
         void* expected = nullptr;
-        if (slot.compare_exchange_weak(expected, self, std::memory_order_acq_rel,
+        if (slot.compare_exchange_weak(expected, self,
+                                       std::memory_order_acq_rel,
                                        std::memory_order_relaxed)) {
             // Published. From here we may only touch locals.
             //

@@ -11,8 +11,8 @@
 #               [work_us] [heavy_pct] [churn]
 #
 # Both binaries must take "<port> <threads>" and print a line matching
-# "echo server" once they are listening — the same contract run_comparison.sh
-# uses, which the Go server also satisfies.
+# "echo server" once they are listening; the Go server satisfies the same
+# contract.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

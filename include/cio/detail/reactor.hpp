@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <utility>
 
 #include "cio/config.hpp"
 #include "cio/detail/completion.hpp"
@@ -44,7 +45,8 @@ enum class Dir : unsigned { kRead = 0, kWrite = 1 };
 inline constexpr unsigned kDirCount = 2;
 
 // Sentinel meaning "readiness arrived, no waiter". Never dereferenced.
-inline void* const kIoReady = reinterpret_cast<void*>(static_cast<std::uintptr_t>(1));
+inline void* const kIoReady =
+    reinterpret_cast<void*>(static_cast<std::uintptr_t>(1));
 
 // The parked-task record stored in an IoDesc slot. Lives in the awaiter, which
 // lives in the coroutine frame: parking on I/O never allocates.
@@ -57,6 +59,16 @@ struct IoWait {
     SchedulerTarget sched;
     WorkerId preferred_worker = kInvalidWorkerId;
     Error err{};  // written by the waker before scheduling
+};
+
+// Same-direction socket operations are serialized before they enter the
+// readiness state machine. The queue node lives in the waiting coroutine;
+// lifecycle_lock protects the per-direction FIFO below.
+struct IoOperationWait {
+    IoOperationWait* next = nullptr;
+    std::coroutine_handle<> handle{};
+    SchedulerTarget sched;
+    WorkerId preferred_worker = kInvalidWorkerId;
 };
 
 struct IoDesc;
@@ -88,9 +100,26 @@ struct CIO_CACHE_ALIGNED IoDesc {
     // publishes closing under lifecycle_lock, then waits for these leases
     // without holding that lock before Socket::close() may close the fd.
     //
-    // The public contract permits at most one operation per direction, so a
-    // bool is sufficient and also detects accidental same-direction overlap.
+    // The operation FIFO above ensures at most one native call per direction;
+    // this flag also catches internal paths that bypass that admission layer.
     std::atomic<bool> syscall_active[kDirCount]{{false}, {false}};
+    // One complete public operation per direction owns the reactor slot at a
+    // time. Contenders queue in FIFO order, so concurrent reads/accepts or
+    // writes are supported without turning the epoll slot itself into a list.
+    // Protected by lifecycle_lock on the contended path. Every waiter retains
+    // `refs`; the current owner is pinned once a queue or foreign-runtime
+    // lifetime exists. Zero is idle; otherwise (generation + 1) << 1 owns the
+    // direction and bit zero selects that slow handoff path. The generation
+    // tag lets an old local uncontended guard release after close/reuse without
+    // clearing a new incarnation's owner.
+    std::atomic<std::uint64_t> operation_owner[kDirCount]{{0}, {0}};
+    bool operation_pinned[kDirCount]{};
+    IoOperationWait* operation_head[kDirCount]{};
+    IoOperationWait* operation_tail[kDirCount]{};
+    // A foreign-runtime operation keeps the descriptor's home Scheduler alive
+    // until the direction becomes idle. Kept on the descriptor rather than in
+    // every operation guard so the common coroutine frame stays compact.
+    std::shared_ptr<Scheduler> operation_lifetime[kDirCount];
     // Serializes the tiny "validate incarnation + publish waiter" window with
     // descriptor teardown/reuse and syscall-lease acquisition. Readiness
     // dispatch remains lock-free.
@@ -135,12 +164,13 @@ struct CIO_CACHE_ALIGNED IoDesc {
     // that tracks 1/syscalls almost exactly.
     //
     // A short read removes the need for the second one. If recv returns fewer
-    // bytes than asked for, the receive queue was empty when it returned, so the
-    // next call would EAGAIN — and any data arriving later re-arms the epoll
-    // edge, which sets this back to true. So the task can skip straight to
-    // parking. Starts true because nothing is known about a fresh descriptor.
-    // Keep this hot state beside the absolute deadline and before the cold
-    // update mutexes so no-deadline I/O does not acquire an extra cache line.
+    // bytes than asked for, the receive queue was empty when it returned, so
+    // the next call would EAGAIN — and any data arriving later re-arms the
+    // epoll edge, which sets this back to true. So the task can skip straight
+    // to parking. Starts true because nothing is known about a fresh
+    // descriptor. Keep this hot state beside the absolute deadline and before
+    // the cold update mutexes so no-deadline I/O does not acquire an extra
+    // cache line.
     std::atomic<bool> ready_hint[kDirCount]{{true}, {true}};
     // Serializes the cold set/clear transaction for one direction. The
     // lifecycle lock must be dropped while disarm waits for a firing callback,
@@ -148,7 +178,9 @@ struct CIO_CACHE_ALIGNED IoDesc {
     // node and then trying to arm the same IoTimer.
     std::mutex deadline_update_mutex[kDirCount];
 
-    std::atomic<void*>& dir_slot(Dir d) noexcept { return slot[static_cast<unsigned>(d)]; }
+    std::atomic<void*>& dir_slot(Dir d) noexcept {
+        return slot[static_cast<unsigned>(d)];
+    }
 
     void lock_lifecycle() noexcept {
         while (lifecycle_lock.test_and_set(std::memory_order_acquire)) {
@@ -164,15 +196,18 @@ struct CIO_CACHE_ALIGNED IoDesc {
     }
 
     bool may_be_ready(Dir d) const noexcept {
-        return ready_hint[static_cast<unsigned>(d)].load(std::memory_order_acquire);
+        return ready_hint[static_cast<unsigned>(d)].load(
+            std::memory_order_acquire);
     }
     // Called by the owning task when a syscall proved the direction is drained.
     void note_would_block(Dir d) noexcept {
-        ready_hint[static_cast<unsigned>(d)].store(false, std::memory_order_release);
+        ready_hint[static_cast<unsigned>(d)].store(false,
+                                                   std::memory_order_release);
     }
     // Called by the reactor when an edge arrives.
     void note_readable(Dir d) noexcept {
-        ready_hint[static_cast<unsigned>(d)].store(true, std::memory_order_release);
+        ready_hint[static_cast<unsigned>(d)].store(true,
+                                                   std::memory_order_release);
     }
 
     bool timed_out(Dir d) const noexcept {
@@ -199,7 +234,8 @@ struct CIO_CACHE_ALIGNED IoDesc {
     bool cancelled() const noexcept {
         const std::atomic<bool>* const flag =
             cancel_flag.load(std::memory_order_relaxed);
-        if (flag == nullptr) [[likely]] return false;
+        if (flag == nullptr) [[likely]]
+            return false;
         return flag->load(std::memory_order_acquire);
     }
 
@@ -239,8 +275,7 @@ struct CIO_CACHE_ALIGNED IoDesc {
         Error state;
 
         lock_lifecycle();
-        if (generation.load(std::memory_order_acquire) !=
-                expected_generation ||
+        if (generation.load(std::memory_order_acquire) != expected_generation ||
             closing.load(std::memory_order_acquire) || fd < 0) {
             state = Error{Errc::closed};
         } else if (runtime_stopping()) {
@@ -281,15 +316,85 @@ struct CIO_CACHE_ALIGNED IoDesc {
             }
         }
     }
+
+    static constexpr std::uint64_t operation_tag(
+        std::uint32_t generation) noexcept {
+        return (static_cast<std::uint64_t>(generation) + 1) << 1;
+    }
 };
+
+class IoOperationGuard {
+public:
+    IoOperationGuard() noexcept = default;
+    ~IoOperationGuard();
+
+    IoOperationGuard(const IoOperationGuard&) = delete;
+    IoOperationGuard& operator=(const IoOperationGuard&) = delete;
+    IoOperationGuard(IoOperationGuard&& other) noexcept
+        : desc_(std::exchange(other.desc_, nullptr)),
+          dir_(other.dir_),
+          generation_(other.generation_) {}
+    IoOperationGuard& operator=(IoOperationGuard&& other) noexcept {
+        if (this != &other) {
+            reset();
+            desc_ = std::exchange(other.desc_, nullptr);
+            dir_ = other.dir_;
+            generation_ = other.generation_;
+        }
+        return *this;
+    }
+
+    void reset() noexcept;
+
+private:
+    friend class IoOperationAwaiter;
+    friend Result<IoOperationGuard> try_lock_io_operation(
+        IoDesc*, Dir, std::uint32_t) noexcept;
+
+    IoOperationGuard(IoDesc* desc, Dir dir, std::uint32_t generation) noexcept
+        : desc_(desc), dir_(dir), generation_(generation) {}
+
+    IoDesc* desc_ = nullptr;
+    Dir dir_ = Dir::kRead;
+    std::uint32_t generation_ = 0;
+};
+
+// Acquires the complete-operation FIFO for one descriptor direction. The
+// uncontended local path does not schedule or refcount; a foreign owner pins
+// its source runtime, and contention pins the owner plus every queued waiter.
+class IoOperationAwaiter {
+public:
+    IoOperationAwaiter(IoDesc* desc, Dir dir, std::uint32_t generation) noexcept
+        : desc_(desc), dir_(dir), generation_(generation) {}
+    ~IoOperationAwaiter();
+
+    IoOperationAwaiter(const IoOperationAwaiter&) = delete;
+    IoOperationAwaiter& operator=(const IoOperationAwaiter&) = delete;
+
+    bool await_ready() noexcept;
+    bool await_suspend(std::coroutine_handle<> handle) noexcept;
+    Result<IoOperationGuard> await_resume() noexcept;
+
+private:
+    IoDesc* desc_ = nullptr;
+    Dir dir_ = Dir::kRead;
+    std::uint32_t generation_ = 0;
+    bool retained_ = false;
+    Error error_{};
+    IoOperationWait wait_{};
+};
+
+// Non-suspending operations never wait behind an async owner: they report
+// would_block and let the caller choose whether to use the awaiting form.
+Result<IoOperationGuard> try_lock_io_operation(
+    IoDesc* desc, Dir dir, std::uint32_t generation) noexcept;
 
 // Linearizes one native-fd syscall with descriptor teardown. The guard also
 // keeps the IoDesc incarnation from being recycled: detach does not drop its
 // owner reference until every active guard has released.
 class FdUseGuard {
 public:
-    FdUseGuard(IoDesc* desc, Dir dir,
-               std::uint32_t generation) noexcept
+    FdUseGuard(IoDesc* desc, Dir dir, std::uint32_t generation) noexcept
         : desc_(desc), dir_(dir) {
         if (desc_ == nullptr) {
             error_ = Error{EBADF};
@@ -333,7 +438,8 @@ private:
 //         n = ::read(fd, ...);
 //         if (n >= 0) return n;
 //         if (errno != EAGAIN) return Error::from_errno();
-//         if (auto r = co_await IoAwaiter(desc, Dir::kRead); !r) return r.error();
+//         if (auto r = co_await IoAwaiter(desc, Dir::kRead); !r) return
+//         r.error();
 //     }
 class IoAwaiter {
 public:
@@ -396,8 +502,7 @@ public:
 
     // Arms (or with deadline_ns == 0, clears) the deadline for one direction.
     // Concurrent setters are serialized per direction.
-    void set_deadline(IoDesc* desc, Dir dir,
-                      std::uint32_t expected_generation,
+    void set_deadline(IoDesc* desc, Dir dir, std::uint32_t expected_generation,
                       std::int64_t deadline_ns);
 
     std::size_t registered() const noexcept {
@@ -441,7 +546,8 @@ public:
     // anything parked on it. Same shape as the deadline callback: taken under
     // the lifecycle lock and gated on the incarnation, so a hook that fires
     // after the descriptor was closed or recycled is a no-op.
-    void cancel_waiters(IoDesc* desc, std::uint32_t expected_generation) noexcept;
+    void cancel_waiters(IoDesc* desc,
+                        std::uint32_t expected_generation) noexcept;
 
     void unblock(IoDesc* desc, Dir dir, Error err) noexcept {
         unblock_impl(desc, dir, err, nullptr);
@@ -452,6 +558,8 @@ public:
 
 private:
     friend class IoAwaiter;
+    friend class IoOperationGuard;
+    friend class IoOperationAwaiter;
     friend class Scheduler;
     friend struct SchedulerTestAccess;
 
@@ -487,12 +595,16 @@ private:
     IoDesc* alloc_desc();
     void release_desc(IoDesc* desc) noexcept;
     void free_desc(IoDesc* desc) noexcept;
+    void release_operation(IoDesc* desc, Dir dir,
+                           std::uint32_t generation) noexcept;
     IoDesc* desc_at(std::uint32_t index) noexcept;
 
     // When `batch` is non-null, completions use shard-aware I/O placement and
     // the poller keeps one local continuation without waking a thief.
-    void unblock_impl(IoDesc* desc, Dir dir, Error err, ReadyBatch* batch) noexcept;
-    void dispatch(std::uint64_t token, unsigned dirs, ReadyBatch* batch) noexcept;
+    void unblock_impl(IoDesc* desc, Dir dir, Error err,
+                      ReadyBatch* batch) noexcept;
+    void dispatch(std::uint64_t token, unsigned dirs,
+                  ReadyBatch* batch) noexcept;
 
     // Slab: fixed-size chunks, never freed, so pointers stay stable and a stale
     // event is always safe to dereference. Recycling is detected by generation,
@@ -509,8 +621,7 @@ private:
     int wake_write_fd_ = -1;
     std::atomic<bool> wake_pending_{false};
     CIO_CACHE_ALIGNED std::atomic<bool> polling_{false};
-    CIO_CACHE_ALIGNED std::atomic<std::int64_t>
-        owner_poll_requested_ns_{0};
+    CIO_CACHE_ALIGNED std::atomic<std::int64_t> owner_poll_requested_ns_{0};
     std::atomic<std::int64_t> last_poll_ns_{0};
     std::atomic<std::int64_t> poller_deadline_ns_{INT64_MAX};
 
@@ -519,8 +630,7 @@ private:
     // when they need a coherent pair. covered/attempted are monotonic so a
     // late control frame can never erase a newer request.
     CIO_CACHE_ALIGNED std::coroutine_handle<> driver_handle_{};
-    std::atomic<DriverPhase> driver_phase_{
-        DriverPhase::kUnavailable};
+    std::atomic<DriverPhase> driver_phase_{DriverPhase::kUnavailable};
     std::atomic<std::uint64_t> driver_requested_epoch_{0};
     std::atomic<std::uint64_t> driver_attempted_epoch_{0};
     std::atomic<std::uint64_t> driver_covered_epoch_{0};

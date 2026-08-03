@@ -106,10 +106,8 @@ cmake --build build-tsan -j
 ctest --test-dir build-tsan --output-on-failure
 ```
 
-十九个测试可执行文件覆盖公开 API、调度器、worker 位图、定向 MPSC 收件箱、
-channel、`select`、网络、Unix socket、DNS、文件、进程、信号、缓冲 I/O、定时
-器与池、作用域截止时间与描述符收养、同步原语以及浸泡（soak）行为。可选的
-TLS 模块贡献第二十个：
+测试覆盖公开 API、调度器、并发原语、I/O、网络及浸泡行为。可选 TLS 模块有独立
+测试：
 
 ```sh
 cmake -S . -B build-tls -DCMAKE_BUILD_TYPE=Release -DCIO_TLS=ON
@@ -160,7 +158,7 @@ ctest --test-dir build-tls --output-on-failure
 | `net::Conn` / `PacketConn` / `Listener` | Go net 的三个接口，以 concept 表达 |
 | `cio::io::Reader` / `Writer` | `io.Reader` / `io.Writer`，以 concept 表达 |
 | `net::split_host_port` / `join_host_port` | `net.SplitHostPort` / `net.JoinHostPort` |
-| `cio::Runtime` / `cio::run(task)` / `CIO_MAIN` | 运行时所有权与入口点 |
+| `cio::Runtime` / `cio::run(task)` / `CIO_MAIN` | 运行时所有权、协作式优雅关停与入口点 |
 
 `write()` 遵循 Go 的 `io.Writer` 契约：除非返回错误，否则写满整个 span——短写
 必须伴随错误。因此不存在 `write_all()`：`write()` 本身就是。`copy` 遇到无错误
@@ -195,9 +193,9 @@ socket 截止时间按方向设置、直到重置前持续生效；无后缀的 
 间一样，取消活在连接上。`TcpConn::dial()` 以及解析器和拨号器的入口另外直接
 接受令牌。
 
-`net::Resolver` 是名字解析的唯一入口，用 `LookupOptions::prefer_builtin` 选择
-后端，对应 Go 的 `Resolver.PreferGo`；`Dialer` 经
-`DialOptions::prefer_builtin_resolver` 做同样的选择。
+`net::Resolver` 是名字解析的唯一入口，以 `prefer_builtin` 字段选择后端，对应
+Go 的 `Resolver.PreferGo`；`Dialer` 用 `prefer_builtin_resolver` 选择拨号时的
+解析后端。
 
 默认后端是内置 DNS 解析器，与 Go 在 Unix 上的默认一致，理由也相同：阻塞的
 DNS 查询只占一个任务，阻塞的 C 调用占一个操作系统线程。它在运行时自己的
@@ -218,28 +216,12 @@ socket 上收发 DNS 并读取 `/etc/hosts`：查询可在途中取消、不占�
 
 ## 运行时架构
 
-每个运行时 worker 拥有：
+每个 worker 拥有本地可运行队列、硬定向收件箱、epoll reactor 与定时器分片；
+普通外来提交走共享回退队列，空闲 worker 从已发布的本地队列窃取任务。socket
+固定归属一个 reactor 分片，描述符代号与生命周期租约协调 close、取消、截止时
+间和陈旧 epoll 事件。公开的 `Chan<T>` 是独立的 MPMC channel，不是调度队列。
 
-- 一个单槽 `runnext` 直接交接位；
-- 一条仅由所有者生产的本地 FIFO，其已发布尾部可被窃取；
-- 一个有界 256 项的 MPSC `RemoteInbox`，只承接硬定向的内部工作；
-- 一个边沿触发的 epoll 实例与 eventfd；
-- 一个 4 叉定时器堆。
-
-MPSC 收件箱刻意不做通用可运行队列。只有携带明确内部所有权目标的提交才会进
-入，且只有目标 worker 消费。普通外来提交、软亲和完成与收件箱溢出走共享的互
-斥锁保护回退队列，任意繁忙 worker 都无法把它们困住。公开的 `cio::Chan<T>`
-仍是 MPMC，与调度器收件箱无关。
-
-worker 在可扩展位图中发布空闲与可窃取状态。窃取者只检查已通告的受害者，一个
-纪元（epoch）握手闭合并发的发布/清除竞争。粘性搜索者信用保证新唤醒的 worker
-即使被 I/O 或其他可运行任务截胡，负载再分配也不会丢失。
-
-被 accept 的 socket 获得稳定的 home reactor 分片。描述符代号、生命周期钉与系
-统调用租约让陈旧 epoll 事件在 close、截止时间与取消的竞争中保持安全。延迟的
-跨运行时完成使用进程生命周期内唯一的端点身份，配计数的外部租约。
-
-承重的不变量在 [AGENTS.md](AGENTS.md)。
+完整的所有权、发布和关停不变量见 [AGENTS.md](AGENTS.md)。
 
 ## 仓库布局
 
@@ -251,7 +233,6 @@ worker 在可扩展位图中发布空闲与可窃取状态。窃取者只检查�
 | `tests/` | 单元、并发、API 表面与浸泡测试 |
 | `examples/` | 可构建的小示例 |
 | `bench/` | 核心、I/O、echo、Go 与 HTTP/`wrk` 基准 |
-| `include/cio/tls.hpp` | 可选 TLS 模块；仅在 `-DCIO_TLS=ON` 时构建 |
 | `AGENTS.md` | 仓库的开发与验证规范 |
 
 构建目录、sanitizer 产物、基准二进制、Python 缓存与本地原始结果目录都是本地
@@ -275,49 +256,19 @@ go build -o go_core .
 taskset -c 0-23 ./go_core -gomaxprocs=24 -warmup=1 -repeat=5
 ```
 
-HTTP 前后对比两侧使用同一个第三方 `wrk` 可执行文件、互不相交的服务端/客户端
-CPU 集合、预热、交替的 AB/BA 配对、输入 SHA-256 校验、错误拒绝与保留的原始
-日志：
+HTTP A/B 使用第三方 `wrk`、互不相交的 CPU 集合、预热和交替的 AB/BA 配对：
 
 ```sh
 taskset -c 23 python3 bench/http-comparison/matrix_wrk.py \
   path/to/baseline-server path/to/candidate-server \
-  --cells 1:1,8:4,64:14,256:14,1024:14 \
+  --cells 1:1,8:4,64:16,256:16,1024:16 \
   --pairs 10 --warmup 5 --duration 15 \
-  --server-cores 0-7 --client-cores 8-21 \
-  --tail-script bench/http-comparison/wrk_tail.lua \
-  --expected-a-sha256 <sha256> \
-  --expected-b-sha256 <sha256> \
-  --expected-wrk-sha256 <sha256> \
-  --expected-tail-script-sha256 <sha256>
+  --server-cores 0-7 --client-cores 8-21
 ```
 
-冻结的本地二进制是生成物，不提交入库。每份结果都要记录它们与 `wrk` 的哈希。
-
-### 实测吞吐
-
-极简 HTTP/1.1 服务器，八个 worker 钉在 CPU 0-7，由钉在 CPU 8-23 的第三方
-`wrk` 驱动。五个格子来自针对已发布 v0.0.1 运行时的同一次十对矩阵，因此可以
-直接互相比较：
-
-| 连接数 | req/s | p50 中位数 | p99 中位数 |
-|---:|---:|---:|---:|
-| 1 | 14,339 | 68 us | 110 us |
-| 8 | 125,598 | 52 us | 644 us |
-| 64 | 789,141 | 70 us | 501 us |
-| 256 | 771,416 | 306 us | 2765 us |
-| 1024 | 781,518 | 1125 us | 4635 us |
-
-后来一轮 monitor-balance 测得 c1024 为 859,820 req/s、p99 中位数 2060 us。那
-是针对另一个基线的独立确认，与上表不构成配对；不要把两者当作一次扫描合读。
-
-绝对数字与主机相关，主要用于看形状：吞吐在 64 连接附近饱和，尾延迟才是移动
-的轴。
-
-与 Boost.Asio 和 Go 的对比在 `bench/` 下：`http-comparison` 用同一个第三方
-`wrk` 驱动三个运行时，`echo-comparison` 增加倾斜负载扫描，`go-core` 是
-`bench_core` 的 Go 对应物、独立成模块。它们必须遵守的规则在
-[AGENTS.md](AGENTS.md#基准测试规范)。
+冻结二进制、哈希、钉核、错误拒绝与结果发布规则见
+[AGENTS.md](AGENTS.md#基准测试规范)。Boost.Asio、Go、echo 和混合延迟负载的
+工具都在 `bench/` 下；原始结果只保存在本地。
 
 可选的运行时计数器以 `-DCIO_METRICS=ON` 启用。`cio::runtime_metrics()` 始终
 可链接，未启用插桩时返回全零计数。
@@ -393,9 +344,15 @@ EOF。保留的刻意偏差：`Once::call`（`do` 是 C++ 关键字）、`Timer:
 - 取消是协作式的，只在任务检查它的地方被观察到。
 - 已开始执行的阻塞可调用无法被抢占。运行时关停会等待已开始与已排队的阻塞工
   作完成。
-- 运行时关停不会展开仍 park 在 channel 或 socket 上的任务。从运行时自己的
-  worker 上调用 `Runtime::shutdown()` 会抛出 `std::logic_error`。
-- socket 对象必须比使用它的任务活得久。每个 socket 同方向至多一个等待者。
+- `Runtime::shutdown()` 是立即关停，不展开仍 park 的任务；
+  `graceful_shutdown()` 先关闭外部任务准入、取消 `shutdown_token()`，等待经该
+  Runtime 提交的根任务退出后再停 worker；结构化清理由根任务负责 join。不观察
+  token 的根任务会让它继续等待。
+  两种关停都不能从该 Runtime 自己的 worker 调用。
+- socket 对象必须比使用它的任务活得久。完整的 `read()`、`write()` 与
+  `accept()` 在同方向按 FIFO 串行，读与写仍可并行；有异步操作占用该方向时，
+  `try_read()` / `try_write()` 返回
+  `Errc::would_block`。
 - 对称协程转移依赖尾调用。CMake 传递 GCC 需要的
   `-foptimize-sibling-calls`；sanitizer 插桩仍可能把长的不挂起协程链变成深原
   生栈。
@@ -417,10 +374,9 @@ EOF。保留的刻意偏差：`Once::call`（`do` 是 C++ 关键字）、`Timer:
 
 - 系统后端使用 `getaddrinfo()`。被取消的查询立即恢复调用方，但
   `getaddrinfo()` 无法中断、会跑到结束；迟到的结果被丢弃。
-- 内置后端读 `/etc/hosts` 但不查 NSS，LDAP、NIS 与 mDNS 对它不可见。它也没
-  有缓存、没有 DNSSEC 校验、没有 TCP 回退——截断且无可用记录的应答如实报
-  错，而不是改走 TCP 重试——也不实现 `resolv.conf` 的 search 列表和
-  `ndots`，名字按原样查询。
+- 内置后端读 `/etc/hosts` 但不查 NSS，LDAP、NIS 与 mDNS 对它不可见。它没有
+  缓存和 DNSSEC 校验，也不实现 `resolv.conf` 的 search 列表与 `ndots`；名字按
+  原样查询，截断的 UDP 应答会向同一服务器发起 TCP 重试。
 
 信号：
 

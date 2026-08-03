@@ -19,9 +19,10 @@
 // reports ENOSYS on anything older rather than silently falling back to a
 // blocking wait.
 //
-// OWNERSHIP: Child is move-only. Destroying it without wait() leaves the process
-// running and reaped by init, which is what Go's os.Process does; call wait() to
-// collect a status, or kill() first if the child should not outlive its parent.
+// OWNERSHIP: Child is move-only. Destroying it without wait() leaves the
+// process running, but transfers its pidfd to cio's process-wide reaper so its
+// eventual exit cannot leave a zombie. Call wait() to collect a status, or
+// kill() first if the child should not outlive its parent.
 #pragma once
 
 #include <csignal>
@@ -47,7 +48,9 @@ struct Status {
     // The signal that killed it, when it did not.
     std::optional<int> signal;
 
-    bool success() const noexcept { return exit_code.has_value() && *exit_code == 0; }
+    bool success() const noexcept {
+        return exit_code.has_value() && *exit_code == 0;
+    }
     bool signalled() const noexcept { return signal.has_value(); }
 };
 
@@ -56,7 +59,8 @@ struct Output;
 
 // Go's exec.Cmd: an options struct with the run methods on it.
 struct Command {
-    explicit Command(std::string program_path) : program(std::move(program_path)) {}
+    explicit Command(std::string program_path)
+        : program(std::move(program_path)) {}
 
     std::string program;
     // argv[0] is supplied automatically from `program` unless argv0 is set.
@@ -84,7 +88,8 @@ struct Command {
 
     // Go's cmd.Output(), except stderr is returned alongside stdout instead of
     // being folded into the error.
-    Task<Result<Output>> output(std::size_t max_output = 16u * 1024 * 1024) const;
+    Task<Result<Output>> output(std::size_t max_output = 16u * 1024 *
+                                                         1024) const;
 };
 
 // A running child process.
@@ -134,6 +139,8 @@ public:
 
 private:
     friend struct Command;
+
+    void release_unwaited() noexcept;
 
     int pid_ = -1;
     std::optional<PollableFd> pidfd_;

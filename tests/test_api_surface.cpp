@@ -545,6 +545,8 @@ void test_runtime_and_concurrency_usage() {
     options.max_blocking_threads = 2;
     cio::Runtime runtime(options);
     CIO_CHECK_EQ(runtime.worker_count(), std::size_t{1});
+    const cio::CancelToken shutdown = runtime.shutdown_token();
+    CIO_CHECK(!shutdown.cancelled());
 
     bool member_spawn_started = false;
     auto member_handle = runtime.spawn(lazy_value(&member_spawn_started, 9));

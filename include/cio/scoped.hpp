@@ -45,7 +45,7 @@ namespace cio {
 // SetDeadline plus SetReadDeadline and SetWriteDeadline, while TCPListener
 // carries only SetDeadline, because accept has one direction. A type with only
 // the combined setter is scoped as a single direction.
-template <typename S>
+template<typename S>
 concept HasDirectionalDeadlines = requires(S& s, TimePoint t) {
     s.set_read_deadline(t);
     s.set_write_deadline(t);
@@ -53,14 +53,13 @@ concept HasDirectionalDeadlines = requires(S& s, TimePoint t) {
     s.clear_write_deadline();
 };
 
-template <typename S>
+template<typename S>
 class [[nodiscard]] Timeout {
 public:
     Timeout(S& socket, Duration duration, bool read = true, bool write = true)
         : Timeout(socket, Clock::now() + duration, read, write) {}
 
-    Timeout(S& socket, TimePoint deadline, bool read = true,
-            bool write = true)
+    Timeout(S& socket, TimePoint deadline, bool read = true, bool write = true)
         : socket_(&socket), read_(read), write_(write) {
         if constexpr (HasDirectionalDeadlines<S>) {
             if (read_) {
@@ -153,12 +152,12 @@ private:
 // It registers the descriptor with the worker-local reactor and exposes
 // readiness, deadlines and cancellation.
 //
-// Two ways to use it. `readable()`/`writable()` wait and leave the syscall to the
-// caller, which is what an interface with its own framing needs. `read()`/
+// Two ways to use it. `readable()`/`writable()` wait and leave the syscall to
+// the caller, which is what an interface with its own framing needs. `read()`/
 // `write()` do the ordinary thing with read(2) and write(2), which makes a
-// PollableFd satisfy io::Reader and io::Writer, so bufio and the io helpers work
-// over a pipe or a character device unchanged. Nothing is interpreted or buffered
-// either way.
+// PollableFd satisfy io::Reader and io::Writer, so bufio and the io helpers
+// work over a pipe or a character device unchanged. Nothing is interpreted or
+// buffered either way.
 //
 // read(2), not recv(2): this has to work on pipes and character devices, where
 // the socket calls fail with ENOTSOCK.

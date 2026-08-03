@@ -133,13 +133,19 @@ public:
         const std::uint32_t t = tail_.load(std::memory_order_relaxed);
         const std::uint32_t h = head_.load(std::memory_order_acquire);
         if (t - h >= kLocalQueueCapacity) {
-            if (spawn_mode != nullptr) *spawn_mode = 1;
+            if (spawn_mode != nullptr) {
+                *spawn_mode =
+                    static_cast<std::uint8_t>((*spawn_mode & ~3u) | 1u);
+            }
             return false;
         }
         // Values match TaskPromiseBase's detached modes without making the
         // scheduler queue depend on coroutine promise definitions. Publish
         // the mode before the frame becomes visible to a thief.
-        if (spawn_mode != nullptr) *spawn_mode = t == h ? 2 : 1;
+        if (spawn_mode != nullptr) {
+            *spawn_mode = static_cast<std::uint8_t>((*spawn_mode & ~3u) |
+                                                    (t == h ? 2u : 1u));
+        }
         buf_[t & kLocalQueueMask].store(item, std::memory_order_relaxed);
         // Release: publishes the slot write to any thief that observes tail_.
         tail_.store(t + 1, std::memory_order_release);

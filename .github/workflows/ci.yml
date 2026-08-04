@@ -24,7 +24,7 @@ jobs:
         sanitize: [none, asan, tsan]
     name: ${{ matrix.compiler }} / ${{ matrix.sanitize }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - name: Configure
@@ -67,7 +67,7 @@ jobs:
             flags: -DCIO_METRICS=ON
     name: variant / ${{ matrix.name }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.flags }}
           cmake --build build -j
@@ -78,7 +78,7 @@ jobs:
   arm64:
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j
@@ -90,7 +90,7 @@ jobs:
   fuzz:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y clang
       - run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug             -DCMAKE_CXX_COMPILER=clang++ -DCIO_SANITIZE=asan -DCIO_FUZZ=ON             -DCIO_BUILD_TESTS=OFF -DCIO_BUILD_EXAMPLES=OFF -DCIO_BUILD_BENCHMARKS=OFF
@@ -108,7 +108,7 @@ jobs:
   soak:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build -j
       - run: ./build/test_soak 60
@@ -117,7 +117,7 @@ jobs:
   install:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - name: Install to a prefix
         run: |
@@ -151,7 +151,7 @@ jobs:
   subdirectory:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: |
           mkdir -p /tmp/parent/vendor && cd /tmp/parent
           cp -r "$GITHUB_WORKSPACE" vendor/cio
@@ -171,7 +171,7 @@ jobs:
   format:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check whitespace
         run: git diff --check HEAD~1 || true
       - name: Trailing whitespace and tabs
